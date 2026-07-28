@@ -4,8 +4,11 @@ import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.gui.components.MetalOptionSlider;
 import com.pebbles_boon.metalrender.nativebridge.MetalHardwareChecker;
+import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
+import com.pebbles_boon.metalrender.render.MetalRenderHookState;
 import java.util.ArrayList;
 import java.util.List;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.CloudStatus;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.OptionInstance;
@@ -93,10 +96,8 @@ public class MetalRenderSettingsScreen extends Screen {
   private boolean pendingDeepDebugNextRun;
 
   private int initialRenderDist;
-  private int initialBiomeDetail;
   private int initialLeafCulling;
   private boolean initialMetalOn;
-  private boolean initialSmoothLighting;
   private boolean initialDebugPinkBlockTint;
 
   private final List<Row> rows = new ArrayList<>();
@@ -141,7 +142,7 @@ public class MetalRenderSettingsScreen extends Screen {
       config = MetalRenderConfig.load();
     Options o = Minecraft.getInstance().options;
     pendingRenderDist = o.renderDistance().get();
-    pendingSimDist = o.simulationDistance().get();
+    pendingSimDist = MetalRenderClient.getPreferredSimulationDistance(o);
     pendingMaxFps = fromVanillaFpsLimit(o.framerateLimit().get());
     pendingGuiScale = o.guiScale().get();
     pendingBrightness = o.gamma().get();
@@ -153,10 +154,8 @@ public class MetalRenderSettingsScreen extends Screen {
     pendingDeepDebugNextRun = MetalRenderConfig.isOneRunDeepDebugRequested();
 
     initialRenderDist = pendingRenderDist;
-    initialBiomeDetail = config.biomeTransitionDetail;
     initialLeafCulling = config.leafCullingMode;
     initialMetalOn = config.enableMetalRendering;
-    initialSmoothLighting = config.enableSimpleLighting;
     initialDebugPinkBlockTint = config.debugPinkBlockTint;
     layout();
     rebuild();
@@ -218,7 +217,7 @@ public class MetalRenderSettingsScreen extends Screen {
         Component.literal("MetalRender Settings"),
         px + 16, py + (HDR_H - 9) / 2 + 1, C_TEXT_PRI, false);
     int vx = px + 16 + font.width("MetalRender Settings") + 8;
-    ctx.text(font, Component.literal("v0.1.7"),
+    ctx.text(font, Component.literal("v" + modVersion()),
         vx, py + (HDR_H - 9) / 2 + 1, C_TEXT_SEC, false);
   }
 
@@ -482,43 +481,36 @@ public class MetalRenderSettingsScreen extends Screen {
 
     boolean metalFlip = config.enableMetalRendering != initialMetalOn;
     boolean needsRebuild = (pendingRenderDist != initialRenderDist)
-        || (config.biomeTransitionDetail != initialBiomeDetail)
         || (config.leafCullingMode != initialLeafCulling)
-        || (config.enableSimpleLighting != initialSmoothLighting)
         || (config.debugPinkBlockTint != initialDebugPinkBlockTint);
 
-    boolean biomeChanged = config.biomeTransitionDetail != initialBiomeDetail;
     com.pebbles_boon.metalrender.util.MetalLogger.info(
-        "settings close: rebuild=%b rd=%b bm=%b lf=%b lt=%b",
+        "settings close: rebuild=%b rd=%b lf=%b tint=%b",
         needsRebuild,
         pendingRenderDist != initialRenderDist,
-        biomeChanged,
         config.leafCullingMode != initialLeafCulling,
-        config.enableSimpleLighting != initialSmoothLighting);
+        config.debugPinkBlockTint != initialDebugPinkBlockTint);
     MetalRenderClient.requestDeferredApply(
         metalFlip,
         metalFlip,
-        !metalFlip && (needsRebuild || biomeChanged));
+        !metalFlip && needsRebuild);
 
     Minecraft mc = Minecraft.getInstance();
     if (mc != null)
-      mc.setScreen(parent);
+      mc.gui.setScreen(parent);
   }
 
   private void applyPending() {
     Options o = Minecraft.getInstance().options;
     o.renderDistance().set(pendingRenderDist);
-    if (config.prioritizeFpsOverTps) {
-      pendingSimDist = Math.min(pendingSimDist, 5);
-    }
-    o.simulationDistance().set(pendingSimDist);
+    MetalRenderClient.applySimulationDistanceFromSettings(o, pendingSimDist);
     o.framerateLimit().set(toVanillaFpsLimit(pendingMaxFps));
     o.guiScale().set(pendingGuiScale);
     o.gamma().set(pendingBrightness);
     o.fov().set(pendingFov);
     o.screenEffectScale().set(pendingDistortion);
     o.fovEffectScale().set(pendingFovEffects);
-    o.save();
+    MetalRenderClient.saveOptionsPreservingFpsPriority(o);
     config.targetFrameRate = pendingTargetFps;
     config.maxMemoryMB = pendingMaxMemMb;
     MetalRenderConfig.setOneRunDeepDebugRequested(pendingDeepDebugNextRun);
@@ -610,7 +602,20 @@ public class MetalRenderSettingsScreen extends Screen {
   private void buildMetal() {
     sec("Renderer");
     tog("Metal Rendering", config.enableMetalRendering, v -> config.enableMetalRendering = v);
-    tog("Smooth Lighting", config.enableSimpleLighting, v -> config.enableSimpleLighting = v);
+    tog("Metal 4 Runtime (Hybrid)", config.enableMetal4, v -> {
+      config.enableMetal4 = v;
+      if (!v) {
+        config.requireMetal4 = false;
+      }
+    });
+    tog("Require Metal 4", config.requireMetal4, v -> {
+      config.requireMetal4 = v;
+      if (v) {
+        config.enableMetal4 = true;
+      }
+    });
+    tog("MetalFX Upscaling", config.enableMetalFX, v -> config.enableMetalFX = v);
+    nfo("Smooth Lighting Override", "Not Available");
     tog("Debug: Pink Block Tint", config.debugPinkBlockTint, v -> config.debugPinkBlockTint = v);
     if (MetalRenderConfig.isDeepDebugActive()) {
       nfo("Deep Debug Status", "Active this run");
@@ -621,9 +626,14 @@ public class MetalRenderSettingsScreen extends Screen {
     sec("Hardware");
     nfo("GPU", MetalHardwareChecker.getDeviceName());
     nfo("Metal", MetalRenderClient.isMetalAvailable() ? "Supported" : "Not Available");
+    MetalRenderHookState.isGraphicsBackendSupported();
+    nfo("Minecraft Graphics API", MetalRenderHookState.graphicsBackendName());
+    nfo("Native Backend", nativeBackendMode());
+    nfo("Metal 4 Capability", metal4Capability());
+    nfo("Metal 4 Active", metal4Active());
     nfo("Apple Silicon", MetalHardwareChecker.appleSilicon() ? "Yes" : "No");
     nfo("Sodium", MetalRenderClient.isSodiumLoaded() ? "Installed" : "Not Installed");
-    nfo("Mesh Shaders", MetalHardwareChecker.supportsMeshShaders() ? "Supported" : "Not Available");
+    nfo("Mesh Shaders", "Experimental - validation locked");
   }
 
   private void buildQuality() {
@@ -663,22 +673,27 @@ public class MetalRenderSettingsScreen extends Screen {
     sld("Anisotropy", 0, 3, 1, o.maxAnisotropyBit().get(),
         v -> o.maxAnisotropyBit().set((int) (float) v));
 
-    sec("Sodium Extras");
-    tog("Hidden Fluid Culling", config.hiddenFluidCulling, v -> config.hiddenFluidCulling = v);
-    tog("Improved Fluid Shaping", config.improvedFluidShaping, v -> config.improvedFluidShaping = v);
-    tog("Closest Point Entity Sort", config.closestPointEntitySort, v -> config.closestPointEntitySort = v);
+    sec("Compatibility Options (Read-only)");
+    nfo("Hidden Fluid Culling", "Not Available");
+    nfo("Improved Fluid Shaping", "Not Available");
+    nfo("Closest Point Entity Sort", "Not Available");
   }
 
   private void buildPerformance() {
     sec("Frame Pacing");
-    sld("Target FPS", 30, 5000, 30, pendingTargetFps, v -> pendingTargetFps = (int) (float) v);
+    tog("Match Display Refresh", config.autoTargetFrameRate,
+        v -> config.autoTargetFrameRate = v);
+    sld("Manual/Fallback FPS", 30, 1000, 10, pendingTargetFps,
+        v -> pendingTargetFps = (int) (float) v);
+    nfo("Active Metal Target", MetalRenderClient.effectiveTargetFrameRate() + " FPS");
     tog("Triple Buffering", config.enableTripleBuffering, v -> config.enableTripleBuffering = v);
-    tog("Burst Thread Mode", config.enableBurstThreadMode, v -> config.enableBurstThreadMode = v);
+    nfo("Burst Thread Mode", "Not Available");
     tog("Sacrifice TPS for FPS", config.prioritizeFpsOverTps, v -> config.prioritizeFpsOverTps = v);
     nfo("FPS Priority Mode", config.prioritizeFpsOverTps ? "Simulation Distance <= 5" : "Off");
     sec("Memory");
-    sld("Max GPU Memory (MB)", 512, 4096, 512, pendingMaxMemMb, v -> pendingMaxMemMb = (int) (float) v);
-    tog("Memory Fallback", config.enableMemoryPressureFallback, v -> config.enableMemoryPressureFallback = v);
+    sld("Native Buffer Budget (MB)", 512, 2048, 512, pendingMaxMemMb,
+        v -> pendingMaxMemMb = (int) (float) v);
+    nfo("Memory Pressure Fallback", "Not Available");
     sec("Runtime");
     Runtime rt = Runtime.getRuntime();
     long used = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
@@ -688,10 +703,57 @@ public class MetalRenderSettingsScreen extends Screen {
 
   private void buildAdvanced() {
     sec("Metal Features");
+    nfo("Fast Terrain Replacement", "Disabled pending depth interop validation");
+    nfo("Entities & Particles", "Vanilla overlay (safe beta default)");
     tog("Argument Buffers", config.enableArgumentBuffers, v -> config.enableArgumentBuffers = v);
     tog("Indirect CMD Buffers", config.enableIndirectCommandBuffers, v -> config.enableIndirectCommandBuffers = v);
-    tog("Mesh Shaders", config.enableMeshShaders, v -> config.enableMeshShaders = v);
     tog("Programmable Blending", config.enableProgrammableBlending, v -> config.enableProgrammableBlending = v);
+    nfo("Mesh Shaders", "Experimental - disabled by validation");
+    nfo("Metal 4 Backend", nativeBackendMode());
+  }
+
+  private static String nativeBackendMode() {
+    try {
+      if (!NativeBridge.isLibLoaded()) {
+        return "Not initialized";
+      }
+      String mode = NativeBridge.nGetBackendMode();
+      return mode == null || mode.isBlank() ? "Unknown" : mode;
+    } catch (Throwable error) {
+      return "Unavailable";
+    }
+  }
+
+  private static String modVersion() {
+    try {
+      return FabricLoader.getInstance()
+          .getModContainer("metalrender")
+          .map(container ->
+              container.getMetadata().getVersion().getFriendlyString())
+          .orElse("development");
+    } catch (Throwable error) {
+      return "development";
+    }
+  }
+
+  private static String metal4Capability() {
+    try {
+      return NativeBridge.isLibLoaded() && NativeBridge.nSupportsMetal4()
+          ? "Supported"
+          : "Not Available";
+    } catch (Throwable error) {
+      return "Not Available";
+    }
+  }
+
+  private static String metal4Active() {
+    try {
+      return NativeBridge.isLibLoaded() && NativeBridge.nIsMetal4Active()
+          ? "Yes"
+          : "No";
+    } catch (Throwable error) {
+      return "No";
+    }
   }
 
   private void sec(String label) {

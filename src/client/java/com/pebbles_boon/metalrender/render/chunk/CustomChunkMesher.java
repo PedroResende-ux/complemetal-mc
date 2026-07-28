@@ -24,6 +24,7 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.block.BlockStateModelSet;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
+import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
@@ -130,6 +131,15 @@ public class CustomChunkMesher {
   private long deviceHandle;
   private boolean initialized;
   private long globalIndexBufferHandle;
+  private final java.util.concurrent.atomic.AtomicLong buildEpoch =
+      new java.util.concurrent.atomic.AtomicLong();
+  private final java.util.concurrent.atomic.AtomicLong lastBufferBudgetLogNs =
+      new java.util.concurrent.atomic.AtomicLong();
+  private final Object publishLock = new Object();
+  private final Object threadBudgetLogLock = new Object();
+  private long lastThreadBudgetLogNs;
+  private boolean lastLoggedLoadingMode;
+  private boolean hasLoggedThreadBudget;
 
   private final java.util.concurrent.atomic.AtomicInteger meshCountAtomic = new java.util.concurrent.atomic.AtomicInteger(
       0);
@@ -195,6 +205,21 @@ public class CustomChunkMesher {
   }
 
   public void initialize(long device) {
+    if (device == 0) {
+      initialized = false;
+      MetalLogger.warn("mesher init skipped: no Metal device");
+      return;
+    }
+    if (initialized && deviceHandle == device &&
+        globalIndexBufferHandle != 0) {
+      MetalLogger.debug("mesher reuse: dev=%d ib=%d", device,
+          globalIndexBufferHandle);
+      return;
+    }
+    if (globalIndexBufferHandle != 0) {
+      NativeBridge.nDestroyBuffer(globalIndexBufferHandle);
+      globalIndexBufferHandle = 0;
+    }
     this.deviceHandle = device;
     MetalLogger.info("mesher init: dev=%d cfg=%s",
         device, MetalRenderClient.getConfig() != null
@@ -218,6 +243,11 @@ public class CustomChunkMesher {
     ib.get(ibData);
     this.globalIndexBufferHandle = NativeBridge.nCreateBuffer(
         deviceHandle, ibData.length, NativeMemory.STORAGE_MODE_SHARED);
+    if (globalIndexBufferHandle == 0) {
+      initialized = false;
+      MetalLogger.error("mesher init failed: global index buffer unavailable");
+      return;
+    }
     NativeBridge.nUploadBufferData(this.globalIndexBufferHandle, ibData, 0,
         ibData.length);
     this.initialized = true;
@@ -243,37 +273,58 @@ public class CustomChunkMesher {
     synchronized (dirtyGeneration) {
       genAtSubmit = dirtyGeneration.get(key);
     }
+    final long epochAtSubmit = buildEpoch.get();
 
     synchronized (pendingKeys) {
-      pendingKeys.add(key);
+      if (!pendingKeys.add(key)) {
+        return;
+      }
     }
 
     int priority = interactive ? 0 : (highPriority ? 1 : 2);
-    submitMeshTask(priority, () -> {
+    boolean submitted = submitMeshTask(priority, () -> {
       try {
-        if (isTaskCancelled(key, genAtSubmit)) {
+        if (isTaskCancelled(key, genAtSubmit, epochAtSubmit)) {
           return;
         }
         MeshBuildContext context = captureBuildContext(world, chunkX, chunkY, chunkZ);
+        if (isTaskCancelled(key, genAtSubmit, epochAtSubmit)) {
+          return;
+        }
         SectionSnapshot snapshot = captureSectionSnapshot(world, chunkX, chunkY, chunkZ,
             aggressiveApproximateLighting);
+        if (isTaskCancelled(key, genAtSubmit, epochAtSubmit)) {
+          return;
+        }
         if (!snapshot.valid) {
           return;
         }
         if (snapshot.empty) {
-          removeEmptyMesh(key, chunkX, chunkY, chunkZ);
+          removeEmptyMesh(key, chunkX, chunkY, chunkZ, genAtSubmit,
+              epochAtSubmit);
           return;
         }
-        doMeshBuild(chunkX, chunkY, chunkZ, snapshot, key, genAtSubmit, context);
+        doMeshBuild(chunkX, chunkY, chunkZ, snapshot, key, genAtSubmit,
+            epochAtSubmit, context);
       } catch (Exception e) {
         MetalLogger.error("mesher fail [%d,%d,%d]: %s", chunkX,
             chunkY, chunkZ, e.getMessage());
       } finally {
-        synchronized (pendingKeys) {
-          pendingKeys.remove(key);
+        if (buildEpoch.get() == epochAtSubmit) {
+          synchronized (pendingKeys) {
+            pendingKeys.remove(key);
+          }
         }
       }
     }, chunkX, chunkZ);
+    if (!submitted && initialized && buildEpoch.get() == epochAtSubmit) {
+      synchronized (pendingKeys) {
+        pendingKeys.remove(key);
+      }
+      synchronized (dirtyKeys) {
+        dirtyKeys.add(key);
+      }
+    }
   }
 
   public void buildMeshFromWorldInteractive(int chunkX, int chunkY, int chunkZ) {
@@ -282,6 +333,24 @@ public class CustomChunkMesher {
 
   public void clear() {
     clearAllMeshes();
+  }
+
+  /**
+   * Releases renderer-lifetime resources. A normal world unload only calls
+   * {@link #clear()} so the global index buffer and worker pools can be reused
+   * by the next world.
+   */
+  public void shutdown() {
+    initialized = false;
+    immediatePool.shutdownNow();
+    backgroundPool.shutdownNow();
+    clearAllMeshes();
+    if (globalIndexBufferHandle != 0) {
+      NativeBridge.nDestroyBuffer(globalIndexBufferHandle);
+      globalIndexBufferHandle = 0;
+    }
+    deviceHandle = 0;
+    MetalLogger.info("mesher shut down");
   }
 
   public int getTotalVertexCount() {
@@ -371,64 +440,100 @@ public class CustomChunkMesher {
 
   public void removeMesh(int cx, int cy, int cz) {
     long key = packChunkKey(cx, cy, cz);
-    ChunkMeshData old;
-    synchronized (meshCache) {
-      old = meshCache.remove(key);
+    synchronized (publishLock) {
+      // Invalidate any worker that captured this key before pruning. The
+      // publish lock makes removal atomic with cache publication and native
+      // registration, so a late worker cannot resurrect a far-away mesh.
+      synchronized (dirtyGeneration) {
+        dirtyGeneration.put(key, dirtyGeneration.get(key) + 1L);
+      }
+      synchronized (pendingKeys) {
+        pendingKeys.remove(key);
+      }
+
+      // A published mesh may still be waiting in the registration batch.
+      // Flush first, then unregister it, otherwise a later batch flush could
+      // register a handle that has already been destroyed below.
+      synchronized (batchRegData) {
+        if (batchRegCount > 0) {
+          NativeBridge.nRegisterChunkMeshBatch(batchRegCount, batchRegData);
+          batchRegCount = 0;
+        }
+      }
+
+      ChunkMeshData old;
+      synchronized (meshCache) {
+        old = meshCache.remove(key);
+      }
+      if (old != null) {
+        NativeBridge.nUnregisterChunkMesh(cx, cy, cz);
+        NativeBridge.nDestroyBuffer(old.bufferHandle);
+        meshCountAtomic.decrementAndGet();
+        vertexCountAtomic.addAndGet(-old.quadCount * 4);
+      }
+      synchronized (emptyKeys) {
+        emptyKeys.remove(key);
+      }
+      synchronized (dirtyKeys) {
+        dirtyKeys.remove(key);
+      }
+      meshUpdateGeneration.incrementAndGet();
     }
-    if (old != null) {
-      NativeBridge.nUnregisterChunkMesh(cx, cy, cz);
-      NativeBridge.nDestroyBuffer(old.bufferHandle);
-      meshCountAtomic.decrementAndGet();
-      vertexCountAtomic.addAndGet(-old.quadCount * 4);
-    }
-    synchronized (emptyKeys) {
-      emptyKeys.remove(key);
-    }
-    synchronized (dirtyKeys) {
-      dirtyKeys.remove(key);
-    }
-    meshUpdateGeneration.incrementAndGet();
   }
 
   public void clearAllMeshes() {
+    long nextEpoch = buildEpoch.incrementAndGet();
     int count;
-    synchronized (meshCache) {
-      count = meshCache.size();
-      if (NativeBridge.isLibLoaded()) {
-        NativeBridge.nClearAllChunkRegistrations();
-      }
-      for (ChunkMeshData mesh : meshCache.values()) {
-        if (mesh.bufferHandle != 0) {
-          NativeBridge.nDestroyBuffer(mesh.bufferHandle);
+    synchronized (publishLock) {
+      synchronized (meshCache) {
+        count = meshCache.size();
+        if (NativeBridge.isLibLoaded()) {
+          NativeBridge.nClearAllChunkRegistrations();
         }
+        for (ChunkMeshData mesh : meshCache.values()) {
+          if (mesh.bufferHandle != 0) {
+            NativeBridge.nDestroyBuffer(mesh.bufferHandle);
+          }
+        }
+        meshCache.clear();
+        meshCountAtomic.set(0);
+        vertexCountAtomic.set(0);
       }
-      meshCache.clear();
-      meshCountAtomic.set(0);
-      vertexCountAtomic.set(0);
+      synchronized (pendingKeys) {
+        pendingKeys.clear();
+      }
+      synchronized (dirtyKeys) {
+        dirtyKeys.clear();
+      }
+      synchronized (emptyKeys) {
+        emptyKeys.clear();
+      }
+      synchronized (snapshotCache) {
+        snapshotCache.clear();
+      }
+      synchronized (snapshotCacheGen) {
+        snapshotCacheGen.clear();
+      }
+      synchronized (dirtyGeneration) {
+        dirtyGeneration.clear();
+      }
+      synchronized (pendingVisibleSectionNanos) {
+        pendingVisibleSectionNanos.clear();
+      }
+      synchronized (pendingBlockUpdateNanos) {
+        pendingBlockUpdateNanos.clear();
+      }
+      synchronized (batchRegData) {
+        batchRegCount = 0;
+      }
+      coalesceFrameCounter = 0;
+      synchronized (rebuildBatchTick) {
+        rebuildBatchTick.clear();
+      }
+      meshUpdateGeneration.incrementAndGet();
     }
-    synchronized (pendingKeys) {
-      pendingKeys.clear();
-    }
-    synchronized (dirtyKeys) {
-      dirtyKeys.clear();
-    }
-    synchronized (emptyKeys) {
-      emptyKeys.clear();
-    }
-    synchronized (snapshotCache) {
-      snapshotCache.clear();
-    }
-    synchronized (snapshotCacheGen) {
-      snapshotCacheGen.clear();
-    }
-    synchronized (batchRegData) {
-      batchRegCount = 0;
-    }
-    coalesceFrameCounter = 0;
-    synchronized (rebuildBatchTick) {
-      rebuildBatchTick.clear();
-    }
-    MetalLogger.info("mesher data cleared (%d).", count);
+    MetalLogger.info("mesher data cleared (%d, epoch=%d).", count,
+        nextEpoch);
   }
 
   public int getMeshCount() {
@@ -521,22 +626,37 @@ public class CustomChunkMesher {
 
   public void setLoadingModeThreadBudget(boolean loadingMode, int totalPending) {
     int pending = Math.max(getPendingCount(), totalPending);
-    MetalRenderConfig config = MetalRenderClient.getConfig();
     aggressiveApproximateLighting = false;
 
-    MetalLogger.info(
-        "thread_budget: load=%s p=%d approx=%s",
-        loadingMode, pending, aggressiveApproximateLighting);
+    long now = System.nanoTime();
+    boolean shouldLog;
+    synchronized (threadBudgetLogLock) {
+      shouldLog = !hasLoggedThreadBudget
+          || loadingMode != lastLoggedLoadingMode
+          || now - lastThreadBudgetLogNs >= 5_000_000_000L;
+      if (shouldLog) {
+        hasLoggedThreadBudget = true;
+        lastLoggedLoadingMode = loadingMode;
+        lastThreadBudgetLogNs = now;
+      }
+    }
+    if (shouldLog) {
+      MetalLogger.info(
+          "thread_budget: load=%s p=%d approx=%s",
+          loadingMode, pending, aggressiveApproximateLighting);
+    }
   }
 
   public void flushMeshRegistrations() {
-    int toFlush;
-    synchronized (batchRegData) {
-      toFlush = batchRegCount;
-      if (toFlush <= 0)
-        return;
-      NativeBridge.nRegisterChunkMeshBatch(toFlush, batchRegData);
-      batchRegCount = 0;
+    synchronized (publishLock) {
+      int toFlush;
+      synchronized (batchRegData) {
+        toFlush = batchRegCount;
+        if (toFlush <= 0)
+          return;
+        NativeBridge.nRegisterChunkMeshBatch(toFlush, batchRegData);
+        batchRegCount = 0;
+      }
     }
   }
 
@@ -607,7 +727,8 @@ public class CustomChunkMesher {
 
   private static final int IMMEDIATE_QUEUE_CHUNK_RANGE = 8;
 
-  private void submitMeshTask(int priority, Runnable task, int chunkX, int chunkZ) {
+  private boolean submitMeshTask(int priority, Runnable task, int chunkX,
+      int chunkZ) {
     boolean isImmediate;
     if (priority == 0) {
       isImmediate = true;
@@ -631,13 +752,18 @@ public class CustomChunkMesher {
     }
     int backgroundCap = estimator != null ? estimator.recommendedInFlightFor(1) : 256;
     if (!isImmediate && getBackgroundInFlight() >= backgroundCap) {
-      return;
+      return false;
     }
     PrioritizedMeshTask ptask = new PrioritizedMeshTask(priority, task);
-    if (isImmediate) {
-      immediatePool.execute(ptask);
-    } else {
-      backgroundPool.execute(ptask);
+    try {
+      if (isImmediate) {
+        immediatePool.execute(ptask);
+      } else {
+        backgroundPool.execute(ptask);
+      }
+      return true;
+    } catch (java.util.concurrent.RejectedExecutionException rejected) {
+      return false;
     }
   }
 
@@ -649,7 +775,10 @@ public class CustomChunkMesher {
     return backgroundPool.getActiveCount() + backgroundPool.getQueue().size();
   }
 
-  private boolean isTaskCancelled(long key, long generation) {
+  private boolean isTaskCancelled(long key, long generation, long epoch) {
+    if (buildEpoch.get() != epoch || !initialized) {
+      return true;
+    }
     synchronized (dirtyGeneration) {
       return dirtyGeneration.get(key) != generation;
     }
@@ -680,24 +809,30 @@ public class CustomChunkMesher {
     }
   }
 
-  private void removeEmptyMesh(long key, int chunkX, int chunkY, int chunkZ) {
-    synchronized (meshCache) {
-      ChunkMeshData old = meshCache.remove(key);
-      if (old != null) {
-        NativeBridge.nUnregisterChunkMesh(chunkX, chunkY, chunkZ);
-        NativeBridge.nDestroyBuffer(old.bufferHandle);
-        meshCountAtomic.decrementAndGet();
-        vertexCountAtomic.addAndGet(-old.quadCount * 4);
+  private void removeEmptyMesh(long key, int chunkX, int chunkY, int chunkZ,
+      long generation, long epoch) {
+    synchronized (publishLock) {
+      if (isTaskCancelled(key, generation, epoch)) {
+        return;
       }
+      synchronized (meshCache) {
+        ChunkMeshData old = meshCache.remove(key);
+        if (old != null) {
+          NativeBridge.nUnregisterChunkMesh(chunkX, chunkY, chunkZ);
+          NativeBridge.nDestroyBuffer(old.bufferHandle);
+          meshCountAtomic.decrementAndGet();
+          vertexCountAtomic.addAndGet(-old.quadCount * 4);
+        }
+      }
+      synchronized (emptyKeys) {
+        emptyKeys.add(key);
+      }
+      synchronized (dirtyKeys) {
+        dirtyKeys.remove(key);
+      }
+      meshUpdateGeneration.incrementAndGet();
+      recordVisibleLatency(key);
     }
-    synchronized (emptyKeys) {
-      emptyKeys.add(key);
-    }
-    synchronized (dirtyKeys) {
-      dirtyKeys.remove(key);
-    }
-    meshUpdateGeneration.incrementAndGet();
-    recordVisibleLatency(key);
   }
 
   private static final class SectionSnapshot {
@@ -947,16 +1082,16 @@ public class CustomChunkMesher {
 
   private void doMeshBuild(int chunkX, int chunkY, int chunkZ,
       SectionSnapshot snapshot, long key, long generation,
-      MeshBuildContext context) {
+      long epoch, MeshBuildContext context) {
     long buildStart = System.nanoTime();
     try {
-      if (isTaskCancelled(key, generation)) {
+      if (isTaskCancelled(key, generation, epoch)) {
         return;
       }
 
       if (snapshot != null && snapshot.paddedBlockStates != null &&
           isSectionFullyOccluded(snapshot.paddedBlockStates)) {
-        removeEmptyMesh(key, chunkX, chunkY, chunkZ);
+        removeEmptyMesh(key, chunkX, chunkY, chunkZ, generation, epoch);
         return;
       }
 
@@ -969,13 +1104,16 @@ public class CustomChunkMesher {
           snapshot, context, chunkX, chunkY, chunkZ);
 
       builder.build();
+      if (isTaskCancelled(key, generation, epoch)) {
+        return;
+      }
 
       int opaqueQuadCount = builder.opaqueQuadCount;
       int waterQuadCount = builder.waterQuadCount;
       int quadCount = opaqueQuadCount + waterQuadCount;
 
       if (quadCount == 0) {
-        removeEmptyMesh(key, chunkX, chunkY, chunkZ);
+        removeEmptyMesh(key, chunkX, chunkY, chunkZ, generation, epoch);
         return;
       }
 
@@ -992,79 +1130,124 @@ public class CustomChunkMesher {
       long visibilityMask = computeVisibilityMask(snapshot.paddedBlockStates);
       int dataLen = quadCount * 4 * VERTEX_STRIDE;
 
-      if (isTaskCancelled(key, generation)) {
+      if (isTaskCancelled(key, generation, epoch)) {
         return;
       }
 
       int roundedSize = roundToSizeClass(dataLen);
-      long oldHintHandle = 0;
-      synchronized (meshCache) {
-        ChunkMeshData existing = meshCache.get(key);
-        if (existing != null) {
-          oldHintHandle = existing.bufferHandle;
+      synchronized (publishLock) {
+        if (isTaskCancelled(key, generation, epoch)) {
+          return;
         }
-      }
 
-      long bufferHandle;
-      UPLOAD_SEMAPHORE.acquireUninterruptibly();
-      try {
-        bufferHandle = NativeBridge.nCreateBufferWithHint(
-            deviceHandle, roundedSize, NativeMemory.STORAGE_MODE_SHARED, oldHintHandle);
-        long uploadStart = System.nanoTime();
-        NativeBridge.nUploadBufferDataDirect(bufferHandle, vertexBuffer, 0, dataLen);
-        MetalRenderProfiler.getInstance().recordUploadTime(System.nanoTime() - uploadStart);
-        MetalRenderProfiler.getInstance().incrementUploadsDone(1);
-      } finally {
-        UPLOAD_SEMAPHORE.release();
-      }
-
-      ChunkMeshData mesh = new ChunkMeshData(bufferHandle, quadCount, chunkX, chunkY, chunkZ,
-          context.buildPlayerCX, context.buildPlayerCY, context.buildPlayerCZ,
-          visibilityMask, facingQuadCounts);
-      ChunkMeshData old;
-      synchronized (meshCache) {
-        old = meshCache.put(key, mesh);
-      }
-      if (old == null) {
-        meshCountAtomic.incrementAndGet();
-        vertexCountAtomic.addAndGet(mesh.quadCount * 4);
-      } else {
-        vertexCountAtomic.addAndGet(mesh.quadCount * 4 - old.quadCount * 4);
-      }
-
-      int flushCount = -1;
-      synchronized (batchRegData) {
-        int idx = batchRegCount * 8;
-        batchRegData[idx] = (chunkX & 0xFFFFFFFFL) | ((long) chunkY << 32);
-        batchRegData[idx + 1] = (chunkZ & 0xFFFFFFFFL) | ((long) quadCount << 32);
-        batchRegData[idx + 2] = bufferHandle;
-        batchRegData[idx + 3] = visibilityMask;
-        batchRegData[idx + 4] = (opaqueQuadCount & 0xFFFFFFFFL)
-            | ((long) (facingQuadCounts.length > 0 ? facingQuadCounts[0] : 0) << 32);
-        batchRegData[idx + 5] = ((long) (facingQuadCounts.length > 1 ? facingQuadCounts[1] : 0) & 0xFFFFFFFFL)
-            | ((long) (facingQuadCounts.length > 2 ? facingQuadCounts[2] : 0) << 32);
-        batchRegData[idx + 6] = ((long) (facingQuadCounts.length > 3 ? facingQuadCounts[3] : 0) & 0xFFFFFFFFL)
-            | ((long) (facingQuadCounts.length > 4 ? facingQuadCounts[4] : 0) << 32);
-        batchRegData[idx + 7] = ((long) (facingQuadCounts.length > 5 ? facingQuadCounts[5] : 0) & 0xFFFFFFFFL)
-            | ((long) (facingQuadCounts.length > 6 ? facingQuadCounts[6] : 0) << 32);
-        batchRegCount++;
-        if (batchRegCount >= BATCH_REG_CAPACITY) {
-          flushCount = batchRegCount;
-          batchRegCount = 0;
+        long oldHintHandle = 0;
+        synchronized (meshCache) {
+          ChunkMeshData existing = meshCache.get(key);
+          if (existing != null) {
+            oldHintHandle = existing.bufferHandle;
+          }
         }
-      }
-      if (flushCount > 0) {
-        NativeBridge.nRegisterChunkMeshBatch(flushCount, batchRegData);
-      }
-      if (old != null && old.bufferHandle != bufferHandle) {
-        NativeBridge.nDestroyBuffer(old.bufferHandle);
-      }
 
-      meshUpdateGeneration.incrementAndGet();
-      recordVisibleLatency(key);
-      MetalRenderProfiler.getInstance().incrementMeshesBuilt(1);
-      synchronized (dirtyKeys) {
-        dirtyKeys.remove(key);
+        long bufferHandle;
+        UPLOAD_SEMAPHORE.acquireUninterruptibly();
+        try {
+          if (isTaskCancelled(key, generation, epoch)) {
+            return;
+          }
+          bufferHandle = NativeBridge.nCreateBufferWithHint(
+              deviceHandle, roundedSize, NativeMemory.STORAGE_MODE_SHARED,
+              oldHintHandle);
+          if (bufferHandle == 0) {
+            logBufferBudgetExhausted(chunkX, chunkY, chunkZ, roundedSize);
+            markDirty(chunkX, chunkY, chunkZ);
+            return;
+          }
+          if (isTaskCancelled(key, generation, epoch)) {
+            destroyReplacementBuffer(bufferHandle, oldHintHandle);
+            return;
+          }
+          long uploadStart = System.nanoTime();
+          NativeBridge.nUploadBufferDataDirect(bufferHandle, vertexBuffer, 0,
+              dataLen);
+          MetalRenderProfiler.getInstance().recordUploadTime(
+              System.nanoTime() - uploadStart);
+          MetalRenderProfiler.getInstance().incrementUploadsDone(1);
+        } finally {
+          UPLOAD_SEMAPHORE.release();
+        }
+
+        if (isTaskCancelled(key, generation, epoch)) {
+          destroyReplacementBuffer(bufferHandle, oldHintHandle);
+          return;
+        }
+
+        ChunkMeshData mesh = new ChunkMeshData(bufferHandle, quadCount, chunkX,
+            chunkY, chunkZ, context.buildPlayerCX, context.buildPlayerCY,
+            context.buildPlayerCZ, visibilityMask, facingQuadCounts);
+        ChunkMeshData old;
+        synchronized (meshCache) {
+          if (isTaskCancelled(key, generation, epoch)) {
+            destroyReplacementBuffer(bufferHandle, oldHintHandle);
+            return;
+          }
+          old = meshCache.put(key, mesh);
+        }
+        if (old == null) {
+          meshCountAtomic.incrementAndGet();
+          vertexCountAtomic.addAndGet(mesh.quadCount * 4);
+        } else {
+          vertexCountAtomic.addAndGet(
+              mesh.quadCount * 4 - old.quadCount * 4);
+        }
+
+        int flushCount = -1;
+        synchronized (batchRegData) {
+          int idx = batchRegCount * 8;
+          batchRegData[idx] = (chunkX & 0xFFFFFFFFL) |
+              ((long) chunkY << 32);
+          batchRegData[idx + 1] = (chunkZ & 0xFFFFFFFFL) |
+              ((long) quadCount << 32);
+          batchRegData[idx + 2] = bufferHandle;
+          batchRegData[idx + 3] = visibilityMask;
+          batchRegData[idx + 4] = (opaqueQuadCount & 0xFFFFFFFFL)
+              | ((long) (facingQuadCounts.length > 0
+                  ? facingQuadCounts[0] : 0) << 32);
+          batchRegData[idx + 5] =
+              ((long) (facingQuadCounts.length > 1
+                  ? facingQuadCounts[1] : 0) & 0xFFFFFFFFL)
+                  | ((long) (facingQuadCounts.length > 2
+                      ? facingQuadCounts[2] : 0) << 32);
+          batchRegData[idx + 6] =
+              ((long) (facingQuadCounts.length > 3
+                  ? facingQuadCounts[3] : 0) & 0xFFFFFFFFL)
+                  | ((long) (facingQuadCounts.length > 4
+                      ? facingQuadCounts[4] : 0) << 32);
+          batchRegData[idx + 7] =
+              ((long) (facingQuadCounts.length > 5
+                  ? facingQuadCounts[5] : 0) & 0xFFFFFFFFL)
+                  | ((long) (facingQuadCounts.length > 6
+                      ? facingQuadCounts[6] : 0) << 32);
+          batchRegCount++;
+          if (batchRegCount >= BATCH_REG_CAPACITY) {
+            flushCount = batchRegCount;
+            batchRegCount = 0;
+          }
+        }
+        if (flushCount > 0) {
+          NativeBridge.nRegisterChunkMeshBatch(flushCount, batchRegData);
+        }
+        if (old != null && old.bufferHandle != bufferHandle) {
+          NativeBridge.nDestroyBuffer(old.bufferHandle);
+        }
+
+        meshUpdateGeneration.incrementAndGet();
+        recordVisibleLatency(key);
+        MetalRenderProfiler.getInstance().incrementMeshesBuilt(1);
+        if (!isTaskCancelled(key, generation, epoch)) {
+          synchronized (dirtyKeys) {
+            dirtyKeys.remove(key);
+          }
+        }
       }
     } catch (Exception e) {
       java.io.StringWriter sw = new java.io.StringWriter();
@@ -1073,9 +1256,27 @@ public class CustomChunkMesher {
     } finally {
       long buildElapsed = System.nanoTime() - buildStart;
       MetalRenderProfiler.getInstance().recordMeshingTime(buildElapsed);
-      synchronized (pendingKeys) {
-        pendingKeys.remove(key);
-      }
+    }
+  }
+
+  private void logBufferBudgetExhausted(int chunkX, int chunkY, int chunkZ,
+      int requestedBytes) {
+    long now = System.nanoTime();
+    long previous = lastBufferBudgetLogNs.get();
+    if (now - previous < 1_000_000_000L ||
+        !lastBufferBudgetLogNs.compareAndSet(previous, now)) {
+      return;
+    }
+    MetalLogger.warn(
+        "terrain buffer budget exhausted at [%d,%d,%d] (%d bytes); " +
+            "keeping the previous/vanilla mesh and retrying",
+        chunkX, chunkY, chunkZ, requestedBytes);
+  }
+
+  private static void destroyReplacementBuffer(long bufferHandle,
+      long oldHintHandle) {
+    if (bufferHandle != 0 && bufferHandle != oldHintHandle) {
+      NativeBridge.nDestroyBuffer(bufferHandle);
     }
   }
 
@@ -1175,13 +1376,19 @@ public class CustomChunkMesher {
           if (shouldCullFace(lx, ly, lz, direction, state))
             continue;
           for (BakedQuad quad : quads) {
-            emitBakedQuad(quad, lx, ly, lz, state, false);
+            if (quad.materialInfo().layer() !=
+                ChunkSectionLayer.TRANSLUCENT) {
+              emitBakedQuad(quad, lx, ly, lz, state, false);
+            }
           }
         }
         List<BakedQuad> noCull = part.getQuads(null);
         if (noCull != null) {
           for (BakedQuad quad : noCull) {
-            emitBakedQuad(quad, lx, ly, lz, state, false);
+            if (quad.materialInfo().layer() !=
+                ChunkSectionLayer.TRANSLUCENT) {
+              emitBakedQuad(quad, lx, ly, lz, state, false);
+            }
           }
         }
       }

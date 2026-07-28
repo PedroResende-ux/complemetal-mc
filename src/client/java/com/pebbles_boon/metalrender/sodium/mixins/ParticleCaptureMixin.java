@@ -3,14 +3,18 @@ package com.pebbles_boon.metalrender.sodium.mixins;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.particle.MetalParticleRenderer;
+import com.pebbles_boon.metalrender.render.MetalRenderHookState;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
+import com.pebbles_boon.metalrender.sodium.mixins.accessor.ParticleGroupAccessor;
 import com.pebbles_boon.metalrender.sodium.mixins.accessor.ParticleManagerAccessor;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import java.util.Map;
 import net.minecraft.client.Camera;
+import net.minecraft.client.particle.NoRenderParticleGroup;
 import net.minecraft.client.particle.ParticleEngine;
 import net.minecraft.client.particle.ParticleGroup;
 import net.minecraft.client.particle.ParticleRenderType;
+import net.minecraft.client.particle.QuadParticleGroup;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.state.level.ParticlesRenderState;
 import org.spongepowered.asm.mixin.Mixin;
@@ -24,50 +28,74 @@ public class ParticleCaptureMixin {
   @Unique
   private int metalrender$captureFrameCount = 0;
 
-  @Inject(method = "extract", at = @At("HEAD"), cancellable = true, require = 0)
-  private void metalrender$captureAndCancelParticles(ParticlesRenderState renderState,
+  @Inject(method = "extract", at = @At("TAIL"), require = 1)
+  private void metalrender$captureParticles(ParticlesRenderState renderState,
       Frustum frustum, Camera camera,
       float tickDelta, CallbackInfo ci) {
+    MetalRenderHookState.markParticleCaptureIncomplete();
     if (!MetalRenderClient.isEnabled())
+      return;
+    MetalRenderConfig config = MetalRenderClient.getConfig();
+    if (config == null || !config.enableExperimentalFeatureReplacement)
       return;
     MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
     if (worldRenderer == null || !worldRenderer.metalActive())
       return;
-    int loadingBacklog = worldRenderer.getLoadingModePendingCount();
-    if (loadingBacklog > 3000 && (worldRenderer.getFrameCount() % 3) != 0) {
-      ci.cancel();
-      return;
-    }
     MetalParticleRenderer particleRenderer = worldRenderer.getParticleRenderer();
-    if (particleRenderer == null || !particleRenderer.isActive())
+    if (particleRenderer == null)
       return;
-    particleRenderer.capture((ParticleEngine) (Object) this, camera, tickDelta);
+    particleRenderer.discardCapturedParticles();
+    if (!particleRenderer.isActive())
+      return;
     try {
+      particleRenderer.capture((ParticleEngine) (Object) this, camera,
+          tickDelta);
       ParticleManagerAccessor accessor = (ParticleManagerAccessor) (Object) this;
       Map<ParticleRenderType, ParticleGroup<?>> particlesMap = accessor.metalrender$getParticles();
-      if (particlesMap != null) {
-        for (Map.Entry<ParticleRenderType, ParticleGroup<?>> entry : particlesMap.entrySet()) {
-          ParticleGroup<?> group = entry.getValue();
-          if (group != null && !group.isEmpty()) {
-            particleRenderer.captureParticleList(group.getAll(), camera,
-                tickDelta);
+      if (particlesMap == null) {
+        particleRenderer.discardCapturedParticles();
+        return;
+      }
+
+      for (ParticleGroup<?> group : particlesMap.values()) {
+        if (group == null || group.isEmpty() ||
+            group instanceof NoRenderParticleGroup) {
+          continue;
+        }
+        if (!(group instanceof QuadParticleGroup)) {
+          particleRenderer.discardCapturedParticles();
+          return;
+        }
+      }
+
+      for (ParticleGroup<?> group : particlesMap.values()) {
+        if (group instanceof QuadParticleGroup && !group.isEmpty()) {
+          boolean capturedCompletely = particleRenderer.captureParticleList(
+              ((ParticleGroupAccessor) (Object) group)
+                  .metalrender$getParticles(),
+              frustum, camera, tickDelta);
+          if (!capturedCompletely) {
+            particleRenderer.discardCapturedParticles();
+            return;
           }
         }
       }
-    } catch (Exception e) {
+      MetalRenderHookState.markParticleCaptureComplete();
+    } catch (Throwable e) {
+      particleRenderer.discardCapturedParticles();
+      MetalRenderHookState.failOpenParticles("particle-capture", e);
       if (metalrender$captureFrameCount < 5) {
         MetalLogger.error("[particlemix] cap fail: %s", e.getMessage());
-        e.printStackTrace();
       }
+      return;
     }
     metalrender$captureFrameCount++;
     if (MetalRenderConfig.isDeepDebugActive() &&
         (metalrender$captureFrameCount <= 3 ||
             metalrender$captureFrameCount % 500 == 0)) {
       MetalLogger.info(
-          "[particlemix] cap frame %d, cancel gl",
+          "[particlemix] cap frame %d",
           metalrender$captureFrameCount);
     }
-    ci.cancel();
   }
 }

@@ -1,34 +1,313 @@
 package com.pebbles_boon.metalrender.nativebridge;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFilePermission;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
+import java.util.Set;
+
 public final class NativeBridge {
-  private static volatile boolean libLoaded;
-  static {
-    try {
-      System.loadLibrary("metalrender");
-      libLoaded = true;
-    } catch (UnsatisfiedLinkError e) {
-      System.err.println("[MetalRender] native metalrender library unavailable: "
-          + e.getMessage());
-      libLoaded = false;
-    } catch (Throwable t) {
-      System.err.println("[MetalRender] native metalrender library failed to load: "
-          + t.getClass().getSimpleName() + ": " + t.getMessage());
-      libLoaded = false;
-    }
+  private static final String LIBRARY_BASENAME = "libmetalrender.dylib";
+  private static final String SHADER_LIBRARY_BASENAME = "shaders.metallib";
+  private static final String[] LIBRARY_RESOURCES = {
+      "/native/macos-arm64/" + LIBRARY_BASENAME,
+      "/" + LIBRARY_BASENAME
+  };
+  private static final String[] SHADER_LIBRARY_RESOURCES = {
+      "/native/macos-arm64/" + SHADER_LIBRARY_BASENAME,
+      "/" + SHADER_LIBRARY_BASENAME
+  };
+
+  private record ResourcePayload(byte[] bytes, String resourceName,
+                                 String sha256) {
   }
+
+  private record PackagedNativePayload(Path libraryPath,
+                                       Path shaderLibraryPath) {
+  }
+
+  public enum LoadState {
+    NOT_TRIED,
+    READY,
+    UNSUPPORTED,
+    FAILED
+  }
+
+  private static volatile LoadState loadState = LoadState.NOT_TRIED;
+  private static volatile boolean libLoaded;
+  private static volatile String loadedPath;
+  private static volatile String loadFailure;
 
   private NativeBridge() {
   }
 
-  public static void loadLibrary() {
-    if (!libLoaded) {
+  public static synchronized void loadLibrary() {
+    if (loadState == LoadState.READY) {
+      return;
+    }
+    if (loadState == LoadState.UNSUPPORTED) {
+      throw new UnsatisfiedLinkError(loadFailure);
+    }
+
+    String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+    String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
+    if (!os.contains("mac") || !(arch.contains("aarch64") || arch.contains("arm64"))) {
+      markLoadFailure(LoadState.UNSUPPORTED,
+          "MetalRender native backend requires macOS on Apple Silicon; found "
+              + os + "/" + arch);
+      throw new UnsatisfiedLinkError(loadFailure);
+    }
+
+    String explicitPath = System.getProperty("metalrender.native.path", "").trim();
+    if (!explicitPath.isEmpty()) {
+      try {
+        Path candidate = Path.of(explicitPath).toAbsolutePath().normalize();
+        System.load(candidate.toString());
+        markLoaded(candidate.toString());
+        return;
+      } catch (Throwable t) {
+        markLoadFailure(LoadState.FAILED,
+            "explicit native path failed: " + safeMessage(t));
+        throw asLinkError(loadFailure, t);
+      }
+    }
+
+    // A complete packaged payload is the production path. Prefer its
+    // checksum-paired dylib/metallib over java.library.path so an unrelated or
+    // stale development library cannot shadow the release artifact.
+    if (hasPackagedResource(LIBRARY_RESOURCES)
+        && hasPackagedResource(SHADER_LIBRARY_RESOURCES)) {
+      try {
+        PackagedNativePayload extracted = extractPackagedPayload();
+        System.load(extracted.libraryPath().toString());
+        markLoaded(extracted.libraryPath().toString());
+        return;
+      } catch (Throwable packagedFailure) {
+        markLoadFailure(LoadState.FAILED,
+            "packaged native payload failed: " + safeMessage(packagedFailure));
+        throw asLinkError(loadFailure, packagedFailure);
+      }
+    }
+
+    Throwable libraryPathFailure = null;
+    try {
       System.loadLibrary("metalrender");
-      libLoaded = true;
+      markLoaded("java.library.path:metalrender");
+      return;
+    } catch (Throwable t) {
+      libraryPathFailure = t;
+    }
+
+    try {
+      PackagedNativePayload extracted = extractPackagedPayload();
+      System.load(extracted.libraryPath().toString());
+      markLoaded(extracted.libraryPath().toString());
+    } catch (Throwable extractionFailure) {
+      String firstFailure = safeMessage(libraryPathFailure);
+      markLoadFailure(LoadState.FAILED,
+          "native load failed (java.library.path: " + firstFailure
+              + "; packaged library: " + safeMessage(extractionFailure) + ")");
+      throw asLinkError(loadFailure, extractionFailure);
     }
   }
 
   public static boolean isLibLoaded() {
     return libLoaded;
+  }
+
+  public static LoadState getLoadState() {
+    return loadState;
+  }
+
+  public static String getLoadedPath() {
+    return loadedPath;
+  }
+
+  public static String getLoadFailure() {
+    return loadFailure;
+  }
+
+  private static boolean hasPackagedResource(String[] candidates) {
+    for (String resource : candidates) {
+      if (NativeBridge.class.getResource(resource) != null) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static PackagedNativePayload extractPackagedPayload()
+      throws IOException, NoSuchAlgorithmException {
+    ResourcePayload library = readRequiredResource(
+        LIBRARY_BASENAME, LIBRARY_RESOURCES);
+    ResourcePayload shaders = readRequiredResource(
+        SHADER_LIBRARY_BASENAME, SHADER_LIBRARY_RESOURCES);
+    validateMetallib(shaders);
+
+    String version = implementationVersion();
+    Path cacheRoot = Path.of(System.getProperty("user.home"), "Library", "Caches",
+        "MetalRender", "native", version,
+        library.sha256().substring(0, 16)
+            + "-" + shaders.sha256().substring(0, 16));
+    Files.createDirectories(cacheRoot);
+
+    // The native backend resolves shaders.metallib relative to its own image.
+    // Materialize the shader first so it is present before System.load invokes
+    // any native initialization.
+    Path shaderDestination = writeVerifiedResource(
+        cacheRoot, SHADER_LIBRARY_BASENAME, shaders, false);
+    Path libraryDestination = writeVerifiedResource(
+        cacheRoot, LIBRARY_BASENAME, library, true);
+
+    Path manifest = cacheRoot.resolve("payload.sha256");
+    Files.writeString(manifest,
+        library.sha256() + "  " + library.resourceName()
+            + System.lineSeparator()
+            + shaders.sha256() + "  " + shaders.resourceName()
+            + System.lineSeparator());
+    return new PackagedNativePayload(
+        libraryDestination.toAbsolutePath().normalize(),
+        shaderDestination.toAbsolutePath().normalize());
+  }
+
+  private static ResourcePayload readRequiredResource(
+      String basename, String[] candidates)
+      throws IOException, NoSuchAlgorithmException {
+    for (String resource : candidates) {
+      try (InputStream input = NativeBridge.class.getResourceAsStream(resource)) {
+        if (input == null) {
+          continue;
+        }
+        byte[] bytes = input.readAllBytes();
+        if (bytes.length == 0) {
+          throw new IOException("packaged " + basename + " is empty: " + resource);
+        }
+        String digest = HexFormat.of().formatHex(
+            MessageDigest.getInstance("SHA-256").digest(bytes));
+        return new ResourcePayload(bytes, resource, digest);
+      }
+    }
+    throw new IOException("no packaged " + basename + " resource");
+  }
+
+  private static void validateMetallib(ResourcePayload shaders)
+      throws IOException {
+    byte[] bytes = shaders.bytes();
+    if (bytes.length < 4
+        || bytes[0] != 'M'
+        || bytes[1] != 'T'
+        || bytes[2] != 'L'
+        || bytes[3] != 'B') {
+      throw new IOException("packaged " + SHADER_LIBRARY_BASENAME
+          + " is not a Metal library: " + shaders.resourceName());
+    }
+  }
+
+  private static Path writeVerifiedResource(
+      Path cacheRoot, String basename, ResourcePayload payload,
+      boolean executable)
+      throws IOException, NoSuchAlgorithmException {
+    Path destination = cacheRoot.resolve(basename);
+    byte[] bytes = payload.bytes();
+    if (!Files.exists(destination)
+        || Files.size(destination) != bytes.length
+        || !payload.sha256().equals(sha256(destination))) {
+      Path temporary = Files.createTempFile(cacheRoot, basename, ".tmp");
+      try {
+        Files.write(temporary, bytes);
+        if (executable) {
+          makeExecutable(temporary);
+        }
+        try {
+          Files.move(temporary, destination, StandardCopyOption.ATOMIC_MOVE,
+              StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException ignored) {
+          Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING);
+        }
+      } finally {
+        Files.deleteIfExists(temporary);
+      }
+    }
+    if (executable) {
+      makeExecutable(destination);
+    }
+
+    Path checksum = cacheRoot.resolve(basename + ".sha256");
+    Files.writeString(checksum,
+        payload.sha256() + "  " + payload.resourceName()
+            + System.lineSeparator());
+    return destination;
+  }
+
+  private static void makeExecutable(Path path) {
+    try {
+      Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(path);
+      permissions.add(PosixFilePermission.OWNER_READ);
+      permissions.add(PosixFilePermission.OWNER_WRITE);
+      permissions.add(PosixFilePermission.OWNER_EXECUTE);
+      Files.setPosixFilePermissions(path, permissions);
+    } catch (IOException | UnsupportedOperationException ignored) {
+      path.toFile().setReadable(true, true);
+      path.toFile().setWritable(true, true);
+      path.toFile().setExecutable(true, true);
+    }
+  }
+
+  private static String sha256(Path path)
+      throws IOException, NoSuchAlgorithmException {
+    MessageDigest digest = MessageDigest.getInstance("SHA-256");
+    try (InputStream input = Files.newInputStream(path)) {
+      byte[] chunk = new byte[64 * 1024];
+      int read;
+      while ((read = input.read(chunk)) >= 0) {
+        digest.update(chunk, 0, read);
+      }
+    }
+    return HexFormat.of().formatHex(digest.digest());
+  }
+
+  private static String implementationVersion() {
+    String version = NativeBridge.class.getPackage().getImplementationVersion();
+    if (version == null || version.isBlank()) {
+      version = System.getProperty("metalrender.version", "development");
+    }
+    return version.replaceAll("[^A-Za-z0-9._-]", "_");
+  }
+
+  private static void markLoaded(String path) {
+    loadedPath = path;
+    loadFailure = null;
+    libLoaded = true;
+    loadState = LoadState.READY;
+  }
+
+  private static void markLoadFailure(LoadState state, String message) {
+    libLoaded = false;
+    loadedPath = null;
+    loadFailure = message;
+    loadState = state;
+    System.err.println("[MetalRender] " + message);
+  }
+
+  private static String safeMessage(Throwable throwable) {
+    if (throwable == null) {
+      return "unknown";
+    }
+    String message = throwable.getMessage();
+    return throwable.getClass().getSimpleName()
+        + (message == null || message.isBlank() ? "" : ": " + message);
+  }
+
+  private static UnsatisfiedLinkError asLinkError(String message, Throwable cause) {
+    UnsatisfiedLinkError error = new UnsatisfiedLinkError(message);
+    error.initCause(cause);
+    return error;
   }
 
   public static native boolean nIsAvailable();
@@ -131,6 +410,8 @@ public final class NativeBridge {
   public static native void nWaitForRender(long handle);
 
   public static native boolean nIsFrameReady(long handle);
+
+  public static native void nRecycleUnpresentedFrames(long handle);
 
   public static native void nSetReuseTerrainFrame(boolean reuse);
 
@@ -235,10 +516,6 @@ public final class NativeBridge {
   public static native int nDrawAllVisibleChunks(long frameContext,
       long indexBuffer);
 
-  public static native int nBatchPackFaces(long outBufferAddr, int outOffset,
-      java.nio.ByteBuffer faceData,
-      int faceCount);
-
   public static native void nWatchdogReset();
 
   public static native void nFlushFrames();
@@ -257,6 +534,16 @@ public final class NativeBridge {
       boolean enableMeshShaders, boolean enableArgumentBuffers,
       boolean enableProgrammableBlending);
 
+  public static native void nConfigureRuntime(boolean enableMetal4,
+      int memoryBudgetMB, int targetFrameRate, boolean tripleBuffering);
+
+  public static native boolean nSupportsMetal4();
+
+  public static native boolean nIsMetal4Active();
+
+  public static native boolean nIsMetal4DrawPathActive();
+
+  public static native String nGetBackendMode();
 
   public static native void nDrawOITPass(long frameContext);
 

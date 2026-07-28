@@ -281,8 +281,8 @@ fragment half4 fragment_terrain_opaque(
 ) {
     constexpr sampler texSampler(mag_filter::nearest, min_filter::nearest, mip_filter::nearest);
     half4 texColor = blockAtlas.sample(texSampler, in.texCoord);
-    if (texColor.a < half(0.001)) {
-        texColor.a = half(1.0);
+    if (texColor.a < half(0.1)) {
+        discard_fragment();
     }
     half4 tinted = texColor * in.color;
     half faceShade = kFaceShade[min(in.normalIndex, 5u)];
@@ -297,8 +297,8 @@ fragment half4 fragment_terrain_icb_opaque(
 ) {
     constexpr sampler texSampler(mag_filter::nearest, min_filter::nearest, mip_filter::nearest);
     half4 texColor = resources.blockAtlas.sample(texSampler, in.texCoord);
-    if (texColor.a < half(0.001)) {
-        texColor.a = half(1.0);
+    if (texColor.a < half(0.1)) {
+        discard_fragment();
     }
     half4 tinted = texColor * in.color;
     half faceShade = kFaceShade[min(in.normalIndex, 5u)];

@@ -43,7 +43,8 @@ bool projectAABB(float3 minC, float3 maxC, float4x4 vp, float2 screen,
                  thread float4& screenRect, thread float& closestDepth) {
     float2 ssMin = float2(1e10);
     float2 ssMax = float2(-1e10);
-    closestDepth = 1.0;
+    // Reversed-Z: the closest corner has the largest depth value.
+    closestDepth = 0.0;
     bool anyValid = false;
     for (uint i = 0; i < 8; i++) {
         float3 corner = float3(
@@ -54,13 +55,13 @@ bool projectAABB(float3 minC, float3 maxC, float4x4 vp, float2 screen,
         float4 proj = projectPoint(corner, vp);
         if (proj.w <= 0.0) {
             screenRect = float4(0, 0, screen.x, screen.y);
-            closestDepth = 0.0;
+            closestDepth = 1.0;
             return true;
         }
         float2 ss = (proj.xy * 0.5 + 0.5) * screen;
         ssMin = min(ssMin, ss);
         ssMax = max(ssMax, ss);
-        closestDepth = min(closestDepth, proj.z * 0.5 + 0.5);
+        closestDepth = max(closestDepth, clamp(proj.z, 0.0, 1.0));
         anyValid = true;
     }
     if (!anyValid) return false;
@@ -111,7 +112,7 @@ kernel void occlusion_cull(
         constexpr sampler hizSampler(filter::nearest, address::clamp_to_edge);
         float2 center = (screenRect.xy + screenRect.zw) * 0.5 / params.screenSize;
         float hizDepth = hizPyramid.sample(hizSampler, center, level(float(mipLevel))).r;
-        if (closestDepth > hizDepth) {
+        if (closestDepth + 1e-5 < hizDepth) {
             visibility[gid] = 0;
             return;
         }

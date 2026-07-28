@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+jar_path="${1:-}"
+
+if [[ -z "$jar_path" ]]; then
+  jar_path="$(find "$project_dir/build/libs" -maxdepth 1 -type f -name '*.jar' \
+    ! -name '*-sources.jar' | sort | tail -n 1)"
+fi
+
+if [[ -z "$jar_path" || ! -f "$jar_path" ]]; then
+  echo "Release JAR was not found" >&2
+  exit 1
+fi
+jar_path="$(cd "$(dirname "$jar_path")" && pwd)/$(basename "$jar_path")"
+
+entries="$(jar tf "$jar_path")"
+required_entries=(
+  "META-INF/MANIFEST.MF"
+  "fabric.mod.json"
+  "metalrender.mixins.json"
+  "libmetalrender.dylib"
+  "shaders.metallib"
+  "LICENSE"
+)
+
+for required in "${required_entries[@]}"; do
+  if ! grep -Fxq "$required" <<<"$entries"; then
+    echo "Missing required JAR entry: $required" >&2
+    exit 1
+  fi
+done
+
+if grep -Fxq "libmetalrender_debug_v2.dylib" <<<"$entries"; then
+  echo "Release JAR contains the obsolete duplicate debug dylib" >&2
+  exit 1
+fi
+
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/metalrender-jar.XXXXXX")"
+trap 'rm -rf "$tmp_dir"' EXIT
+(cd "$tmp_dir" && jar xf "$jar_path" \
+  libmetalrender.dylib shaders.metallib \
+  fabric.mod.json metalrender.mixins.json LICENSE META-INF/MANIFEST.MF)
+
+if ! file "$tmp_dir/libmetalrender.dylib" | grep -q 'Mach-O 64-bit.*arm64'; then
+  echo "Packaged native library is not macOS arm64" >&2
+  exit 1
+fi
+
+shader_size="$(wc -c < "$tmp_dir/shaders.metallib" | tr -d '[:space:]')"
+shader_magic="$(LC_ALL=C od -An -tx1 -N4 "$tmp_dir/shaders.metallib" |
+  tr -d '[:space:]')"
+if [[ "$shader_size" -lt 4096 || "$shader_magic" != "4d544c42" ]]; then
+  echo "Packaged shaders.metallib is empty or is not a compiled Metal library" >&2
+  exit 1
+fi
+
+if ! grep -q '"minecraft"[[:space:]]*:[[:space:]]*"[^"]*26\.2' \
+  "$tmp_dir/fabric.mod.json"; then
+  echo "fabric.mod.json does not target Minecraft 26.2" >&2
+  exit 1
+fi
+
+if grep -Fq '${version}' "$tmp_dir/fabric.mod.json"; then
+  echo "fabric.mod.json still contains an unexpanded version placeholder" >&2
+  exit 1
+fi
+
+fabric_version="$(sed -n \
+  's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "$tmp_dir/fabric.mod.json" | head -n 1)"
+manifest_version="$(tr -d '\r' < "$tmp_dir/META-INF/MANIFEST.MF" |
+  sed -n 's/^Implementation-Version: //p' | head -n 1)"
+if [[ -z "$fabric_version" || "$manifest_version" != "$fabric_version" ]]; then
+  echo "JAR manifest and fabric.mod.json versions do not match" >&2
+  exit 1
+fi
+
+if ! grep -Fq '"compatibilityLevel": "JAVA_25"' \
+  "$tmp_dir/metalrender.mixins.json"; then
+  echo "Mixin configuration does not target Java 25" >&2
+  exit 1
+fi
+
+for tool in javac nm rg; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "Required release verification tool is unavailable: $tool" >&2
+    exit 1
+  fi
+done
+
+jni_dir="$tmp_dir/jni"
+mkdir -p "$jni_dir"
+javac -h "$jni_dir" -d "$jni_dir" \
+  "$project_dir/src/client/java/com/pebbles_boon/metalrender/nativebridge/NativeBridge.java"
+jni_header="$jni_dir/com_pebbles_boon_metalrender_nativebridge_NativeBridge.h"
+jni_expected="$jni_dir/expected.txt"
+jni_actual="$jni_dir/actual.txt"
+jni_missing="$jni_dir/missing.txt"
+jni_orphaned="$jni_dir/orphaned.txt"
+
+rg -o \
+  'Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_[A-Za-z0-9_]+' \
+  "$jni_header" | sort -u > "$jni_expected"
+nm -gU "$tmp_dir/libmetalrender.dylib" |
+  rg -o \
+    'Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_[A-Za-z0-9_]+' |
+  sort -u > "$jni_actual"
+comm -23 "$jni_expected" "$jni_actual" > "$jni_missing"
+comm -13 "$jni_expected" "$jni_actual" > "$jni_orphaned"
+
+if [[ -s "$jni_missing" || -s "$jni_orphaned" ]]; then
+  if [[ -s "$jni_missing" ]]; then
+    echo "Packaged dylib is missing JNI exports:" >&2
+    sed 's/^/  - /' "$jni_missing" >&2
+  fi
+  if [[ -s "$jni_orphaned" ]]; then
+    echo "Packaged dylib has orphaned JNI exports:" >&2
+    sed 's/^/  - /' "$jni_orphaned" >&2
+  fi
+  exit 1
+fi
+
+if command -v vtool >/dev/null 2>&1 &&
+   ! vtool -show-build "$tmp_dir/libmetalrender.dylib" |
+     grep -Eq 'minos[[:space:]]+14\.0'; then
+  echo "Packaged native library does not declare macOS 14.0 compatibility" >&2
+  exit 1
+fi
+
+if command -v codesign >/dev/null 2>&1; then
+  codesign --verify "$tmp_dir/libmetalrender.dylib"
+fi
+
+echo "Release JAR verified: $jar_path"
+shasum -a 256 "$jar_path"
+shasum -a 256 "$tmp_dir/shaders.metallib"

@@ -11,7 +11,7 @@ public class MetalRenderCoordinator {
 
   public void initialize() {
     this.initialized = true;
-    MetalLogger.info("metalwender coordinator weady");
+    MetalLogger.info("MetalRender coordinator ready");
   }
 
   public boolean isInitialized() {

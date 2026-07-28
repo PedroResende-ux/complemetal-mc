@@ -13,8 +13,10 @@ public class AsyncCullTask {
   private static final String THREAD_NAME_PREFIX = "MetalRender-AsyncCull";
 
   private static final AtomicLong handleCounter = new AtomicLong(0);
+  private static final AtomicLong worldEpoch = new AtomicLong(0);
   private static final AtomicLong staleFrames = new AtomicLong(0);
   private static final AtomicReference<CullResult> latestRef = new AtomicReference<>();
+  private static final Object publishLock = new Object();
 
   private static final ThreadLocal<FrustumCuller> WORKER_CULLER = ThreadLocal.withInitial(FrustumCuller::new);
 
@@ -30,19 +32,29 @@ public class AsyncCullTask {
 
   public static void submitFrustumUpdate(Matrix4f proj, Matrix4f modelView, Vector3f camPos) {
     long handle = handleCounter.incrementAndGet();
+    long epochAtSubmit = worldEpoch.get();
+    Matrix4f projectionSnapshot = new Matrix4f(proj);
+    Matrix4f modelViewSnapshot = new Matrix4f(modelView);
+    Vector3f cameraSnapshot = new Vector3f(camPos);
     EXECUTOR.submit(() -> {
       try {
         FrustumCuller mine = WORKER_CULLER.get();
-        mine.update(proj, modelView, camPos);
-        CullResult result = new CullResult(mine, handle);
-        CullResult prev;
-        do {
-          prev = latestRef.get();
+        mine.update(projectionSnapshot, modelViewSnapshot, cameraSnapshot);
+        // Never publish the thread-local worker itself. It is mutated again by
+        // the next task and used concurrently by the render thread.
+        CullResult result = new CullResult(mine.snapshot(), handle);
+        synchronized (publishLock) {
+          if (worldEpoch.get() != epochAtSubmit) {
+            staleFrames.incrementAndGet();
+            return;
+          }
+          CullResult prev = latestRef.get();
           if (prev != null && prev.handle >= handle) {
             staleFrames.incrementAndGet();
             return;
           }
-        } while (!latestRef.compareAndSet(prev, result));
+          latestRef.set(result);
+        }
       } catch (Throwable t) {
         MetalLogger.error("async cull ewwor: " + t.getMessage());
       }
@@ -59,8 +71,11 @@ public class AsyncCullTask {
     return r != null ? r.handle : 0L;
   }
   public static void reset() {
-    latestRef.set(null);
-    handleCounter.set(0);
+    synchronized (publishLock) {
+      worldEpoch.incrementAndGet();
+      latestRef.set(null);
+      staleFrames.set(0);
+    }
   }
 
   public static int getStaleFrames() {

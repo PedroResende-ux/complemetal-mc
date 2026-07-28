@@ -1,20 +1,28 @@
 package com.pebbles_boon.metalrender.config;
 
 public final class MetalRenderConfig {
+  public static final int SCHEMA_VERSION = 4;
+
   public boolean enableMetalRendering = true;
+  public boolean enableMetal4 = true;
+  public boolean requireMetal4 = false;
+  public boolean enableFastTerrainReplacement = false;
+  public boolean enableExperimentalFeatureReplacement = false;
+  public boolean enableMetalFX = false;
   public boolean enableSimpleLighting = true;
   public boolean enableDebugOverlay = false;
   public boolean debugPinkBlockTint = false;
   public int leafCullingMode = 1;
   public int biomeTransitionDetail = 2;
   public int targetFrameRate = 60;
+  public boolean autoTargetFrameRate = true;
   public boolean prioritizeFpsOverTps = false;
   public int maxMemoryMB = 2048;
   public boolean enableTripleBuffering = true;
   public boolean enableMemoryPressureFallback = true;
   public boolean enableBurstThreadMode = false;
-  public boolean enableMeshShaders = true;
-  public boolean enableArgumentBuffers = false;
+  public boolean enableMeshShaders = false;
+  public boolean enableArgumentBuffers = true;
   public boolean enableClusterFrustumCulling = false;
   public boolean enableHiZCull = false;
   public boolean enableGpuTranslucencySort = false;
@@ -52,6 +60,8 @@ public final class MetalRenderConfig {
       }
     } catch (Exception e) {
       deepDebugActive = false;
+      com.pebbles_boon.metalrender.util.MetalLogger.warn(
+          "deep debug flag could not be read: %s", e.getMessage());
     }
   }
 
@@ -65,6 +75,18 @@ public final class MetalRenderConfig {
         String raw = java.nio.file.Files.readString(path);
         com.google.gson.JsonObject obj = com.google.gson.JsonParser.parseString(raw).getAsJsonObject();
 
+        if (obj.has("enableMetal4"))
+          cfg.enableMetal4 = obj.get("enableMetal4").getAsBoolean();
+        if (obj.has("requireMetal4"))
+          cfg.requireMetal4 = obj.get("requireMetal4").getAsBoolean();
+        if (obj.has("enableFastTerrainReplacement"))
+          cfg.enableFastTerrainReplacement =
+              obj.get("enableFastTerrainReplacement").getAsBoolean();
+        if (obj.has("enableExperimentalFeatureReplacement"))
+          cfg.enableExperimentalFeatureReplacement =
+              obj.get("enableExperimentalFeatureReplacement").getAsBoolean();
+        if (obj.has("enableMetalFX"))
+          cfg.enableMetalFX = obj.get("enableMetalFX").getAsBoolean();
         if (obj.has("enableMetalRendering"))
           cfg.enableMetalRendering = obj.get("enableMetalRendering").getAsBoolean();
         if (obj.has("enableSimpleLighting"))
@@ -79,6 +101,8 @@ public final class MetalRenderConfig {
           cfg.biomeTransitionDetail = obj.get("biomeTransitionDetail").getAsInt();
         if (obj.has("targetFrameRate"))
           cfg.targetFrameRate = obj.get("targetFrameRate").getAsInt();
+        if (obj.has("autoTargetFrameRate"))
+          cfg.autoTargetFrameRate = obj.get("autoTargetFrameRate").getAsBoolean();
         if (obj.has("prioritizeFpsOverTps"))
           cfg.prioritizeFpsOverTps = obj.get("prioritizeFpsOverTps").getAsBoolean();
         if (obj.has("maxMemoryMB"))
@@ -93,9 +117,17 @@ public final class MetalRenderConfig {
           cfg.enableMeshShaders = obj.get("enableMeshShaders").getAsBoolean();
         if (obj.has("enableArgumentBuffers"))
           cfg.enableArgumentBuffers = obj.get("enableArgumentBuffers").getAsBoolean();
+        if (obj.has("enableProgrammableBlending"))
+          cfg.enableProgrammableBlending = obj.get("enableProgrammableBlending").getAsBoolean();
 
         if (obj.has("enableIndirectCommandBuffers"))
           cfg.enableIndirectCommandBuffers = obj.get("enableIndirectCommandBuffers").getAsBoolean();
+        if (obj.has("enableClusterFrustumCulling"))
+          cfg.enableClusterFrustumCulling = obj.get("enableClusterFrustumCulling").getAsBoolean();
+        if (obj.has("enableHiZCull"))
+          cfg.enableHiZCull = obj.get("enableHiZCull").getAsBoolean();
+        if (obj.has("enableGpuTranslucencySort"))
+          cfg.enableGpuTranslucencySort = obj.get("enableGpuTranslucencySort").getAsBoolean();
 
         if (obj.has("hiddenFluidCulling"))
           cfg.hiddenFluidCulling = obj.get("hiddenFluidCulling").getAsBoolean();
@@ -108,10 +140,11 @@ public final class MetalRenderConfig {
           resolutionScale = clamp(obj.get("savedResolutionScale").getAsFloat(), 0.20f, 1.5f);
       }
     } catch (Exception e) {
-
+      com.pebbles_boon.metalrender.util.MetalLogger.warn(
+          "config load failed, using validated defaults: %s", e.getMessage());
     }
 
-    applyStableQualityFallback(cfg);
+    cfg.validate();
     setDebugPinkBlockTint(cfg.debugPinkBlockTint);
 
     cfg.loadFeatureFlags();
@@ -122,28 +155,50 @@ public final class MetalRenderConfig {
   private MetalRenderConfig() {
   }
 
-  private static void applyStableQualityFallback(MetalRenderConfig cfg) {
-    resolutionScale = 1.0f;
+  private void validate() {
+    leafCullingMode = clamp(leafCullingMode, 0, 2);
+    biomeTransitionDetail = clamp(biomeTransitionDetail, 0, 7);
+    targetFrameRate = clamp(targetFrameRate, 30, 1000);
+    maxMemoryMB = clamp(maxMemoryMB, 512, 2048);
+    resolutionScale = clamp(resolutionScale, 0.20f, 1.0f);
+
+    // These paths are validation-locked in normal builds. Each explicit JVM
+    // property is a complete opt-in for development; no hidden JSON toggle or
+    // second feature flag is required.
+    enableMeshShaders =
+        getBool("metalrender.experimental.meshShaders", false);
+    enableHiZCull = getBool("metalrender.experimental.hiz", false);
+    enableFastTerrainReplacement =
+        getBool("metalrender.experimental.fastTerrainReplacement", false);
+    // Entity/particle replacement still relies on a legacy raw OpenGL
+    // texture readback that is unsafe on the macOS 26 Apple driver. Keep the
+    // path release-locked until it is migrated to fenced GpuTexture readback.
+    enableExperimentalFeatureReplacement = false;
+    if (requireMetal4) {
+      enableMetal4 = true;
+    }
   }
 
   public void save() {
-
-    System.setProperty("metalrender.enabled", String.valueOf(enableMetalRendering));
-    System.setProperty("metalrender.feature.icb",
-        String.valueOf(enableIndirectCommandBuffers));
-    System.setProperty("metalrender.feature.mesh", String.valueOf(enableMeshShaders));
-    System.setProperty("metalrender.feature.argbuf", String.valueOf(enableArgumentBuffers));
-    System.setProperty("metalrender.feature.oit", String.valueOf(enableProgrammableBlending));
-
+    validate();
     try {
       com.google.gson.JsonObject obj = new com.google.gson.JsonObject();
+      obj.addProperty("schemaVersion", SCHEMA_VERSION);
       obj.addProperty("enableMetalRendering", enableMetalRendering);
+      obj.addProperty("enableMetal4", enableMetal4);
+      obj.addProperty("requireMetal4", requireMetal4);
+      obj.addProperty("enableFastTerrainReplacement",
+          enableFastTerrainReplacement);
+      obj.addProperty("enableExperimentalFeatureReplacement",
+          enableExperimentalFeatureReplacement);
+      obj.addProperty("enableMetalFX", enableMetalFX);
       obj.addProperty("enableSimpleLighting", enableSimpleLighting);
       obj.addProperty("enableDebugOverlay", enableDebugOverlay);
       obj.addProperty("debugPinkBlockTint", debugPinkBlockTint);
       obj.addProperty("leafCullingMode", leafCullingMode);
       obj.addProperty("biomeTransitionDetail", biomeTransitionDetail);
       obj.addProperty("targetFrameRate", targetFrameRate);
+      obj.addProperty("autoTargetFrameRate", autoTargetFrameRate);
       obj.addProperty("prioritizeFpsOverTps", prioritizeFpsOverTps);
       obj.addProperty("maxMemoryMB", maxMemoryMB);
       obj.addProperty("enableTripleBuffering", enableTripleBuffering);
@@ -153,6 +208,9 @@ public final class MetalRenderConfig {
       obj.addProperty("enableArgumentBuffers", enableArgumentBuffers);
       obj.addProperty("enableProgrammableBlending", enableProgrammableBlending);
       obj.addProperty("enableIndirectCommandBuffers", enableIndirectCommandBuffers);
+      obj.addProperty("enableClusterFrustumCulling", enableClusterFrustumCulling);
+      obj.addProperty("enableHiZCull", enableHiZCull);
+      obj.addProperty("enableGpuTranslucencySort", enableGpuTranslucencySort);
       obj.addProperty("hiddenFluidCulling", hiddenFluidCulling);
       obj.addProperty("improvedFluidShaping", improvedFluidShaping);
       obj.addProperty("closestPointEntitySort", closestPointEntitySort);
@@ -160,10 +218,25 @@ public final class MetalRenderConfig {
       obj.addProperty("savedResolutionScale", resolutionScale);
       java.nio.file.Path path = configFile();
       java.nio.file.Files.createDirectories(path.getParent());
-      java.nio.file.Files.writeString(path,
-          new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(obj));
+      String json = new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(obj);
+      java.nio.file.Path temporary = java.nio.file.Files.createTempFile(
+          path.getParent(), "metalrender-", ".json.tmp");
+      try {
+        java.nio.file.Files.writeString(temporary, json);
+        try {
+          java.nio.file.Files.move(temporary, path,
+              java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+              java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
+          java.nio.file.Files.move(temporary, path,
+              java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
+      } finally {
+        java.nio.file.Files.deleteIfExists(temporary);
+      }
     } catch (Exception e) {
-
+      com.pebbles_boon.metalrender.util.MetalLogger.warn(
+          "config save failed: %s", e.getMessage());
     }
   }
 
@@ -213,7 +286,8 @@ public final class MetalRenderConfig {
         java.nio.file.Files.deleteIfExists(flagPath);
       }
     } catch (Exception e) {
-
+      com.pebbles_boon.metalrender.util.MetalLogger.warn(
+          "deep debug flag update failed: %s", e.getMessage());
     }
   }
 
@@ -234,7 +308,7 @@ public final class MetalRenderConfig {
   }
 
   public static void setResolutionScale(float v) {
-    resolutionScale = clamp(v, 0.20f, 1.5f);
+    resolutionScale = clamp(v, 0.20f, 1.0f);
   }
 
   public static void setDebugPinkBlockTint(boolean v) {
@@ -246,10 +320,15 @@ public final class MetalRenderConfig {
     swapOpaque = getBool("metalrender.swap.opaque", swapOpaque);
     swapCutout = getBool("metalrender.swap.cutout", swapCutout);
     swapTranslucent = getBool("metalrender.swap.translucent", swapTranslucent);
-    resolutionScale = getFloat("metalrender.render.resolutionScale", resolutionScale);
+    resolutionScale = clamp(
+        getFloat("metalrender.render.resolutionScale", resolutionScale),
+        0.20f, 1.0f);
   }
 
   public void loadFeatureFlags() {
+    enableMetalRendering =
+        getBool("metalrender.enabled", enableMetalRendering);
+    enableMetal4 = getBool("metalrender.feature.metal4", enableMetal4);
     enableIndirectCommandBuffers = getBool("metalrender.feature.icb", enableIndirectCommandBuffers);
     enableMeshShaders = getBool("metalrender.feature.mesh", enableMeshShaders);
     enableArgumentBuffers = getBool("metalrender.feature.argbuf", enableArgumentBuffers);
@@ -258,6 +337,50 @@ public final class MetalRenderConfig {
     if (enableMeshShaders && com.pebbles_boon.metalrender.nativebridge.MetalHardwareChecker.supportsMeshShaders()) {
       enableIndirectCommandBuffers = true;
     }
+    validate();
+  }
+
+  public void copyFrom(MetalRenderConfig other) {
+    if (other == null) {
+      return;
+    }
+    enableMetalRendering = other.enableMetalRendering;
+    enableMetal4 = other.enableMetal4;
+    requireMetal4 = other.requireMetal4;
+    enableFastTerrainReplacement = other.enableFastTerrainReplacement;
+    enableExperimentalFeatureReplacement =
+        other.enableExperimentalFeatureReplacement;
+    enableMetalFX = other.enableMetalFX;
+    enableSimpleLighting = other.enableSimpleLighting;
+    enableDebugOverlay = other.enableDebugOverlay;
+    debugPinkBlockTint = other.debugPinkBlockTint;
+    leafCullingMode = other.leafCullingMode;
+    biomeTransitionDetail = other.biomeTransitionDetail;
+    targetFrameRate = other.targetFrameRate;
+    autoTargetFrameRate = other.autoTargetFrameRate;
+    prioritizeFpsOverTps = other.prioritizeFpsOverTps;
+    maxMemoryMB = other.maxMemoryMB;
+    enableTripleBuffering = other.enableTripleBuffering;
+    enableMemoryPressureFallback = other.enableMemoryPressureFallback;
+    enableBurstThreadMode = other.enableBurstThreadMode;
+    enableMeshShaders = other.enableMeshShaders;
+    enableArgumentBuffers = other.enableArgumentBuffers;
+    enableClusterFrustumCulling = other.enableClusterFrustumCulling;
+    enableHiZCull = other.enableHiZCull;
+    enableGpuTranslucencySort = other.enableGpuTranslucencySort;
+    hiddenFluidCulling = other.hiddenFluidCulling;
+    improvedFluidShaping = other.improvedFluidShaping;
+    closestPointEntitySort = other.closestPointEntitySort;
+    enableProgrammableBlending = other.enableProgrammableBlending;
+    enableIndirectCommandBuffers = other.enableIndirectCommandBuffers;
+    validate();
+  }
+
+  public static MetalRenderConfig defaults() {
+    MetalRenderConfig defaults = new MetalRenderConfig();
+    resolutionScale = 1.0f;
+    defaults.validate();
+    return defaults;
   }
 
   private static boolean getBool(String key, boolean def) {

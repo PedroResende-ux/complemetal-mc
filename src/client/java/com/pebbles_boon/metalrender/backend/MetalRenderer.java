@@ -1,5 +1,7 @@
 package com.pebbles_boon.metalrender.backend;
 
+import com.pebbles_boon.metalrender.MetalRenderClient;
+import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import java.nio.ByteBuffer;
 import org.joml.Matrix4f;
@@ -8,6 +10,7 @@ public final class MetalRenderer implements RenderBackend {
   private long handle;
   private volatile boolean pipelinesReady;
   private boolean available;
+  private float currentScale = 1.0f;
   private final MetalRendererBackendHandle backend;
 
   public static final class MetalRendererBackendHandle {
@@ -51,9 +54,11 @@ public final class MetalRenderer implements RenderBackend {
   }
 
   public void init(int width, int height) {
-    this.handle = NativeBridge.nInit(width, height, 1.0f);
+    this.currentScale = configuredScale();
+    this.handle = NativeBridge.nInit(width, height, currentScale);
     if (this.handle != 0L) {
       this.available = true;
+      applyTemporalScale(currentScale);
     }
   }
 
@@ -66,8 +71,36 @@ public final class MetalRenderer implements RenderBackend {
   }
 
   public void resize(int width, int height) {
-    if (handle != 0)
-      NativeBridge.nResize(handle, width, height, 1.0f);
+    if (handle != 0) {
+      currentScale = configuredScale();
+      NativeBridge.nResize(handle, width, height, currentScale);
+      applyTemporalScale(currentScale);
+    }
+  }
+
+  public void refreshRuntimeScale(int width, int height) {
+    float requested = configuredScale();
+    if (handle != 0 && Math.abs(requested - currentScale) > 0.001f) {
+      currentScale = requested;
+      NativeBridge.nResize(handle, width, height, currentScale);
+      applyTemporalScale(currentScale);
+    }
+  }
+
+  private static float configuredScale() {
+    MetalRenderConfig config = MetalRenderClient.getConfig();
+    return config != null && config.enableMetalFX
+        ? MetalRenderConfig.resolutionScale()
+        : 1.0f;
+  }
+
+  private static void applyTemporalScale(float scale) {
+    try {
+      NativeBridge.nSetTemporalScale(scale);
+    } catch (UnsatisfiedLinkError ignored) {
+      // Allows the Java 26.2 build to fail open with an older baseline native
+      // during migration. Release validation requires JNI parity.
+    }
   }
 
   public void beginFrame(float tickDelta) {

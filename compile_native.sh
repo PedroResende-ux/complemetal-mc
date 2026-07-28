@@ -1,48 +1,109 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "Compiling shaders..."
-SHADER_DIR="src/main/resources/native/shaders"
+project_root="$(cd "$(dirname "$0")" && pwd)"
+cd "$project_root"
 
-xcrun -sdk macosx metal -c $SHADER_DIR/metalrender.metal -o $SHADER_DIR/metalrender.air
-xcrun -sdk macosx metal -c $SHADER_DIR/entity.metal -o $SHADER_DIR/entity.air
-xcrun -sdk macosx metal -c $SHADER_DIR/culling.metal -o $SHADER_DIR/culling.air
-xcrun -sdk macosx metal -c $SHADER_DIR/hiz.metal -o $SHADER_DIR/hiz.air
-xcrun -sdk macosx metal -c $SHADER_DIR/occlusion_culling.metal -o $SHADER_DIR/occlusion_culling.air
-xcrun -sdk macosx metal -c $SHADER_DIR/visibility_buffer.metal -o $SHADER_DIR/visibility_buffer.air
-xcrun -sdk macosx metal -c $SHADER_DIR/oit_transparency.metal -o $SHADER_DIR/oit_transparency.air
-xcrun -sdk macosx metal -c $SHADER_DIR/cull_and_encode.metal -o $SHADER_DIR/cull_and_encode.air
+metal_tool_usable() {
+  local metal_path
+  metal_path="$(xcrun --sdk macosx --find metal 2>/dev/null)" || return 1
+  [[ -x "$metal_path" ]] || return 1
+  "$metal_path" --version >/dev/null 2>&1
+}
 
-echo "compelling shaders"
-xcrun -sdk macosx metal -std=metal3.0 -c $SHADER_DIR/mesh_terrain.metal -o $SHADER_DIR/mesh_terrain.air
+# Do not mutate the machine-wide xcode-select setting. When Command Line Tools
+# are selected, prefer the standard full-Xcode installation for this process.
+if [[ -z "${DEVELOPER_DIR:-}" ]] &&
+   ! metal_tool_usable &&
+   [[ -d "/Applications/Xcode.app/Contents/Developer" ]]; then
+  export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+  echo "Using full Xcode from $DEVELOPER_DIR"
+fi
 
-xcrun -sdk macosx metallib \
-    $SHADER_DIR/metalrender.air \
-    $SHADER_DIR/entity.air \
-    $SHADER_DIR/culling.air \
-    $SHADER_DIR/hiz.air \
-    $SHADER_DIR/occlusion_culling.air \
-    $SHADER_DIR/visibility_buffer.air \
-    $SHADER_DIR/oit_transparency.air \
-    $SHADER_DIR/cull_and_encode.air \
-    $SHADER_DIR/mesh_terrain.air \
-    -o src/main/resources/shaders.metallib
-echo "Shaders compiled to src/main/resources/shaders.metallib"
+deployment_target="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+shader_dir="$project_root/src/main/resources/native/shaders"
+shader_build_dir="$project_root/build/native/shaders"
+native_build_dir="$project_root/build/native"
+resource_dir="$project_root/src/main/resources"
+java_root="${JAVA_HOME:-$(/usr/libexec/java_home)}"
+sdk_root="$(xcrun --sdk macosx --show-sdk-path)"
 
-echo "Compiling native library..."
-JAVA_HOME=$(/usr/libexec/java_home)
-echo "Using JAVA_HOME: $JAVA_HOME"
+mkdir -p "$shader_build_dir" "$native_build_dir"
 
-clang++ -O3 -std=c++17 -dynamiclib \
+if [[ "${BUILD_SHADERS:-1}" != "0" ]]; then
+  metallib_path="$(xcrun --sdk macosx --find metallib 2>/dev/null || true)"
+  if ! metal_tool_usable || [[ -z "$metallib_path" ]] ||
+     [[ ! -x "$metallib_path" ]]; then
+    echo "Metal shader tools are unavailable in the selected Xcode." >&2
+    echo "Install the Metal Toolchain component with:" >&2
+    echo "  DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -downloadComponent MetalToolchain" >&2
+    echo "For a development-only native build, use BUILD_SHADERS=0." >&2
+    exit 1
+  fi
+
+  shader_sources=(
+    metalrender.metal
+    entity.metal
+    culling.metal
+    hiz.metal
+    occlusion_culling.metal
+    visibility_buffer.metal
+    oit_transparency.metal
+    cull_and_encode.metal
+    mesh_terrain.metal
+  )
+  air_files=()
+  for shader_source in "${shader_sources[@]}"; do
+    if [[ ! -f "$shader_dir/$shader_source" ]]; then
+      echo "Missing Metal shader source: $shader_dir/$shader_source" >&2
+      exit 1
+    fi
+    air_file="$shader_build_dir/${shader_source%.metal}.air"
+    xcrun -sdk macosx metal \
+      -std=metal3.0 \
+      -mmacosx-version-min="$deployment_target" \
+      -c "$shader_dir/$shader_source" \
+      -o "$air_file"
+    air_files+=("$air_file")
+  done
+  shader_output="$shader_build_dir/shaders.metallib"
+  xcrun -sdk macosx metallib "${air_files[@]}" \
+    -o "$shader_output"
+  shader_magic="$(LC_ALL=C od -An -tx1 -N4 "$shader_output" |
+    tr -d '[:space:]')"
+  if [[ ! -s "$shader_output" || "$shader_magic" != "4d544c42" ]]; then
+    echo "Metal compiler produced an invalid shader library: $shader_output" >&2
+    exit 1
+  fi
+  install -m 0644 "$shader_output" "$resource_dir/shaders.metallib"
+  echo "Shaders compiled: $resource_dir/shaders.metallib"
+fi
+
+if [[ "${BUILD_NATIVE:-1}" != "0" ]]; then
+  native_output="$native_build_dir/libmetalrender.dylib"
+  clang++ -arch arm64 -O3 -DNDEBUG -std=c++17 -dynamiclib -fblocks \
+    -mmacosx-version-min="$deployment_target" \
+    -Wl,-install_name,@rpath/libmetalrender.dylib \
+    -isysroot "$sdk_root" \
     -DMETALRENDER_HAS_METALFX=1 \
-    -framework Metal -framework MetalFX -framework Foundation -framework Cocoa -framework IOKit -framework IOSurface -framework OpenGL -framework QuartzCore \
-    -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin" \
-    -I"src/main/resources/native" \
-    src/main/resources/native/metalrender.mm \
-    src/main/resources/native/meshshader.mm \
-    -o src/main/resources/libmetalrender_debug_v2.dylib
+    -framework Metal \
+    -framework MetalFX \
+    -framework Foundation \
+    -framework Cocoa \
+    -framework IOKit \
+    -framework IOSurface \
+    -framework OpenGL \
+    -framework QuartzCore \
+    -I"$java_root/include" \
+    -I"$java_root/include/darwin" \
+    -I"$project_root/src/main/resources/native" \
+    "$project_root/src/main/resources/native/metalrender.mm" \
+    "$project_root/src/main/resources/native/meshshader.mm" \
+    -o "$native_output"
 
-cp src/main/resources/libmetalrender_debug_v2.dylib src/main/resources/libmetalrender.dylib
-
-echo "Native library compiled to src/main/resources/libmetalrender_debug_v2.dylib"
-echo "Copied to src/main/resources/libmetalrender.dylib"
+  if command -v codesign >/dev/null 2>&1; then
+    codesign --force --sign - "$native_output"
+  fi
+  cp "$native_output" "$resource_dir/libmetalrender.dylib"
+  echo "Native library compiled (minimum macOS $deployment_target): $native_output"
+fi

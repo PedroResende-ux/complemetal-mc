@@ -53,7 +53,7 @@ public class MeshShaderBackend {
     active = true;
     gpuDrivenEnabled = meshShadersAvailable &&
         (terrainPipelineHandles[0] != 0 || fallbackPipelineHandle != 0);
-    MetalLogger.info("mesh backend weady (mesh=%s gpu=%s pipes=%d)",
+    MetalLogger.info("mesh backend ready (mesh=%s gpu=%s pipes=%d)",
         meshShadersAvailable ? "ok" : "no",
         gpuDrivenEnabled ? "on" : "off",
         MeshShaderNative.getActivePipelineCount());

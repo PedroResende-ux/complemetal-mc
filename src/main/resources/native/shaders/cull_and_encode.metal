@@ -34,7 +34,8 @@ bool isOccludedByHiZ(float3 aabbMin, float3 aabbMax,
                      constant CameraUniforms& camera) {
     float2 ssMin = float2(1e10);
     float2 ssMax = float2(-1e10);
-    float minDepth = 1.0;
+    // Reversed-Z: the closest point of the object is its maximum depth.
+    float closestDepth = 0.0;
     for (uint i = 0; i < 8; i++) {
         float3 corner = float3(
             (i & 1) ? aabbMax.x : aabbMin.x,
@@ -47,7 +48,7 @@ bool isOccludedByHiZ(float3 aabbMin, float3 aabbMax,
         float2 ss = (ndc.xy * 0.5 + 0.5) * camera.screenSize;
         ssMin = min(ssMin, ss);
         ssMax = max(ssMax, ss);
-        minDepth = min(minDepth, ndc.z);
+        closestDepth = max(closestDepth, clamp(ndc.z, 0.0, 1.0));
     }
     ssMin = clamp(ssMin, float2(0), camera.screenSize);
     ssMax = clamp(ssMax, float2(0), camera.screenSize);
@@ -59,7 +60,7 @@ bool isOccludedByHiZ(float3 aabbMin, float3 aabbMax,
     constexpr sampler hizSampler(filter::nearest, address::clamp_to_edge);
     float2 center = (ssMin + ssMax) * 0.5 / camera.screenSize;
     float hizDepth = hiz.sample(hizSampler, center, level(float(mipLevel))).r;
-    return (minDepth > hizDepth);
+    return (closestDepth + 1e-5 < hizDepth);
 }
 bool isInFrustum(float3 minC, float3 maxC, constant float4* planes) {
     for (uint i = 0; i < 6; i++) {

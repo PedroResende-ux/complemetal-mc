@@ -40,7 +40,7 @@ public class StartupBlockerOverlay extends Overlay {
             float delta) {
         if (!loggedRender) {
             loggedRender = true;
-            MetalLogger.info("startup_blocker: overlay wendew");
+            MetalLogger.info("startup_blocker: overlay render");
         }
         ctx.fill(0, 0, ctx.guiWidth(), ctx.guiHeight(), 0xFF000000);
 
@@ -123,7 +123,7 @@ public class StartupBlockerOverlay extends Overlay {
         mc.getTextureManager().registerAndLoad(textureState.id,
                 new SimpleTexture(textureState.id));
         textureState.loaded = true;
-        MetalLogger.info("startup_blocker: %s weady %dx%d",
+        MetalLogger.info("startup_blocker: %s ready %dx%d",
                 textureState.logLabel, textureState.width,
                 textureState.height);
     }

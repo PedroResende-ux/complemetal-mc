@@ -19,6 +19,7 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.particle.Particle;
 import net.minecraft.client.particle.ParticleEngine;
 import net.minecraft.client.particle.SingleQuadParticle;
+import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.core.BlockPos;
@@ -35,6 +36,7 @@ public class MetalParticleRenderer {
   private static final int MAX_PARTICLES_PER_FRAME = 65536;
   private long device;
   private boolean active;
+  private boolean buffersReady;
   private int frameCount;
   private ByteBuffer vertexStagingBuffer;
   private long[] vbufs = new long[3];
@@ -78,49 +80,55 @@ public class MetalParticleRenderer {
   }
 
   public void setup(long device) {
+    active = false;
+    if (buffersReady && this.device == device) {
+      return;
+    }
+    destroyVertexBuffers();
+    buffersReady = false;
     this.device = device;
     if (device != 0) {
       for (int i = 0; i < 3; i++) {
         vbufs[i] = NativeBridge.nCreateBuffer(
             device, MAX_PARTICLE_VERTICES * VERTEX_STRIDE, 0);
+        if (vbufs[i] == 0) {
+          destroyVertexBuffers();
+          this.device = 0;
+          MetalLogger.warn(
+              "particle buffers unavailable; keeping vanilla particles active");
+          return;
+        }
       }
       MetalLogger.info(
           "MetalParticleRenderer initialized: device=%d vb0=%d vb1=%d vb2=%d",
           device, vbufs[0], vbufs[1], vbufs[2]);
+      buffersReady = true;
     }
   }
 
   public void setActive(boolean active) {
-    this.active = active;
+    this.active = active && buffersReady;
   }
 
   public boolean isActive() {
-    return active;
+    return active && buffersReady;
   }
 
   public void capture(ParticleEngine engine, Camera camera, float delta) {
     if (!active)
       return;
-    count = 0;
-    try {
-      collect(engine, camera, delta);
-    } catch (Exception e) {
-      if (frameCount < 5) {
-        MetalLogger.error("particle cap fail: %s", e.getMessage());
-        e.printStackTrace();
-      }
-    }
+    discardCapturedParticles();
+    collect(engine, camera, delta);
   }
 
-  public void captureParticleList(Queue<? extends Particle> particles,
-      Camera camera, float delta) {
+  public boolean captureParticleList(Queue<? extends Particle> particles,
+      Frustum frustum, Camera camera, float delta) {
     if (!active || particles == null)
-      return;
+      return false;
     double camX = camera.position().x;
     double camY = camera.position().y;
     double camZ = camera.position().z;
 
-    boolean inWater = false;
     ClientLevel world = null;
     int camLight = 0x00F000F0;
     Minecraft mc = Minecraft.getInstance();
@@ -129,7 +137,6 @@ public class MetalParticleRenderer {
       scratchPos.set((int) Math.floor(camera.position().x),
           (int) Math.floor(camera.position().y),
           (int) Math.floor(camera.position().z));
-      inWater = !mc.level.getBlockState(scratchPos).getFluidState().isEmpty();
       var lights = world.getChunkSource().getLightEngine();
       int blockLev = lights.getLayerListener(LightLayer.BLOCK).getLightValue(scratchPos);
       int skyLev = lights.getLayerListener(LightLayer.SKY).getLightValue(scratchPos);
@@ -137,19 +144,21 @@ public class MetalParticleRenderer {
     }
     int captured = 0;
     for (Particle p : particles) {
-      if (count >= MAX_PARTICLES_PER_FRAME)
-        break;
-      if (p == null || !p.isAlive())
+      if (p == null)
         continue;
-      if (!(p instanceof SingleQuadParticle bp))
+      ParticleAccessor pa = (ParticleAccessor) p;
+      if (!frustum.pointInFrustum(pa.metalrender$getX(),
+          pa.metalrender$getY(), pa.metalrender$getZ())) {
         continue;
-
-      if (inWater) {
-        int hash = System.identityHashCode(p);
-        if ((hash & 7) > 1) {
-          continue;
-        }
       }
+      if (!(p instanceof SingleQuadParticle bp))
+        return false;
+      if (bp.getFacingCameraMode() !=
+          SingleQuadParticle.FacingCameraMode.LOOKAT_XYZ) {
+        return false;
+      }
+      if (count >= MAX_PARTICLES_PER_FRAME)
+        return false;
       captured++;
       CapturedParticle cp;
       if (count < capturedParticlePool.size()) {
@@ -159,7 +168,6 @@ public class MetalParticleRenderer {
         capturedParticlePool.add(cp);
       }
       count++;
-      ParticleAccessor pa = (ParticleAccessor) p;
       BillboardParticleAccessor bpa = (BillboardParticleAccessor) bp;
       cp.x = (float) (Mth.lerp(delta, pa.metalrender$getLastX(),
           pa.metalrender$getX()) -
@@ -171,16 +179,13 @@ public class MetalParticleRenderer {
           pa.metalrender$getZ()) -
           camZ);
       cp.scale = bp.getQuadSize(delta);
-
-      if (inWater) {
-        cp.scale *= 0.5f;
-      }
       cp.red = bpa.metalrender$getRed();
       cp.green = bpa.metalrender$getGreen();
       cp.blue = bpa.metalrender$getBlue();
       cp.alpha = bpa.metalrender$getAlpha();
       cp.zRotation = Mth.lerp(delta, bpa.metalrender$getLastZRotation(),
           bpa.metalrender$getZRotation());
+      cp.atlasId = null;
       var sprite = bpa.metalrender$getSprite();
       if (sprite != null) {
 
@@ -213,6 +218,7 @@ public class MetalParticleRenderer {
         logged++;
       }
     }
+    return true;
   }
 
   private void collect(ParticleEngine manager, Camera camera, float delta) {
@@ -299,7 +305,7 @@ public class MetalParticleRenderer {
     }
     frameCount++;
     if (frameCount <= 5 || frameCount % 3000 == 0) {
-      MetalLogger.info("particle wendew: f=%d p=%d v=%d d=%d",
+      MetalLogger.info("particle render: f=%d p=%d v=%d d=%d",
           frameCount, count, vtxCount, drawsDone);
     }
     pendingDrawCount = 0;
@@ -316,7 +322,7 @@ public class MetalParticleRenderer {
     Minecraft mc = Minecraft.getInstance();
     if (mc == null)
       return;
-    Camera camera = mc.gameRenderer.getMainCamera();
+    Camera camera = mc.gameRenderer.mainCamera();
     if (camera == null)
       return;
     Quaternionf camRot = camera.rotation();
@@ -561,15 +567,23 @@ public class MetalParticleRenderer {
     return vtxCount;
   }
 
+  public void discardCapturedParticles() {
+    for (int i = 0; i < count; i++) {
+      capturedParticlePool.get(i).atlasId = null;
+    }
+    count = 0;
+    pendingDrawCount = 0;
+    vtxCount = 0;
+  }
+
   public void shutdown() {
     active = false;
+    buffersReady = false;
     cachedParticlePipeline = 0;
     cachedParticleFallbackPipeline = 0;
     textureReadbackBuf = null;
     texturePixelBuf = null;
-    for (int i = 0; i < count; i++)
-      capturedParticlePool.get(i).atlasId = null;
-    count = 0;
+    discardCapturedParticles();
     for (int _ti = 0; _ti < TEXTURE_CACHE_SIZE; _ti++) {
       long h = textureCache[_ti];
       if (h > 0)
@@ -577,14 +591,18 @@ public class MetalParticleRenderer {
     }
     java.util.Arrays.fill(textureCache, TEXTURE_UNCACHED);
     java.util.Arrays.fill(textureUploadFrame, -1);
-    for (int i = 0; i < 3; i++) {
+    destroyVertexBuffers();
+    device = 0;
+    MetalLogger.info("particle renderer shut down");
+  }
+
+  private void destroyVertexBuffers() {
+    for (int i = 0; i < vbufs.length; i++) {
       if (vbufs[i] != 0) {
         NativeBridge.nDestroyBuffer(vbufs[i]);
         vbufs[i] = 0;
       }
     }
-    device = 0;
-    MetalLogger.info("particle wendewer shut down");
   }
 
   private static class CapturedParticle {

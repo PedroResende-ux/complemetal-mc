@@ -118,6 +118,7 @@ public class MetalWorldRenderer {
   private final Matrix4f modelViewMatrix;
   private boolean worldLoaded;
   private boolean renderingActive;
+  private boolean nativeWorldLoaded;
   private boolean texturesReady;
   private int frameCount;
   private int maxMeshes = DEFAULT_MAX_MESHES;
@@ -180,6 +181,21 @@ public class MetalWorldRenderer {
   }
 
   public void onWorldLoad() {
+    if (worldLoaded && renderingActive) {
+      return;
+    }
+    MetalRenderer renderer = MetalRenderClient.getRenderer();
+    if (renderer != null && renderer.isAvailable() &&
+        renderer.getHandle() != 0 && NativeBridge.isLibLoaded()) {
+      try {
+        NativeBridge.nOnWorldLoaded(renderer.getHandle());
+        nativeWorldLoaded = true;
+      } catch (Throwable error) {
+        nativeWorldLoaded = false;
+        MetalLogger.warn("native world load hook failed: %s",
+            error.getMessage());
+      }
+    }
     AsyncCullTask.reset();
     worldLoaded = true;
     MetalRenderConfig gpuConfig = MetalRenderClient.getConfig();
@@ -207,7 +223,6 @@ public class MetalWorldRenderer {
     }
     MetalLogger.info("orchestrators: cluster=%s hiz=%s sort=%s icb=%s",
         clusterEnabled, hiZEnabled, sortEnabled, icbEnabled);
-    MetalRenderer renderer = MetalRenderClient.getRenderer();
     if (renderer != null && renderer.isAvailable()) {
       Minecraft mc = Minecraft.getInstance();
       int w = mc.getWindow().getWidth();
@@ -244,14 +259,14 @@ public class MetalWorldRenderer {
       }
       applyFeatureConfig(MetalRenderClient.getConfig());
       boolean meshShadersActive = NativeBridge.isLibLoaded() && NativeBridge.nAreMeshShadersActive();
-      MetalLogger.info("gpu pipeline weady (mesh=%s on=%s)",
+      MetalLogger.info("GPU pipeline ready (mesh=%s on=%s)",
           meshShadersActive ? "on" : (meshShadersSupported ? "avail" : "no"),
           gpuDrivenEnabled ? "yes" : "no");
-      MetalLogger.info("world wendew on (" + w + "x" + h + ")");
+      MetalLogger.info("world rendering active (" + w + "x" + h + ")");
     } else if (!loggedWorldLoadWithoutRenderer) {
       loggedWorldLoadWithoutRenderer = true;
       MetalLogger.warn(
-          "world load before wendewer weady; capture deferred");
+          "world load before renderer is ready; capture deferred");
     }
   }
 
@@ -259,10 +274,24 @@ public class MetalWorldRenderer {
     worldLoaded = false;
     renderingActive = false;
     texturesReady = false;
+    if (nativeWorldLoaded) {
+      MetalRenderer renderer = MetalRenderClient.getRenderer();
+      long handle = renderer != null && renderer.isAvailable()
+          ? renderer.getHandle()
+          : 0;
+      if (handle != 0 && NativeBridge.isLibLoaded()) {
+        try {
+          NativeBridge.nOnWorldUnloaded(handle);
+        } catch (Throwable error) {
+          MetalLogger.warn("native world unload hook failed: %s",
+              error.getMessage());
+        }
+      }
+      nativeWorldLoaded = false;
+    }
     entityRenderer.shutdown();
     particleRenderer.shutdown();
     textureManager.destroy();
-    ioSurfaceBlitter.destroy();
     chunkMesher.clear();
     loggedChunkLoadDropNotReady = false;
     loggedBlockUpdateDropNotReady = false;
@@ -274,7 +303,6 @@ public class MetalWorldRenderer {
       meshShaderBackend = null;
     }
     gpuDrivenEnabled = false;
-    instance = null;
     subChunkUploadBuffer = null;
     chunkUniformsBuffer = null;
     if (argumentBufferHandle != 0) {
@@ -287,6 +315,24 @@ public class MetalWorldRenderer {
     translucencySorter.shutdown();
     terrainIndirectDraw.shutdown();
     updateLoadingModeState();
+  }
+
+  /**
+   * Releases renderer-lifetime resources. Unlike {@link #onWorldUnload()},
+   * this object cannot be reused after shutdown.
+   */
+  public void shutdown() {
+    onWorldUnload();
+    if (outlineBufferHandle != 0) {
+      NativeBridge.nDestroyBuffer(outlineBufferHandle);
+      outlineBufferHandle = 0;
+      outlineBufferSize = 0;
+    }
+    chunkMesher.shutdown();
+    ioSurfaceBlitter.destroy();
+    if (instance == this) {
+      instance = null;
+    }
   }
 
   public boolean metalActive() {
@@ -345,7 +391,7 @@ public class MetalWorldRenderer {
               " fb=" + textureManager.isUsingFallbackBlockAtlas() +
               " m=" + chunkMesher.getMeshCount());
     }
-    Camera camera = mc.gameRenderer.getMainCamera();
+    Camera camera = mc.gameRenderer.mainCamera();
     Vector3f camPos = new Vector3f((float) camera.position().x, (float) camera.position().y,
         (float) camera.position().z);
     if (MetalRenderClient.getConfig().enableMetalRendering) {
@@ -598,16 +644,19 @@ public class MetalWorldRenderer {
       return;
     long frameCtx = renderer.frameCtx();
     if (frameCtx != 0) {
-      boolean inWater = false;
-      Minecraft mc = Minecraft.getInstance();
-      if (mc != null && mc.getCameraEntity() != null) {
-        inWater = mc.getCameraEntity().isUnderWater();
+      boolean replaceEntities = MetalRenderHookState.canReplaceEntities();
+      boolean replaceParticles = MetalRenderHookState.canReplaceParticles();
+      if (replaceEntities) {
+        boolean inWater = false;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && mc.getCameraEntity() != null) {
+          inWater = mc.getCameraEntity().isUnderWater();
+        }
+        entityRenderer.renderCapturedEntities(frameCtx, inWater);
       }
-    entityRenderer.renderCapturedEntities(frameCtx, inWater);
-    NativeBridge.nDrawDeferredWaterPass(frameCtx);
-      NativeBridge.nDrawOITPass(frameCtx);
-    particleRenderer.render(frameCtx);
-    renderBlockOutline(frameCtx);
+      if (replaceParticles) {
+        particleRenderer.render(frameCtx);
+      }
     }
     renderer.endFrame();
     frameCount++;
@@ -622,7 +671,7 @@ public class MetalWorldRenderer {
         return;
       BlockHitResult hit = (BlockHitResult) mc.hitResult;
       BlockPos pos = hit.getBlockPos();
-      Camera cam = mc.gameRenderer.getMainCamera();
+      Camera cam = mc.gameRenderer.mainCamera();
       float bx = (float) (pos.getX() - cam.position().x);
       float by = (float) (pos.getY() - cam.position().y);
       float bz = (float) (pos.getZ() - cam.position().z);
@@ -784,7 +833,7 @@ public class MetalWorldRenderer {
     if (mc.player == null || mc.level == null) {
       return;
     }
-    if (mc.getOverlay() != null) {
+    if (mc.gui.overlay() != null) {
       return;
     }
     if (mc.player != null) {
@@ -1464,28 +1513,27 @@ public class MetalWorldRenderer {
     return "flip_head";
   }
 
-  public void forceBlitNow() {
+  public boolean forceBlitNow() {
     if (shouldSuspendBlitForScreenshot()) {
-      return;
+      return false;
     }
     MetalRenderer renderer = MetalRenderClient.getRenderer();
     if (renderer == null || !renderer.isAvailable())
-      return;
+      return false;
     long handle = renderer.getHandle();
     if (handle == 0)
-      return;
+      return false;
     Minecraft mc = Minecraft.getInstance();
-    if (mc != null && mc.getMainRenderTarget() != null) {
+    if (mc != null && mc.gameRenderer.mainRenderTarget() != null) {
       CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
       try (RenderPass pass = encoder.createRenderPass(
           () -> "metalrender_terrain_blit",
-          mc.getMainRenderTarget().getColorTextureView(),
-          java.util.OptionalInt.empty())) {
-        ioSurfaceBlitter.blit(handle);
+          mc.gameRenderer.mainRenderTarget().getColorTextureView(),
+          java.util.Optional.empty())) {
+        return ioSurfaceBlitter.blit(handle);
       }
-    } else {
-      ioSurfaceBlitter.blit(handle);
     }
+    return ioSurfaceBlitter.blit(handle);
   }
 
   private boolean shouldSuspendBlitForScreenshot() {

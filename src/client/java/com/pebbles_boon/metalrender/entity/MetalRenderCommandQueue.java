@@ -17,9 +17,11 @@ import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
 import net.minecraft.client.renderer.entity.state.EntityRenderState;
 import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
+import net.minecraft.client.renderer.gizmos.DrawableGizmoPrimitives;
 import net.minecraft.client.renderer.item.ItemStackRenderState;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
@@ -28,6 +30,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.world.item.ItemDisplayContext;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
@@ -72,9 +75,8 @@ public class MetalRenderCommandQueue implements SubmitNodeCollector {
   @Override
   public void submitModelPart(ModelPart part, PoseStack matrices, RenderType layer,
       int light, int overlay, TextureAtlasSprite sprite,
-      boolean visible, boolean noCull, int color,
-      ModelFeatureRenderer.CrumblingOverlay crumbling, int extra) {
-    if (part != null && (visible || noCull)) {
+      int color, ModelFeatureRenderer.CrumblingOverlay crumbling, int extra) {
+    if (part != null) {
       part.render(matrices, vertexConsumer, light, overlay, color);
     }
   }
@@ -87,7 +89,7 @@ public class MetalRenderCommandQueue implements SubmitNodeCollector {
   @Override
   public void submitNameTag(PoseStack matrices, Vec3 pos, int bgColor,
       Component text, boolean seeThrough, int textColor,
-      double distance, CameraRenderState camera) {
+      CameraRenderState camera) {
   }
 
   @Override
@@ -109,7 +111,7 @@ public class MetalRenderCommandQueue implements SubmitNodeCollector {
 
   @Override
   public void submitMovingBlock(PoseStack matrices,
-      MovingBlockRenderState state) {
+      MovingBlockRenderState state, int light) {
     if (state == null || state.blockState == null || vertexConsumer == null) {
       return;
     }
@@ -120,7 +122,9 @@ public class MetalRenderCommandQueue implements SubmitNodeCollector {
       return;
     }
 
-    int light = defaultLight != 0 ? defaultLight : 0x00F000F0;
+    int resolvedLight = light != 0
+        ? light
+        : (defaultLight != 0 ? defaultLight : 0x00F000F0);
     int color = 0xFFFFFFFF;
     float u0 = sprite.getU0();
     float u1 = sprite.getU1();
@@ -130,27 +134,27 @@ public class MetalRenderCommandQueue implements SubmitNodeCollector {
     emitTexturedQuad(matrices,
         0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f,
         1.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f,
-        0.0f, 0.0f, 1.0f, u0, u1, v0, v1, color, light);
+        0.0f, 0.0f, 1.0f, u0, u1, v0, v1, color, resolvedLight);
     emitTexturedQuad(matrices,
         1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f,
-        0.0f, 0.0f, -1.0f, u0, u1, v0, v1, color, light);
+        0.0f, 0.0f, -1.0f, u0, u1, v0, v1, color, resolvedLight);
     emitTexturedQuad(matrices,
         0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f,
         1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f,
-        0.0f, 1.0f, 0.0f, u0, u1, v0, v1, color, light);
+        0.0f, 1.0f, 0.0f, u0, u1, v0, v1, color, resolvedLight);
     emitTexturedQuad(matrices,
         0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f,
         1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f,
-        0.0f, -1.0f, 0.0f, u0, u1, v0, v1, color, light);
+        0.0f, -1.0f, 0.0f, u0, u1, v0, v1, color, resolvedLight);
     emitTexturedQuad(matrices,
         1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f,
         1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f,
-        1.0f, 0.0f, 0.0f, u0, u1, v0, v1, color, light);
+        1.0f, 0.0f, 0.0f, u0, u1, v0, v1, color, resolvedLight);
     emitTexturedQuad(matrices,
         0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
         0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f,
-        -1.0f, 0.0f, 0.0f, u0, u1, v0, v1, color, light);
+        -1.0f, 0.0f, 0.0f, u0, u1, v0, v1, color, resolvedLight);
     requestedGlTextureId = blockAtlasTextureId;
   }
 
@@ -162,8 +166,7 @@ public class MetalRenderCommandQueue implements SubmitNodeCollector {
 
   @Override
   public void submitBreakingBlockModel(PoseStack matrices,
-      BlockStateModel model, long seed,
-      int color) {
+      List<BlockStateModelPart> parts, int color) {
   }
 
   @Override
@@ -182,7 +185,17 @@ public class MetalRenderCommandQueue implements SubmitNodeCollector {
   }
 
   @Override
-  public void submitParticleGroup(SubmitNodeCollector.ParticleGroupRenderer particleGroup) {
+  public void submitShapeOutline(PoseStack matrices, VoxelShape shape,
+      RenderType layer, int color, float lineWidth, boolean depthTest) {
+  }
+
+  @Override
+  public void submitQuadParticleGroup(QuadParticleRenderState particleGroup) {
+  }
+
+  @Override
+  public void submitGizmoPrimitives(DrawableGizmoPrimitives.Group group,
+      CameraRenderState camera, boolean alwaysOnTop) {
   }
 
   private static void invokeSetupAnim(Model<?> model, Object state) {

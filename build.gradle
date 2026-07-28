@@ -1,16 +1,23 @@
 plugins {
-    id 'net.fabricmc.fabric-loom' version '1.15-SNAPSHOT'
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
     id 'maven-publish'
 }
 
-group = "com.pebbles_boon.metalrender"
-version = "v0.1.7"
+group = project.maven_group
+version = project.mod_version
+
+base {
+    archivesName = project.archives_base_name
+}
 
 java {
     toolchain.languageVersion = JavaLanguageVersion.of(25)
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+    withSourcesJar()
 }
-repositories {
 
+repositories {
     maven {
         name = "Fabric"
         url = "https://maven.fabricmc.net/"
@@ -20,32 +27,34 @@ repositories {
         name = "Modrinth"
         url = "https://api.modrinth.com/maven"
     }
-        maven {
-            name = "LWJGL"
-            url = "https://repo.lwjgl.org/"
-        }
 }
+
 dependencies {
-    minecraft "com.mojang:minecraft:26.1"
-    implementation "net.fabricmc:fabric-loader:0.19.2"
-    implementation "net.fabricmc.fabric-api:fabric-api:0.149.0+26.1.2"
-    implementation "org.lwjgl:lwjgl:3.3.3"
-    implementation "org.lwjgl:lwjgl-glfw:3.3.3"
-    implementation "org.lwjgl:lwjgl:3.3.3:natives-macos"
-    implementation "org.lwjgl:lwjgl-glfw:3.3.3:natives-macos"
-    implementation 'org.joml:joml:1.10.5'
-    compileOnly "maven.modrinth:sodium:mc26.1.1-0.8.9-fabric"
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
+    compileOnly "maven.modrinth:sodium:${sodium_version}"
+
+    testImplementation platform("org.junit:junit-bom:${junit_version}")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
 
 loom {
     splitEnvironmentSourceSets()
+
+    mods {
+        "metalrender" {
+            sourceSet sourceSets.main
+            sourceSet sourceSets.client
+        }
+    }
 
     runs {
         client {
             client()
             source sourceSets.client
             vmArg "-Djava.library.path=${projectDir}/src/main/resources"
-            vmArg "--enable-preview"
             vmArg "--enable-native-access=ALL-UNNAMED"
             if (project.hasProperty('zgc')) {
                 vmArg "-XX:+UseZGC"
@@ -68,15 +77,167 @@ loom {
         }
     }
 }
+
+fabricApi {
+    configureTests {
+        createSourceSet = true
+        modId = "metalrender-tests"
+        enableGameTests = false
+        enableClientGameTests = true
+        clearRunDirectory = true
+        username = "MetalRenderQA"
+    }
+}
+
+sourceSets {
+    test {
+        compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
+        runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
+    }
+    gametest {
+        compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
+        runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
+    }
+}
+
 tasks.withType(JavaCompile).configureEach {
     options.encoding = "UTF-8"
     options.release = 25
-    options.compilerArgs += ['--enable-preview']
 }
-    jar {
-        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-        from('src/main/resources/native') {
-            include 'metalrender.h', 'metalrender.mm'
-            into 'native'
-        }
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
+
+tasks.named("runClientGameTest", JavaExec) {
+    def sanitizerRuntime = providers.environmentVariable(
+        "METALRENDER_DYLD_INSERT_LIBRARIES")
+    if (sanitizerRuntime.isPresent()) {
+        environment "DYLD_INSERT_LIBRARIES", sanitizerRuntime.get()
     }
+}
+
+tasks.named("compileTestJava") {
+    dependsOn tasks.named("compileClientJava")
+}
+
+tasks.withType(AbstractArchiveTask).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
+processResources {
+    inputs.property "version", project.version
+    exclude "libmetalrender_debug_v2.dylib"
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+jar {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes(
+            "Implementation-Title": "MetalRender",
+            "Implementation-Version": project.version
+        )
+    }
+    from("LICENSE")
+    from('src/main/resources/native') {
+        include 'metalrender.h', 'metalrender.mm'
+        into 'native'
+    }
+}
+
+tasks.register("buildNative", Exec) {
+    group = "build"
+    description = "Builds the macOS native library for development without recompiling Metal shaders."
+
+    inputs.file("compile_native.sh")
+    inputs.files(fileTree("src/main/resources/native") {
+        include "*.h"
+        include "*.mm"
+    })
+    outputs.file(layout.buildDirectory.file("native/libmetalrender.dylib"))
+    outputs.file("src/main/resources/libmetalrender.dylib")
+
+    environment "BUILD_SHADERS", "0"
+    workingDir projectDir
+    commandLine "bash", file("compile_native.sh").absolutePath
+}
+
+def buildReleaseNativePayload =
+    tasks.register("buildReleaseNativePayload", Exec) {
+        group = "build"
+        description = "Rebuilds the native library and every offline Metal shader for a release."
+
+        inputs.file("compile_native.sh")
+        inputs.files(fileTree("src/main/resources/native") {
+            include "*.h"
+            include "*.mm"
+            include "shaders/*.metal"
+        })
+        outputs.file(layout.buildDirectory.file(
+            "native/libmetalrender.dylib"))
+        outputs.file("src/main/resources/libmetalrender.dylib")
+        outputs.file("src/main/resources/shaders.metallib")
+        outputs.upToDateWhen { false }
+
+        environment "BUILD_NATIVE", "1"
+        environment "BUILD_SHADERS", "1"
+        workingDir projectDir
+        commandLine "bash", file("compile_native.sh").absolutePath
+    }
+
+tasks.named("processResources") {
+    mustRunAfter buildReleaseNativePayload
+}
+
+tasks.named("sourcesJar") {
+    mustRunAfter buildReleaseNativePayload
+}
+
+def checkJniParity = tasks.register("checkJniParity", Exec) {
+    group = "verification"
+    description = "Verifies that NativeBridge declarations and Objective-C++ JNI exports match."
+
+    inputs.file("scripts/check_jni_parity.sh")
+    inputs.file("src/client/java/com/pebbles_boon/metalrender/nativebridge/NativeBridge.java")
+    inputs.files(fileTree("src/main/resources/native") {
+        include "*.mm"
+    })
+    outputs.upToDateWhen { false }
+
+    commandLine "bash", file("scripts/check_jni_parity.sh").absolutePath
+}
+
+def releaseJar = tasks.named("jar")
+
+def verifyReleaseJar = tasks.register("verifyReleaseJar", Exec) {
+    group = "verification"
+    description = "Verifies required metadata and native payload in the release JAR."
+    dependsOn buildReleaseNativePayload
+    dependsOn releaseJar
+
+    inputs.file("scripts/verify_release_jar.sh")
+    inputs.file(releaseJar.flatMap { it.archiveFile })
+    outputs.upToDateWhen { false }
+
+    doFirst {
+        commandLine "bash",
+            file("scripts/verify_release_jar.sh").absolutePath,
+            releaseJar.get().archiveFile.get().asFile.absolutePath
+    }
+}
+
+tasks.named("check") {
+    dependsOn checkJniParity
+}
+
+tasks.register("releaseCheck") {
+    group = "verification"
+    description = "Runs normal checks and verifies the complete publishable macOS JAR."
+    dependsOn tasks.named("check")
+    dependsOn verifyReleaseJar
+}

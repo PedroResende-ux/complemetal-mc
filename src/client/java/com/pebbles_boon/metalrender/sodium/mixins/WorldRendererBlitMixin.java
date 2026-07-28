@@ -2,16 +2,17 @@ package com.pebbles_boon.metalrender.sodium.mixins;
 
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
-import com.mojang.blaze3d.systems.RenderSystem;
 import com.pebbles_boon.metalrender.MetalRenderClient;
+import com.pebbles_boon.metalrender.backend.MetalRenderer;
+import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import com.pebbles_boon.metalrender.render.CapturedMatrices;
+import com.pebbles_boon.metalrender.render.MetalRenderHookState;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.LevelRenderer;
-import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
@@ -36,15 +37,16 @@ public class WorldRendererBlitMixin {
   @Unique
   private int metalrender$endFrameCount;
 
-  @Inject(method = "renderLevel", at = @At("HEAD"), require = 0)
+  @Inject(method = "render", at = @At("HEAD"), require = 1)
   private void metalrender$beginWorldFrame(
       GraphicsResourceAllocator allocator, DeltaTracker tickCounter,
       boolean renderBlockOutline, CameraRenderState cameraRenderState,
       Matrix4fc positionMatrix, GpuBufferSlice fogBuffer, Vector4f fogColor,
-      boolean renderEntityOutline, ChunkSectionsToRender sectionsToRender,
-      CallbackInfo ci) {
+      boolean renderEntityOutline, CallbackInfo ci) {
+    MetalRenderHookState.beginFrameAttempt();
     metalrender$frameActive = false;
-    if (!MetalRenderClient.isEnabled()) {
+    if (!MetalRenderHookState.isGraphicsBackendSupported() ||
+        !MetalRenderClient.isEnabled()) {
       return;
     }
     MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
@@ -52,8 +54,17 @@ public class WorldRendererBlitMixin {
       return;
     }
     try {
+      MetalRenderer renderer = MetalRenderClient.getRenderer();
+      if (renderer == null || renderer.getHandle() == 0) {
+        return;
+      }
+      // A ready frame left at the start of the next LevelRenderer frame missed
+      // its presentation opportunity. Recycle it whether safe hybrid mode,
+      // screenshot suppression, or a transient blit failure caused the miss.
+      // In-flight and OpenGL-bound surfaces remain protected.
+      NativeBridge.nRecycleUnpresentedFrames(renderer.getHandle());
       Minecraft mc = Minecraft.getInstance();
-      Camera camera = mc.gameRenderer.getMainCamera();
+      Camera camera = mc.gameRenderer.mainCamera();
       if (camera == null || camera.position() == null) {
         return;
       }
@@ -80,43 +91,38 @@ public class WorldRendererBlitMixin {
           camPos.x, camPos.y, camPos.z);
       worldRenderer.beginFrame(camera, tickDelta, metalrender$projection,
           metalrender$modelView);
+      if (renderer.frameCtx() == 0) {
+        MetalRenderHookState.failOpen("begin-frame-context", null);
+        return;
+      }
       com.pebbles_boon.metalrender.performance.MetalRenderProfiler.getInstance().startRender();
+      MetalRenderHookState.markFramePrepared();
       metalrender$frameActive = true;
       metalrender$beginFrameCount++;
       if (metalrender$beginFrameCount <= 3) {
         MetalLogger.info("[blitmix] begin hook #%d",
             metalrender$beginFrameCount);
       }
-    } catch (Exception e) {
-      MetalLogger.error("[blitmix] begin fail: %s", e.getMessage());
-    }
-  }
-
-  @Inject(method = "renderLevel", at = @At("TAIL"), require = 0)
-  private void metalrender$endWorldFrame(
-      GraphicsResourceAllocator allocator, DeltaTracker tickCounter,
-      boolean renderBlockOutline, CameraRenderState cameraRenderState,
-      Matrix4fc positionMatrix, GpuBufferSlice fogBuffer, Vector4f fogColor,
-      boolean renderEntityOutline, ChunkSectionsToRender sectionsToRender,
-      CallbackInfo ci) {
-    if (!metalrender$frameActive) {
-      return;
-    }
-    metalrender$frameActive = false;
-    MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
-    if (worldRenderer == null) {
-      return;
-    }    try {
-      com.pebbles_boon.metalrender.performance.MetalRenderProfiler.getInstance().endRender();
       worldRenderer.endFrame();
-      //no need no more
-      
-      metalrender$endFrameCount++;if (metalrender$endFrameCount <= 3) {
-        MetalLogger.info("[blitmix] end hook #%d",
+      MetalRenderHookState.markFrameFinished();
+      metalrender$frameActive = false;
+      com.pebbles_boon.metalrender.performance.MetalRenderProfiler.getInstance().endRender();
+      metalrender$endFrameCount++;
+      if (metalrender$endFrameCount <= 3) {
+        MetalLogger.info("[blitmix] encoded hook #%d",
             metalrender$endFrameCount);
       }
-    } catch (Exception e) {
-      MetalLogger.error("[blitmix] end fail: %s", e.getMessage());
+    } catch (Throwable e) {
+      if (metalrender$frameActive) {
+        try {
+          com.pebbles_boon.metalrender.performance.MetalRenderProfiler
+              .getInstance().endRender();
+        } catch (Throwable ignored) {
+        }
+      }
+      metalrender$frameActive = false;
+      MetalRenderHookState.failOpen("world-frame-encode", e);
+      MetalLogger.error("[blitmix] frame encode fail: %s", e.getMessage());
     }
   }
 }

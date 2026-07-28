@@ -53,6 +53,7 @@ public class MetalEntityRenderer {
 
   private long device;
   private boolean active;
+  private boolean buffersReady;
   private int frameCount;
   private long lastEntityLogTime;
   private int captureCallsPerSec;
@@ -81,31 +82,45 @@ public class MetalEntityRenderer {
         .order(ByteOrder.nativeOrder());
     metalVertexConsumer = new MetalVertexConsumer(vertexStagingBuffer, MAX_BATCH_VERTICES);
     java.util.Arrays.fill(textureCache, TEXTURE_UNCACHED);
-    MetalLogger.info("entity wendewer weady");
+    MetalLogger.info("entity renderer ready");
   }
 
   public void setup(long device, long pipeline) {
+    active = false;
+    if (buffersReady && this.device == device) {
+      return;
+    }
+    destroyVertexBuffers();
+    buffersReady = false;
     this.device = device;
     if (device != 0) {
       for (int i = 0; i < 3; i++) {
         vbufs[i] = NativeBridge.nCreateBuffer(
             device, MAX_BATCH_VERTICES * ENTITY_VERTEX_STRIDE, 0);
+        if (vbufs[i] == 0) {
+          destroyVertexBuffers();
+          this.device = 0;
+          MetalLogger.warn(
+              "entity buffers unavailable; keeping vanilla entities active");
+          return;
+        }
       }
       if (!residencySetsInitialized) {
         ResidencySetManager.initialize(device);
         residencySetsInitialized = true;
       }
-      MetalLogger.info("entity wendewer: dev=%d vb0=%d vb1=%d vb2=%d",
+      MetalLogger.info("entity renderer: dev=%d vb0=%d vb1=%d vb2=%d",
           device, vbufs[0], vbufs[1], vbufs[2]);
+      buffersReady = true;
     }
   }
 
   public void setActive(boolean active) {
-    this.active = active;
+    this.active = active && buffersReady;
   }
 
   public boolean isActive() {
-    return active;
+    return active && buffersReady;
   }
 
   public boolean hasVisibleSubmergedEntities() {
@@ -117,9 +132,9 @@ public class MetalEntityRenderer {
     return false;
   }
 
-  public void captureEntity(Entity entity, float delta, Matrix4f model) {
+  public boolean captureEntity(Entity entity, float delta, Matrix4f model) {
     if (!active || entity == null || count >= MAX_ENTITIES_PER_FRAME) {
-      return;
+      return false;
     }
     entitiesCapturedPerSec++;
     captureCallsPerSec++;
@@ -164,6 +179,7 @@ public class MetalEntityRenderer {
     }
 
     count++;
+    return true;
   }
 
   public void buildMeshes(long ctx) {
@@ -184,7 +200,7 @@ public class MetalEntityRenderer {
       return;
     }
 
-    Camera camera = mc.gameRenderer.getMainCamera();
+    Camera camera = mc.gameRenderer.mainCamera();
     double camX;
     double camY;
     double camZ;
@@ -222,7 +238,7 @@ public class MetalEntityRenderer {
             camY, camZ, delta);
       } catch (Exception e) {
         if (frameCount < 5) {
-          MetalLogger.warn("entity wendewer fail %s: %s",
+          MetalLogger.warn("entity renderer failed for %s: %s",
               entity.getType().toString(), e.getMessage());
         }
       }
@@ -363,7 +379,7 @@ public class MetalEntityRenderer {
     }
 
     Minecraft mc = Minecraft.getInstance();
-    Camera camera = mc != null ? mc.gameRenderer.getMainCamera() : null;
+    Camera camera = mc != null ? mc.gameRenderer.mainCamera() : null;
     if (camera != null && camera.isInitialized()) {
       camera.extractRenderState(reusableCameraRenderState, tickDelta);
     } else {
@@ -876,7 +892,7 @@ public class MetalEntityRenderer {
     if (MetalRenderConfig.isDeepDebugActive() &&
         now - lastEntityLogTime >= 10000) {
       MetalLogger.info(
-          "entity stats: cap=%d/10s wendew=%d/10s ent=%d/10s",
+          "entity stats: capture=%d/10s render=%d/10s entities=%d/10s",
           captureCallsPerSec, renderCallsPerSec, entitiesCapturedPerSec);
       captureCallsPerSec = 0;
       renderCallsPerSec = 0;
@@ -905,7 +921,7 @@ public class MetalEntityRenderer {
     MetalRenderer renderer = MetalRenderClient.getRenderer();
     if (renderer == null) {
       if (frameCount < 5) {
-        MetalLogger.warn("entity wendewer: wendewer null");
+        MetalLogger.warn("entity renderer: renderer unavailable");
       }
       return;
     }
@@ -924,7 +940,7 @@ public class MetalEntityRenderer {
       long inhousePipeline = renderer.getBackend().getInhousePipelineHandle();
       if (inhousePipeline == 0) {
         if (frameCount < 5) {
-          MetalLogger.warn("entity wendewer: no pipe");
+          MetalLogger.warn("entity renderer: pipeline unavailable");
         }
       } else {
         NativeBridge.nSetPipelineState(ctx, inhousePipeline);
@@ -979,7 +995,7 @@ public class MetalEntityRenderer {
     if (MetalRenderConfig.isDeepDebugActive() &&
         (frameCount <= 5 || frameCount % 3000 == 0)) {
       MetalLogger.info(
-          "entity wendewer: f=%d ent=%d v=%d d=%d",
+          "entity renderer: f=%d ent=%d v=%d d=%d",
           frameCount, pendingDrawCount, vtxCount, drawsDone);
     }
 
@@ -1065,6 +1081,7 @@ public class MetalEntityRenderer {
 
   public void shutdown() {
     active = false;
+    buffersReady = false;
     cachedEntityPipeline = 0;
     count = 0;
     pendingDrawCount = 0;
@@ -1075,16 +1092,20 @@ public class MetalEntityRenderer {
       }
     }
     java.util.Arrays.fill(textureCache, TEXTURE_UNCACHED);
-    for (int i = 0; i < 3; i++) {
+    destroyVertexBuffers();
+    ResidencySetManager.shutdown();
+    residencySetsInitialized = false;
+    device = 0;
+    MetalLogger.info("entity renderer shut down");
+  }
+
+  private void destroyVertexBuffers() {
+    for (int i = 0; i < vbufs.length; i++) {
       if (vbufs[i] != 0) {
         NativeBridge.nDestroyBuffer(vbufs[i]);
         vbufs[i] = 0;
       }
     }
-    ResidencySetManager.shutdown();
-    residencySetsInitialized = false;
-    device = 0;
-    MetalLogger.info("entity wendewer shut down");
   }
 
   private static class CapturedEntity {

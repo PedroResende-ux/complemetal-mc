@@ -4,6 +4,7 @@ import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.nativebridge.MetalHardwareChecker;
+import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import net.minecraft.client.Minecraft;
@@ -19,9 +20,14 @@ public final class MetalRenderCommands {
 
     public static void register() {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
-            dispatcher.register(
-                    literal("metalrender")
+            dispatcher.register(commandTree("metalrender"));
+            dispatcher.register(commandTree("mr"));
+        });
+        MetalLogger.info("MetalRender client commands registered");
+    }
 
+    private static LiteralArgumentBuilder<FabricClientCommandSource> commandTree(String root) {
+        return literal(root)
                             .then(literal("help").executes(ctx -> {
                                 sendHelp(ctx.getSource());
                                 return 1;
@@ -33,17 +39,23 @@ public final class MetalRenderCommands {
                             }))
 
                             .then(literal("cache")
-                                    .then(literal("clear").executes(ctx -> {
+                                    .then(literal("clear")
+                                      .requires(FabricClientCommandSource::attended)
+                                      .executes(ctx -> {
                                         cacheClear(ctx.getSource());
                                         return 1;
                                     })))
 
-                            .then(literal("reload").executes(ctx -> {
+                            .then(literal("reload")
+                              .requires(FabricClientCommandSource::attended)
+                              .executes(ctx -> {
                                 reloadWorld(ctx.getSource());
                                 return 1;
                             }))
 
-                            .then(literal("restart").executes(ctx -> {
+                            .then(literal("restart")
+                              .requires(FabricClientCommandSource::attended)
+                              .executes(ctx -> {
                                 restart(ctx.getSource());
                                 return 1;
                             }))
@@ -57,41 +69,49 @@ public final class MetalRenderCommands {
                                         MetalRenderConfig cfg = MetalRenderClient.getConfig();
                                         if (cfg != null)
                                             cfg.save();
-                                        msg(ctx.getSource(), "§aConfig saved to diks");
+                                        msg(ctx.getSource(), "§aMetalRender config saved");
                                         return 1;
                                     }))
-                                    .then(literal("reload").executes(ctx -> {
-
-                                        msg(ctx.getSource(),
-                                                "§eConfig reloaded. some changes would need restart");
+                                    .then(literal("reload")
+                                      .requires(FabricClientCommandSource::attended)
+                                      .executes(ctx -> {
+                                        boolean ok = MetalRenderClient.reloadConfig();
+                                        msg(ctx.getSource(), ok
+                                            ? "§aMetalRender config reloaded"
+                                            : "§cMetalRender config reload failed; see log");
                                         return 1;
                                     }))
-                                    .then(literal("reset").executes(ctx -> {
+                                    .then(literal("reset")
+                                      .requires(FabricClientCommandSource::attended)
+                                      .executes(ctx -> {
                                         resetConfig(ctx.getSource());
                                         return 1;
                                     })))
 
                             .then(literal("performance")
-                                    .then(literal("reset").executes(ctx -> {
+                                    .then(literal("reset")
+                                      .requires(FabricClientCommandSource::attended)
+                                      .executes(ctx -> {
                                         MetalRenderConfig.setResolutionScale(1.0f);
+                                        MetalRenderClient.requestDeferredApply(false, false, true);
                                         msg(ctx.getSource(),
-                                                "§epewfowmance settings reset");
+                                                "§ePerformance scaling reset");
                                         return 1;
                                     })))
 
                             .then(literal("profile").executes(ctx -> {
                                 com.pebbles_boon.metalrender.performance.MetalRenderProfiler.getInstance().toggleVisible();
                                 boolean nowVisible = com.pebbles_boon.metalrender.performance.MetalRenderProfiler.getInstance().isVisible();
-                                msg(ctx.getSource(), nowVisible ? "§aMetalRender profiler starts" : "§eMetalRender profiler unstarts");
+                                msg(ctx.getSource(), nowVisible
+                                    ? "§aMetalRender profiler enabled"
+                                    : "§eMetalRender profiler disabled");
                                 return 1;
                             }))
 
                             .executes(ctx -> {
                                 sendHelp(ctx.getSource());
                                 return 1;
-                            }));
-        });
-        MetalLogger.info("metalwender command");
+                            });
     }
 
     private static void msg(FabricClientCommandSource src, String text) {
@@ -103,26 +123,25 @@ public final class MetalRenderCommands {
 
     private static void sendHelp(FabricClientCommandSource src) {
         msg(src, "§6§l--- MetalRender Commands ---");
-        msg(src, "§e/metalrender status §7- Show wendewer status");
-        msg(src, "§e/metalrender help §7- help menu");
-        msg(src, "§e/metalrender cache clear §7- Clear cache & westart wendewer");
-        msg(src, "§e/metalrender reload §7- weload world wendewer");
-        msg(src, "§e/metalrender restart §7- Full wendewer westart");
-        msg(src, "§e/metalrender config open §7- Open MetalRender settings screen");
-        msg(src, "§e/metalrender config save|reload|reset §7- Config management");
-        msg(src, "§e/metalrender performance reset §7- reset perf settings");
+        msg(src, "§e/metalrender status §7- Show renderer and backend status");
+        msg(src, "§e/metalrender cache clear §7- Clear generated terrain meshes");
+        msg(src, "§e/metalrender reload §7- Rebuild level render data");
+        msg(src, "§e/metalrender restart §7- Restart the Metal renderer session");
+        msg(src, "§e/metalrender config open|save|reload|reset §7- Configuration");
+        msg(src, "§e/metalrender performance reset §7- Reset dynamic scaling");
         msg(src, "§e/metalrender profile §7- Toggle profiler overlay");
+        msg(src, "§7Alias: §e/mr");
     }
 
     private static void openConfigScreen(FabricClientCommandSource src) {
         try {
             Minecraft mc = Minecraft.getInstance();
             if (mc == null) {
-                msg(src, "§cminecwaft die");
+                msg(src, "§cMinecraft client is unavailable");
                 return;
             }
             MetalRenderClient.openSettingsScreen(mc);
-            msg(src, "§aopen metalrender setting");
+            msg(src, "§aOpened MetalRender settings");
         } catch (Exception e) {
             msg(src, "§cfailed to open config screen: " + e.getMessage());
         }
@@ -134,10 +153,33 @@ public final class MetalRenderCommands {
         boolean enabled = cfg != null && cfg.enableMetalRendering;
 
         msg(src, "§6§l--- MetalRender Status ---");
-        msg(src, "§7Enabled: " + (enabled ? "§cyea" : "§cnah"));
+        msg(src, "§7Enabled: " + (enabled ? "§aYes" : "§cNo"));
         msg(src, "§7Hardware: "
                 + (available ? "§a" + MetalHardwareChecker.getDeviceName() : "§cUnavailable"));
         msg(src, "§7Resolution scale: §f" + String.format("%.2fx", MetalRenderConfig.resolutionScale()));
+        msg(src, "§7Metal frame target: §f"
+                + MetalRenderClient.effectiveTargetFrameRate() + " FPS"
+                + (cfg != null && cfg.autoTargetFrameRate
+                    ? " §7(display/cap)" : " §7(manual)"));
+        msg(src, "§7Terrain replacement: "
+                + (cfg != null && cfg.enableFastTerrainReplacement
+                    ? "§eExperimental fast" : "§aSafe alpha overlay"));
+        msg(src, "§7Init state: §f" + MetalRenderClient.getInitState());
+        if (MetalRenderClient.getInitFailure() != null) {
+            msg(src, "§7Fallback reason: §e" + MetalRenderClient.getInitFailure());
+        }
+        if (NativeBridge.isLibLoaded()) {
+            try {
+                msg(src, "§7Native backend: §f" + NativeBridge.nGetBackendMode());
+                msg(src, "§7Metal 4 runtime: " + (NativeBridge.nIsMetal4Active()
+                    ? "§aReady" : "§eUnavailable"));
+                msg(src, "§7Metal 4 draw path: "
+                    + (NativeBridge.nIsMetal4DrawPathActive()
+                        ? "§aActive" : "§eCompatibility"));
+            } catch (UnsatisfiedLinkError ignored) {
+                msg(src, "§7Native backend: §elegacy dylib");
+            }
+        }
 
         MetalWorldRenderer wr = MetalRenderClient.getWorldRenderer();
         if (wr != null) {
@@ -150,9 +192,9 @@ public final class MetalRenderCommands {
         MetalWorldRenderer wr = MetalRenderClient.getWorldRenderer();
         if (wr != null) {
             wr.getChunkMesher().clearAllMeshes();
-            msg(src, "§acache cleared wendewer westawting");
+            msg(src, "§aTerrain mesh cache cleared");
         } else {
-            msg(src, "§cworld wendewer not available です");
+            msg(src, "§cWorld renderer is unavailable");
         }
     }
 
@@ -160,13 +202,13 @@ public final class MetalRenderCommands {
         try {
             Minecraft mc = Minecraft.getInstance();
             if (mc != null && mc.levelRenderer != null) {
-                mc.levelRenderer.allChanged();
+                mc.levelRenderer.resetLevelRenderData();
             }
             MetalWorldRenderer wr = MetalRenderClient.getWorldRenderer();
             if (wr != null) {
                 wr.getChunkMesher().clearAllMeshes();
             }
-            msg(src, "§aworld rendrer reloaded");
+            msg(src, "§aLevel render data reloaded");
         } catch (Exception e) {
             msg(src, "§creload failed: " + e.getMessage());
         }
@@ -174,26 +216,19 @@ public final class MetalRenderCommands {
 
     private static void restart(FabricClientCommandSource src) {
         try {
-            MetalRenderConfig cfg = MetalRenderClient.getConfig();
-            if (cfg != null) {
-                cfg.enableMetalRendering = false;
-                cfg.enableMetalRendering = true;
-            }
-            MetalWorldRenderer wr = MetalRenderClient.getWorldRenderer();
-            if (wr != null) {
-                wr.getChunkMesher().clearAllMeshes();
-            }
-            msg(src, "§aMetalRender westarted");
+            boolean restarted = MetalRenderClient.restartRenderer(Minecraft.getInstance());
+            msg(src, restarted
+                ? "§aMetalRender restarted"
+                : "§cMetalRender restart failed; see /metalrender status");
         } catch (Exception e) {
             msg(src, "§cRestart fail: " + e.getMessage());
         }
     }
 
     private static void resetConfig(FabricClientCommandSource src) {
-        MetalRenderConfig.setResolutionScale(1.0f);
-        MetalRenderConfig.setMirrorUploads(false);
+        MetalRenderClient.resetConfig();
         invalidateAllMeshes();
-        msg(src, "§esettings wreturned to default");
+        msg(src, "§eMetalRender settings restored to defaults");
     }
 
     private static String fmtPx(float value) {

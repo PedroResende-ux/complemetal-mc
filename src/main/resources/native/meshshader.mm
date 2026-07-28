@@ -23,6 +23,9 @@ extern bool g_meshShadersActive;
 extern uint32_t g_meshPipelineCount;
 extern uint32_t g_drawCallCount;
 static const int kTripleBufferCount = 3;
+// Disabled for the 26.2 correctness baseline. The helper's payload and
+// threadgroup contract is not yet covered by a GPU validation test.
+static constexpr bool kMeshShaderHelperValidated = false;
 static id<MTLBuffer> g_clusterVisibilityBuffer = nil;
 static inline void meshDbg(const char *fmt, ...) {
 #ifdef METALRENDER_DEBUG
@@ -50,6 +53,17 @@ buildMeshPipeline(id<MTLDevice> device, id<MTLLibrary> library,
                   NSString *fragmentFuncName, NSError **outError) {
   if (!device || !library)
     return nil;
+  if (!kMeshShaderHelperValidated) {
+    if (outError)
+      *outError =
+          [NSError errorWithDomain:@"MeshShader"
+                              code:-2
+                          userInfo:@{
+                            NSLocalizedDescriptionKey :
+                                @"Mesh helper disabled pending ABI validation"
+                          }];
+    return nil;
+  }
   bool supported = false;
   if (@available(macOS 13.0, *)) {
     supported = [device supportsFamily:MTLGPUFamilyApple7];

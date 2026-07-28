@@ -1,21 +1,19 @@
 .DS_Store
 /build/
 /.gradle/
-/.gradle/**
 /devlibs/
-/build/
 /generated/
 /tmp/
 *.so
 *.dll
 *.class
 *.jar
+!gradle/wrapper/gradle-wrapper.jar
 /.idea/
 *.iml
 *.ipr
 *.iws
 /.vscode/
-.DS_Store
 /run/
 *.log
 run/logs/
@@ -28,11 +26,13 @@ compiled/
 #.gz
 #.log
 compile_commands.json
+/metalrender.plist
 *.air
 *.metallib
 *.dylib
+!src/main/resources/libmetalrender.dylib
+!src/main/resources/native/macos-arm64/libmetalrender.dylib
 /work files/
 *.txt
 *.out
 /extracted_sources/
-

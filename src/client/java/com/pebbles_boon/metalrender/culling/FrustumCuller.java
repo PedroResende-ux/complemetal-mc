@@ -77,4 +77,10 @@ public class FrustumCuller {
     }
     this.mvp.set(other.mvp);
   }
+
+  public FrustumCuller snapshot() {
+    FrustumCuller copy = new FrustumCuller();
+    copy.copyFrom(this);
+    return copy;
+  }
 }

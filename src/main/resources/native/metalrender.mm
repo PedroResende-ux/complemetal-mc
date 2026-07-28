@@ -1,3 +1,4 @@
+#define GL_SILENCE_DEPRECATION
 #import <Foundation/NSProcessInfo.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
@@ -10,13 +11,18 @@
 #import <OpenGL/gl.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <jni.h>
+#include <limits>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
 #include <mach/mach_time.h>
 #include <mutex>
+#include <pthread/qos.h>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
@@ -67,11 +73,35 @@ static inline int dispatch_get_active_cpu_count() {
 static bool g_available = true;
 id<MTLDevice> g_device = nil;
 id<MTLCommandQueue> g_queue = nil;
+static std::mutex g_textureUploadMutex;
+static id<MTLCommandBuffer> g_lastTextureUploadCommandBuffer = nil;
+static std::atomic<bool> g_metal4Requested{false};
+static std::atomic<bool> g_metal4Supported{false};
+static std::atomic<bool> g_metal4ScaffoldActive{false};
+static std::atomic<bool> g_metal4DrawPathActive{false};
+// These are deliberately kept as id and obtained through runtime selectors so
+// the dylib remains weak-link safe on pre-macOS 26 systems.
+static id g_metal4CommandQueue = nil;
+static id g_metal4CommandAllocator = nil;
+static std::atomic<bool> g_tripleBufferingEnabled{true};
+static std::atomic<int> g_activeSurfaceSlots{3};
 static std::unordered_map<uint64_t, id<MTLBuffer>> g_buffers;
+static std::unordered_map<uint64_t, size_t> g_bufferSizes;
+static size_t g_individualBufferBytes = 0;
 static uint64_t g_nextHandle = 1;
 static id<MTLBuffer> g_megaVB = nil;
 
-static const size_t MEGA_VB_CAPACITY = 3072ULL * 1024 * 1024;
+// A fixed 3 GiB shared allocation is especially expensive on unified-memory
+// Macs. Keep the fast suballocator bounded and fall back to individual buffers
+// after it fills. The runtime budget is derived from Metal's recommended
+// working-set size and can be tightened by nConfigureRuntime.
+static constexpr size_t kMiB = 1024ULL * 1024ULL;
+static constexpr size_t kMegaVBMinimum = 128ULL * kMiB;
+static constexpr size_t kMegaVBDefaultMaximum = 256ULL * kMiB;
+static constexpr size_t kMegaVBHardMaximum = 2048ULL * kMiB;
+static size_t g_requestedMemoryBudgetBytes = 0;
+static size_t g_megaVBCapacity = 0;
+static size_t g_megaVBBudget = 0;
 static size_t g_megaVBHead = 0;
 struct MegaSubAlloc {
   size_t offset;
@@ -120,14 +150,28 @@ static void megaTrimFreeTail() {
 }
 struct DeferredDeletion {
   uint64_t handle;
-  int frameQueued;
+  uint64_t retireAfterSubmission;
   bool isMega;
 };
 static std::vector<DeferredDeletion> g_deferredDeletions;
 static std::mutex g_deferredMutex;
 static constexpr int kTripleBufferCount = 3;
-static const int DEFERRED_FRAME_DELAY = kTripleBufferCount + 1;
+static constexpr uint64_t kDeferredSubmissionDelay =
+    kTripleBufferCount + 1;
+static std::atomic<uint64_t> g_submittedFrameSerial{0};
+static std::atomic<uint64_t> g_completedFrameSerial{0};
 static std::atomic<bool> g_gpuNeedsRecovery{false};
+
+static void mark_frame_submission_completed(uint64_t serial) {
+  uint64_t observed =
+      g_completedFrameSerial.load(std::memory_order_acquire);
+  while (observed < serial &&
+         !g_completedFrameSerial.compare_exchange_weak(
+             observed, serial, std::memory_order_release,
+             std::memory_order_acquire)) {
+  }
+}
+
 static inline bool isMegaHandle(uint64_t h) {
   return (h & 0x8000000000000000ULL) != 0;
 }
@@ -159,7 +203,7 @@ static uint64_t megaAlloc(size_t size) {
     }
     return handle;
   }
-  if (g_megaVBHead + aligned > MEGA_VB_CAPACITY) {
+  if (g_megaVBHead + aligned > g_megaVBCapacity) {
 
     megaCoalesceFreeList();
 
@@ -190,7 +234,7 @@ static uint64_t megaAlloc(size_t size) {
     if (megaFailCount++ < 10 || megaFailCount % 500 == 0)
       dbg("megaAlloc FAIL: need %zu, head=%zu, cap=%zu, freeBlocks=%zu (fail "
           "#%d)\n",
-          aligned, g_megaVBHead, MEGA_VB_CAPACITY, g_megaFreeList.size(),
+          aligned, g_megaVBHead, g_megaVBCapacity, g_megaFreeList.size(),
           megaFailCount);
     return 0;
   }
@@ -212,7 +256,8 @@ static void megaFree(uint64_t handle) {
   for (const MegaSubAlloc &freeBlock : g_megaFreeList) {
     freeBytes += freeBlock.size;
   }
-  if (g_megaFreeList.size() > 64 || freeBytes > (MEGA_VB_CAPACITY / 5)) {
+  if (g_megaFreeList.size() > 64 ||
+      (g_megaVBCapacity > 0 && freeBytes > (g_megaVBCapacity / 5))) {
     megaTrimFreeTail();
   }
 }
@@ -261,28 +306,55 @@ static id<MTLTexture> g_tbDepth[3] = {};
 
 static id<MTLTexture> g_lrColor[3] = {};
 static id<MTLTexture> g_lrDepth[3] = {};
+// MetalFX requires a private output texture. The IOSurface-backed presentation
+// textures are shared, so scale into this private target and copy into the
+// presentation slot afterwards.
+static id<MTLTexture> g_mfxOutput[3] = {};
 static id<MTLFXSpatialScaler> g_mfxScaler = nil;
 #endif
 static IOSurfaceRef g_tbIOSurface[3] = {};
+enum SurfaceSlotState : int {
+  SurfaceSlotAvailable = 0,
+  SurfaceSlotMetalInFlight = 1,
+  SurfaceSlotReadyForPresentation = 2,
+  SurfaceSlotBoundToGL = 3,
+};
 static std::atomic<bool> g_tbSlotReady[3] = {{true}, {true}, {true}};
+static std::atomic<int> g_tbSlotState[3] = {
+    {SurfaceSlotAvailable}, {SurfaceSlotAvailable}, {SurfaceSlotAvailable}};
+static std::mutex g_surfaceSlotMutex;
+static std::condition_variable g_surfaceSlotChanged;
+static std::atomic<int> g_glBoundSlot{-1};
 static std::atomic<int> g_tbLastCompleted{-1};
 static int g_renderSlot = 0;
 static bool g_wasReuseFrame = false;
+static bool g_wasLowResolutionFrame = false;
 static id<MTLCommandBuffer> g_tbCmdBuf[3] = {};
+id<MTLRenderCommandEncoder> g_currentEncoder = nil;
+static id<MTLCommandBuffer> g_currentCmdBuffer = nil;
 
 static id<MTLTexture> g_color = nil;
 static id<MTLTexture> g_depth = nil;
+static id<MTLTexture> g_frameColorTarget = nil;
+static id<MTLTexture> g_frameDepthTarget = nil;
 static IOSurfaceRef g_ioSurface = NULL;
-static id<MTLBuffer> g_depthReadBuffer = nil;
-static id<MTLCommandBuffer> g_depthCmdBuffer = nil;
+static id<MTLBuffer> g_tbDepthReadBuffer[3] = {};
+static NSUInteger g_depthReadBytesPerRow = 0;
+static int g_depthReadWidth = 0;
+static int g_depthReadHeight = 0;
 static id<MTLTexture> g_blockAtlas = nil;
 static id<MTLTexture> g_lightmap = nil;
 static id<MTLLibrary> g_shaderLibrary = nil;
 static int g_rtWidth = 16;
 static int g_rtHeight = 16;
 static float g_scale = 1.0f;
-static int g_frameCount = 0;
+static int g_allocatedRenderWidth = 0;
+static int g_allocatedRenderHeight = 0;
+static std::atomic<int> g_frameCount{0};
 static std::atomic<float> g_lastGpuMs{0.0f};
+static std::mutex g_gpuTelemetryMutex;
+static uint64_t g_gpuTelemetryAccumulatedUs = 0;
+static uint32_t g_gpuTelemetryCompletedFrames = 0;
 uint32_t g_drawCallCount = 0;
 static int g_drawSkipCount = 0;
 static int g_totalDraws = 0;
@@ -306,8 +378,8 @@ static id<MTLRenderPipelineState> g_pipelineInhouseOpaque = nil;
 id<MTLRenderPipelineState> g_pipelineMeshOpaque = nil;
 id<MTLRenderPipelineState> g_pipelineMeshCutout = nil;
 id<MTLRenderPipelineState> g_pipelineMeshEmissive = nil;
-static id<MTLBuffer> g_fragArgBuf = nil;
-static id<MTLBuffer> g_fragArgBufOpaque = nil;
+static id<MTLBuffer> g_fragArgBuf[3] = {};
+static id<MTLBuffer> g_fragArgBufOpaque[3] = {};
 static id<MTLArgumentEncoder> g_fragArgEncoder = nil;
 static id<MTLArgumentEncoder> g_fragArgEncoderOpaque = nil;
 static id<MTLComputePipelineState> g_hizDownsamplePipeline = nil;
@@ -322,6 +394,14 @@ static int g_hizCachedW = 0;
 static int g_hizCachedH = 0;
 static NSUInteger g_cullMaxTG = 0;
 static uint32_t g_hizMipCount = 0;
+// The existing multi-mip builder did not bind its parameter buffer and only
+// populated the first level. Keep occlusion disabled until the complete path is
+// validated; shaders still use reversed-Z semantics for the eventual re-enable.
+static constexpr bool kHiZPathValidated = false;
+// The helper currently disagrees with the mesh payload/threadgroup layout used
+// by mesh_terrain.metal. Do not advertise or dispatch it until that ABI has a
+// GPU-validation test.
+static constexpr bool kMeshShaderPathValidated = false;
 
 static inline void hizUpdateThreadgroupSize(id<MTLTexture> srcDepth) {
   int w = (int)srcDepth.width;
@@ -361,8 +441,8 @@ id<MTLBuffer> g_tripleBuffers[kTripleBufferCount] = {};
 static id<MTLBuffer> g_meshletBuffers[kTripleBufferCount] = {};
 int g_currentBufferIndex = 0;
 static dispatch_semaphore_t g_frameSemaphore = nil;
-static volatile bool g_shuttingDown = false;
-static volatile bool g_currentFrameReady = true;
+static std::atomic<bool> g_shuttingDown{false};
+static std::atomic<bool> g_currentFrameReady{true};
 static id<MTLBuffer> g_argumentBuffer = nil;
 static bool g_argumentBufferDirty = true;
 static id<MTLRenderPipelineState> g_meshTerrainOpaquePSO = nil;
@@ -396,7 +476,6 @@ static float g_targetFrameTimeMs = 16.67f;
 static float g_avgFrameTimeMs = 0.0f;
 static int g_configuredRenderDistBlocks = 512;
 static bool g_useMemorylessTargets = false;
-static float g_lastGpuFrameMs = 0.0f;
 static float g_targetScale = 1.0f;
 static bool g_useProgrammableBlending = false;
 static bool g_useArgumentBuffers = false;
@@ -480,6 +559,108 @@ static inline int opaqueBucketStartQuad(const int counts[7], int bucket) {
   for (int i = 0; i < bucket; i++)
     start += counts[i];
   return start;
+}
+
+static size_t clamp_memory_budget(size_t requestedBytes) {
+  size_t recommended = 0;
+  if (g_device &&
+      [g_device respondsToSelector:@selector(recommendedMaxWorkingSetSize)]) {
+    recommended = (size_t)g_device.recommendedMaxWorkingSetSize;
+  }
+  size_t safeDeviceBudget =
+      recommended > 0 ? std::max(kMegaVBMinimum, recommended / 8)
+                      : kMegaVBDefaultMaximum;
+  safeDeviceBudget = std::min(safeDeviceBudget, kMegaVBHardMaximum);
+  if (requestedBytes == 0)
+    return safeDeviceBudget;
+  return std::max(kMegaVBMinimum,
+                  std::min(requestedBytes, safeDeviceBudget));
+}
+
+static size_t requested_memory_budget_from_environment() {
+  const char *value = std::getenv("METALRENDER_MAX_MEMORY_MB");
+  if (!value || value[0] == '\0')
+    return 0;
+  char *end = nullptr;
+  unsigned long long megabytes = std::strtoull(value, &end, 10);
+  if (end == value || megabytes == 0)
+    return 0;
+  return (size_t)std::min<unsigned long long>(
+             megabytes, kMegaVBHardMaximum / kMiB) *
+         kMiB;
+}
+
+static void recreate_mega_vertex_buffer_if_empty() {
+  if (!g_device)
+    return;
+  if (g_requestedMemoryBudgetBytes == 0)
+    g_requestedMemoryBudgetBytes = requested_memory_budget_from_environment();
+  g_megaVBBudget = clamp_memory_budget(g_requestedMemoryBudgetBytes);
+  size_t desiredCapacity = std::min(
+      std::max(kMegaVBMinimum, g_megaVBBudget / 2),
+      kMegaVBDefaultMaximum);
+  desiredCapacity = std::max(desiredCapacity, kMegaVBMinimum);
+
+  std::unique_lock<std::shared_mutex> lock(g_megaMutex);
+  if (g_megaVB && (g_megaVBHead != 0 || !g_megaAllocs.empty()))
+    return;
+  if (g_megaVB && g_megaVBCapacity == desiredCapacity)
+    return;
+  if (g_megaVB) {
+    [g_megaVB release];
+    g_megaVB = nil;
+  }
+  g_megaVB = [g_device newBufferWithLength:desiredCapacity
+                                    options:MTLStorageModeShared];
+  g_megaVBCapacity = g_megaVB ? desiredCapacity : 0;
+  g_megaVBHead = 0;
+  g_megaFreeList.clear();
+  if (g_megaVB) {
+    g_megaVB.label = @"MetalRender bounded vertex arena";
+    dbg("Vertex arena created: capacity=%zuMB budget=%zuMB\n",
+        g_megaVBCapacity / kMiB, g_megaVBBudget / kMiB);
+  } else {
+    dbg("WARN: Failed to create bounded vertex arena; using individual "
+        "buffers\n");
+  }
+}
+
+static void configure_metal4_scaffold() {
+  if (!g_device)
+    return;
+  bool supported = false;
+  if (@available(macOS 26.0, *)) {
+    SEL queueSelector = NSSelectorFromString(@"newMTL4CommandQueue");
+    SEL allocatorSelector = NSSelectorFromString(@"newCommandAllocator");
+    supported = NSClassFromString(@"MTL4CommandQueueDescriptor") != Nil &&
+                [g_device respondsToSelector:queueSelector] &&
+                [g_device respondsToSelector:allocatorSelector];
+    g_metal4Supported.store(supported, std::memory_order_release);
+    if (supported && g_metal4Requested.load(std::memory_order_acquire) &&
+        !g_metal4ScaffoldActive.load(std::memory_order_acquire)) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+      id queue = [g_device performSelector:queueSelector];
+      id allocator = [g_device performSelector:allocatorSelector];
+#pragma clang diagnostic pop
+      if (queue && allocator) {
+        g_metal4CommandQueue = queue;
+        g_metal4CommandAllocator = allocator;
+        g_metal4ScaffoldActive.store(true, std::memory_order_release);
+        dbg("Metal 4 runtime scaffold ready (queue + allocator); rendering "
+            "remains on the compatibility command stream\n");
+      } else {
+        if (queue)
+          [queue release];
+        if (allocator)
+          [allocator release];
+        dbg("WARN: Metal 4 runtime objects could not be created; using Metal "
+            "3 fallback\n");
+      }
+    }
+  } else {
+    g_metal4Supported.store(false, std::memory_order_release);
+  }
 }
 
 static inline int visibleOpaqueBucketCount(const int counts[7], uint32_t mask) {
@@ -702,23 +883,14 @@ static void ensure_device() {
     g_device = MTLCreateSystemDefaultDevice();
     if (g_device) {
       g_queue = [g_device newCommandQueue];
+      g_queue.label = @"MetalRender Metal 3 compatibility queue";
 
       g_supportsASTC = [g_device supportsFamily:MTLGPUFamilyApple1];
       if (g_supportsASTC) {
         dbg("ASTC texture compression supported (Apple GPU)\n");
       }
-      if (!g_megaVB) {
-        g_megaVB = [g_device newBufferWithLength:MEGA_VB_CAPACITY
-                                         options:MTLStorageModeShared];
-        g_megaVBHead = 0;
-        if (g_megaVB) {
-          dbg("Mega vertex buffer created: %zuMB\n",
-              MEGA_VB_CAPACITY / (1024 * 1024));
-        } else {
-          dbg("WARN: Failed to create mega vertex buffer, falling back to "
-              "individual buffers\n");
-        }
-      }
+      recreate_mega_vertex_buffer_if_empty();
+      configure_metal4_scaffold();
     }
   }
 }
@@ -755,9 +927,12 @@ static MetalFeatureCaps current_feature_caps() {
   caps.memorylessTargets = apple2;
   caps.meshShaders = apple7 || mac2;
 
-  if (!@available(macOS 13.0, *)) {
+  if (@available(macOS 13.0, *)) {
+    // Availability already satisfied.
+  } else {
     caps.meshShaders = false;
   }
+  caps.meshShaders = caps.meshShaders && kMeshShaderPathValidated;
 
   return caps;
 }
@@ -820,21 +995,24 @@ static void load_shaders() {
     }
   }
 
-  NSArray<NSString *> *searchPaths = @[
-    @"src/main/resources/shaders.metallib",
-    [NSString
-        stringWithFormat:@"%@/shaders.metallib",
-                         [[NSFileManager defaultManager] currentDirectoryPath]],
-    @"shaders.metallib",
-  ];
+  NSMutableArray<NSString *> *searchPaths = [NSMutableArray array];
   Dl_info dlInfo;
   if (dladdr((void *)load_shaders, &dlInfo) && dlInfo.dli_fname) {
     NSString *dylibPath = [[NSString stringWithUTF8String:dlInfo.dli_fname]
         stringByDeletingLastPathComponent];
     NSString *metallibPath =
         [dylibPath stringByAppendingPathComponent:@"shaders.metallib"];
-    searchPaths = [searchPaths arrayByAddingObject:metallibPath];
+    // A packaged shader library is extracted beside this dylib. Prefer that
+    // checksum-paired payload over any development file in the working tree.
+    [searchPaths addObject:metallibPath];
   }
+  [searchPaths addObjectsFromArray:@[
+    @"src/main/resources/shaders.metallib",
+    [NSString
+        stringWithFormat:@"%@/shaders.metallib",
+                         [[NSFileManager defaultManager] currentDirectoryPath]],
+    @"shaders.metallib",
+  ]];
   for (NSString *path in searchPaths) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
       NSURL *url = [NSURL fileURLWithPath:path];
@@ -1239,9 +1417,14 @@ fragment float4 fragment_particle(
         g_fragArgEncoder = [fragIcbFn newArgumentEncoderWithBufferIndex:0];
         if (g_fragArgEncoder) {
           NSUInteger argBufLen = [g_fragArgEncoder encodedLength];
-          g_fragArgBuf = [g_device newBufferWithLength:argBufLen
-                                               options:MTLStorageModeShared];
-          g_icbCapable = true;
+          bool allArgumentBuffersAllocated = true;
+          for (int slot = 0; slot < kTripleBufferCount; slot++) {
+            g_fragArgBuf[slot] =
+                [g_device newBufferWithLength:argBufLen
+                                      options:MTLStorageModeShared];
+            allArgumentBuffersAllocated &= g_fragArgBuf[slot] != nil;
+          }
+          g_icbCapable = allArgumentBuffersAllocated;
           dbg("Fragment arg buffer: %zu bytes\n", (size_t)argBufLen);
         }
       }
@@ -1267,9 +1450,11 @@ fragment float4 fragment_particle(
             [fragIcbOpaqueFn newArgumentEncoderWithBufferIndex:0];
         if (g_fragArgEncoderOpaque) {
           NSUInteger argBufLen = [g_fragArgEncoderOpaque encodedLength];
-          g_fragArgBufOpaque =
-              [g_device newBufferWithLength:argBufLen
-                                    options:MTLStorageModeShared];
+          for (int slot = 0; slot < kTripleBufferCount; slot++) {
+            g_fragArgBufOpaque[slot] =
+                [g_device newBufferWithLength:argBufLen
+                                      options:MTLStorageModeShared];
+          }
         }
       } else {
         dbg("WARN: ICB opaque pipeline failed: %s\n",
@@ -1390,19 +1575,20 @@ fragment float4 fragment_particle(
     }
   }
   MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-  dsDesc.depthCompareFunction = MTLCompareFunctionLess;
+  // Minecraft 26.2 uses reversed-Z: near maps to 1, far maps to 0.
+  dsDesc.depthCompareFunction = MTLCompareFunctionGreater;
   dsDesc.depthWriteEnabled = YES;
   g_depthState = [g_device newDepthStencilStateWithDescriptor:dsDesc];
   g_depthStateReversedZ = g_depthState;
   MTLDepthStencilDescriptor *dsNoWrite =
       [[MTLDepthStencilDescriptor alloc] init];
-  dsNoWrite.depthCompareFunction = MTLCompareFunctionLessEqual;
+  dsNoWrite.depthCompareFunction = MTLCompareFunctionGreaterEqual;
   dsNoWrite.depthWriteEnabled = NO;
   g_depthStateNoWrite = [g_device newDepthStencilStateWithDescriptor:dsNoWrite];
   g_depthStateReversedZNoWrite = g_depthStateNoWrite;
   MTLDepthStencilDescriptor *dsLessEq =
       [[MTLDepthStencilDescriptor alloc] init];
-  dsLessEq.depthCompareFunction = MTLCompareFunctionLessEqual;
+  dsLessEq.depthCompareFunction = MTLCompareFunctionGreaterEqual;
   dsLessEq.depthWriteEnabled = NO;
   g_depthStateLessEqual =
       [g_device newDepthStencilStateWithDescriptor:dsLessEq];
@@ -1414,6 +1600,10 @@ fragment float4 fragment_particle(
   dsEqNoWrite.depthWriteEnabled = NO;
   g_depthStateEqualNoWrite =
       [g_device newDepthStencilStateWithDescriptor:dsEqNoWrite];
+  [dsDesc release];
+  [dsNoWrite release];
+  [dsLessEq release];
+  [dsEqNoWrite release];
   auto createComputePipeline =
       [&](NSString *funcName) -> id<MTLComputePipelineState> {
     id<MTLFunction> func = [g_shaderLibrary newFunctionWithName:funcName];
@@ -1576,17 +1766,168 @@ fragment float4 fragment_particle(
       g_pipelineInhouse, g_pipelineOpaque, g_pipelineEntity,
       g_pipelineEntityTranslucent, g_pipelineEntityEmissive, g_depthState);
 }
+
+static void reset_frame_semaphore_after_drain() {
+  if (g_frameSemaphore) {
+    dispatch_release(g_frameSemaphore);
+    g_frameSemaphore = nil;
+  }
+  int maxInFlight =
+      g_tripleBufferingEnabled.load(std::memory_order_acquire) ? 2 : 1;
+  g_frameSemaphore = dispatch_semaphore_create(maxInFlight);
+}
+
+static void wait_for_staged_texture_uploads() {
+  id<MTLCommandBuffer> uploadCommandBuffer = nil;
+  {
+    std::lock_guard<std::mutex> lock(g_textureUploadMutex);
+    // Transfer the retained global reference to this stack scope.
+    uploadCommandBuffer = g_lastTextureUploadCommandBuffer;
+    g_lastTextureUploadCommandBuffer = nil;
+  }
+  if (!uploadCommandBuffer)
+    return;
+  if (uploadCommandBuffer.status < MTLCommandBufferStatusCompleted)
+    [uploadCommandBuffer waitUntilCompleted];
+  if (uploadCommandBuffer.status != MTLCommandBufferStatusCompleted) {
+    NSError *error = uploadCommandBuffer.error;
+    dbg("WARN: staged texture upload failed: status=%ld error=%s\n",
+        (long)uploadCommandBuffer.status,
+        error ? [[error localizedDescription] UTF8String] : "unknown");
+  }
+  [uploadCommandBuffer release];
+}
+
+static void drain_surface_slots(bool finishOpenGL) {
+  @autoreleasepool {
+    if (g_currentEncoder) {
+      [g_currentEncoder endEncoding];
+      [g_currentEncoder release];
+      g_currentEncoder = nil;
+    }
+    if (g_currentCmdBuffer) {
+      [g_currentCmdBuffer commit];
+      [g_currentCmdBuffer waitUntilCompleted];
+      [g_currentCmdBuffer release];
+      g_currentCmdBuffer = nil;
+    }
+    if (finishOpenGL && CGLGetCurrentContext())
+      glFinish();
+
+    for (int i = 0; i < kTripleBufferCount; i++) {
+      id<MTLCommandBuffer> commandBuffer = g_tbCmdBuf[i];
+      if (commandBuffer &&
+          commandBuffer.status < MTLCommandBufferStatusCompleted) {
+        [commandBuffer waitUntilCompleted];
+      }
+    }
+    // Texture uploads are separate same-queue blits. Waiting for the newest
+    // one also orders every earlier upload, including during queue recovery.
+    wait_for_staged_texture_uploads();
+    {
+      std::lock_guard<std::mutex> lock(g_surfaceSlotMutex);
+      for (int i = 0; i < kTripleBufferCount; i++) {
+        if (g_tbCmdBuf[i]) {
+          [g_tbCmdBuf[i] release];
+          g_tbCmdBuf[i] = nil;
+        }
+        g_tbSlotState[i].store(SurfaceSlotAvailable,
+                               std::memory_order_release);
+        g_tbSlotReady[i].store(true, std::memory_order_release);
+      }
+      g_glBoundSlot.store(-1, std::memory_order_release);
+      g_tbLastCompleted.store(-1, std::memory_order_release);
+      g_currentFrameReady.store(true, std::memory_order_release);
+    }
+    g_surfaceSlotChanged.notify_all();
+    reset_frame_semaphore_after_drain();
+  }
+}
+
+static int find_available_surface_slot_locked(int preferred) {
+  int slotCount = std::max(
+      2, std::min(kTripleBufferCount,
+                  g_activeSurfaceSlots.load(std::memory_order_acquire)));
+  for (int offset = 0; offset < slotCount; offset++) {
+    int slot = (preferred + offset) % slotCount;
+    if (g_tbSlotState[slot].load(std::memory_order_acquire) ==
+        SurfaceSlotAvailable)
+      return slot;
+  }
+  // Completed surfaces that were never handed to OpenGL are safe to drop.
+  // Prefer an older ready frame over the latest completed one, but reclaim
+  // the latest too when it is the only way to prevent ring starvation (for
+  // example during startup or screenshot fail-open frames).
+  int lastCompleted = g_tbLastCompleted.load(std::memory_order_acquire);
+  for (int offset = 0; offset < slotCount; offset++) {
+    int slot = (preferred + offset) % slotCount;
+    if (slot != lastCompleted &&
+        g_tbSlotState[slot].load(std::memory_order_acquire) ==
+            SurfaceSlotReadyForPresentation)
+      return slot;
+  }
+  if (lastCompleted >= 0 && lastCompleted < slotCount &&
+      g_tbSlotState[lastCompleted].load(std::memory_order_acquire) ==
+          SurfaceSlotReadyForPresentation)
+    return lastCompleted;
+  return -1;
+}
+
+static int acquire_surface_slot(int preferred) {
+  std::unique_lock<std::mutex> lock(g_surfaceSlotMutex);
+  auto available = [&] {
+    return g_shuttingDown.load(std::memory_order_acquire) ||
+           find_available_surface_slot_locked(preferred) >= 0;
+  };
+  if (!available()) {
+    int waitMs = std::max(8, (int)ceilf(g_targetFrameTimeMs * 2.0f));
+    g_surfaceSlotChanged.wait_for(lock, std::chrono::milliseconds(waitMs),
+                                 available);
+  }
+  if (g_shuttingDown.load(std::memory_order_acquire))
+    return -1;
+  int slot = find_available_surface_slot_locked(preferred);
+  if (slot < 0)
+    return -1;
+  if (g_tbSlotState[slot].load(std::memory_order_acquire) ==
+      SurfaceSlotReadyForPresentation) {
+    int replacementCompleted = -1;
+    for (int i = 0; i < kTripleBufferCount; i++) {
+      if (i != slot &&
+          g_tbSlotState[i].load(std::memory_order_acquire) ==
+              SurfaceSlotReadyForPresentation) {
+        replacementCompleted = i;
+      }
+    }
+    if (g_tbLastCompleted.load(std::memory_order_acquire) == slot)
+      g_tbLastCompleted.store(replacementCompleted,
+                              std::memory_order_release);
+  }
+  g_tbSlotState[slot].store(SurfaceSlotMetalInFlight,
+                            std::memory_order_release);
+  g_tbSlotReady[slot].store(false, std::memory_order_release);
+  return slot;
+}
+
 static void ensure_offscreen() {
   if (!g_device)
     return;
-  int w = std::max(1, (int)(g_rtWidth * g_scale));
-  int h = std::max(1, (int)(g_rtHeight * g_scale));
+  int outputW = std::max(1, g_rtWidth);
+  int outputH = std::max(1, g_rtHeight);
+  int renderW = std::max(1, (int)lroundf(outputW * g_scale));
+  int renderH = std::max(1, (int)lroundf(outputH * g_scale));
 
-  bool recreate = (!g_tbColor[0]) || ((int)g_tbColor[0].width != w) ||
-                  ((int)g_tbColor[0].height != h);
+  bool recreate = (!g_tbColor[0]) ||
+                  ((int)g_tbColor[0].width != outputW) ||
+                  ((int)g_tbColor[0].height != outputH) ||
+                  g_allocatedRenderWidth != renderW ||
+                  g_allocatedRenderHeight != renderH;
   if (!recreate)
     return;
 
+  // IOSurfaces and depth targets may still be retained by either GPU commands
+  // or the OpenGL presentation texture. Drain both APIs before replacement.
+  drain_surface_slots(true);
   for (int s = 0; s < 3; s++) {
     if (g_tbColor[s]) {
       [g_tbColor[s] release];
@@ -1596,15 +1937,22 @@ static void ensure_offscreen() {
       [g_tbDepth[s] release];
       g_tbDepth[s] = nil;
     }
+    if (g_tbDepthReadBuffer[s]) {
+      [g_tbDepthReadBuffer[s] release];
+      g_tbDepthReadBuffer[s] = nil;
+    }
     if (g_tbIOSurface[s]) {
       CFRelease(g_tbIOSurface[s]);
       g_tbIOSurface[s] = NULL;
     }
     g_tbSlotReady[s].store(true, std::memory_order_release);
+    g_tbSlotState[s].store(SurfaceSlotAvailable, std::memory_order_release);
   }
   g_tbLastCompleted.store(-1, std::memory_order_release);
   g_color = nil;
   g_depth = nil;
+  g_frameColorTarget = nil;
+  g_frameDepthTarget = nil;
   g_ioSurface = NULL;
   if (g_hizPyramid) {
     [g_hizPyramid release];
@@ -1621,23 +1969,23 @@ static void ensure_offscreen() {
     }
   }
   g_hizViewsValid = 0;
-  NSUInteger bytesPerRow = ((w * 4) + 15) & ~15;
+  NSUInteger bytesPerRow = ((outputW * 4) + 15) & ~15;
 
   for (int s = 0; s < 3; s++) {
     NSDictionary *surfaceProperties = @{
-      (id)kIOSurfaceWidth : @(w),
-      (id)kIOSurfaceHeight : @(h),
+      (id)kIOSurfaceWidth : @(outputW),
+      (id)kIOSurfaceHeight : @(outputH),
       (id)kIOSurfaceBytesPerElement : @4,
       (id)kIOSurfaceBytesPerRow : @(bytesPerRow),
-      (id)kIOSurfaceAllocSize : @(bytesPerRow * h),
+      (id)kIOSurfaceAllocSize : @(bytesPerRow * outputH),
       (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
     };
     g_tbIOSurface[s] =
         IOSurfaceCreate((__bridge CFDictionaryRef)surfaceProperties);
     MTLTextureDescriptor *cd = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                     width:w
-                                    height:h
+                                     width:outputW
+                                    height:outputH
                                  mipmapped:NO];
     cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     cd.storageMode = MTLStorageModeShared;
@@ -1652,16 +2000,12 @@ static void ensure_offscreen() {
     }
     MTLTextureDescriptor *dd = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                     width:w
-
-                                    height:h
+                                     width:outputW
+                                    height:outputH
                                  mipmapped:NO];
 
-    dd.storageMode = g_useMemorylessTargets ? MTLStorageModeMemoryless
-                                            : MTLStorageModePrivate;
-    dd.usage = g_useMemorylessTargets
-                   ? MTLTextureUsageRenderTarget
-                   : (MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+    dd.storageMode = MTLStorageModePrivate;
+    dd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     g_tbDepth[s] = [g_device newTextureWithDescriptor:dd];
   }
 #ifdef METALRENDER_HAS_METALFX
@@ -1678,31 +2022,17 @@ static void ensure_offscreen() {
         [g_lrDepth[s] release];
         g_lrDepth[s] = nil;
       }
+      if (g_mfxOutput[s]) {
+        [g_mfxOutput[s] release];
+        g_mfxOutput[s] = nil;
+      }
     }
     if (g_scale < 0.99f) {
 
-      int nativeW = std::max(1, g_rtWidth);
-      int nativeH = std::max(1, g_rtHeight);
-      int lrw = w;
-      int lrh = h;
-      for (int s = 0; s < 3; s++) {
-        MTLTextureDescriptor *lrcd = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                         width:lrw
-                                        height:lrh
-                                     mipmapped:NO];
-        lrcd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        lrcd.storageMode = MTLStorageModePrivate;
-        g_lrColor[s] = [g_device newTextureWithDescriptor:lrcd];
-        MTLTextureDescriptor *lrdd = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                         width:lrw
-                                        height:lrh
-                                     mipmapped:NO];
-        lrdd.usage = MTLTextureUsageRenderTarget;
-        lrdd.storageMode = MTLStorageModeMemoryless;
-        g_lrDepth[s] = [g_device newTextureWithDescriptor:lrdd];
-      }
+      int nativeW = outputW;
+      int nativeH = outputH;
+      int lrw = renderW;
+      int lrh = renderH;
       MTLFXSpatialScalerDescriptor *scalerDesc =
           [[MTLFXSpatialScalerDescriptor alloc] init];
       scalerDesc.inputWidth = (NSUInteger)lrw;
@@ -1712,9 +2042,71 @@ static void ensure_offscreen() {
       scalerDesc.colorTextureFormat = MTLPixelFormatBGRA8Unorm;
       scalerDesc.outputTextureFormat = MTLPixelFormatBGRA8Unorm;
       g_mfxScaler = [scalerDesc newSpatialScalerWithDevice:g_device];
-      if (!g_mfxScaler)
+      [scalerDesc release];
+      if (!g_mfxScaler) {
         dbg("WARN: MTLFXSpatialScaler creation failed\n");
-      else
+      } else {
+        bool scalerTexturesReady = true;
+        MTLTextureUsage inputUsage =
+            MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+            g_mfxScaler.colorTextureUsage;
+        MTLTextureUsage outputUsage = g_mfxScaler.outputTextureUsage;
+        if (outputUsage == MTLTextureUsageUnknown)
+          outputUsage = MTLTextureUsageShaderWrite;
+        for (int s = 0; s < 3; s++) {
+          MTLTextureDescriptor *inputDesc = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                           width:lrw
+                                          height:lrh
+                                       mipmapped:NO];
+          inputDesc.storageMode = MTLStorageModePrivate;
+          inputDesc.usage = inputUsage;
+          g_lrColor[s] = [g_device newTextureWithDescriptor:inputDesc];
+
+          MTLTextureDescriptor *depthDesc = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                           width:lrw
+                                          height:lrh
+                                       mipmapped:NO];
+          depthDesc.storageMode = MTLStorageModePrivate;
+          depthDesc.usage =
+              MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+          g_lrDepth[s] = [g_device newTextureWithDescriptor:depthDesc];
+
+          MTLTextureDescriptor *outputDesc = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                           width:nativeW
+                                          height:nativeH
+                                       mipmapped:NO];
+          outputDesc.storageMode = MTLStorageModePrivate;
+          outputDesc.usage = outputUsage | MTLTextureUsageShaderRead;
+          g_mfxOutput[s] = [g_device newTextureWithDescriptor:outputDesc];
+          scalerTexturesReady &= g_lrColor[s] != nil;
+          scalerTexturesReady &= g_lrDepth[s] != nil;
+          scalerTexturesReady &= g_mfxOutput[s] != nil;
+        }
+        if (!scalerTexturesReady) {
+          dbg("WARN: MetalFX private texture allocation failed; using "
+              "full-res rendering\n");
+          [g_mfxScaler release];
+          g_mfxScaler = nil;
+          for (int s = 0; s < 3; s++) {
+            if (g_lrColor[s]) {
+              [g_lrColor[s] release];
+              g_lrColor[s] = nil;
+            }
+            if (g_lrDepth[s]) {
+              [g_lrDepth[s] release];
+              g_lrDepth[s] = nil;
+            }
+            if (g_mfxOutput[s]) {
+              [g_mfxOutput[s] release];
+              g_mfxOutput[s] = nil;
+            }
+          }
+        }
+      }
+      if (g_mfxScaler)
         dbg("MetalFX SpatialScaler created: %dx%d -> %dx%d (scale=%.2f)\n", lrw,
             lrh, nativeW, nativeH, g_scale);
     } else {
@@ -1728,24 +2120,33 @@ static void ensure_offscreen() {
   g_depth = g_tbDepth[0];
   g_ioSurface = g_tbIOSurface[0];
   g_renderSlot = 0;
-  dbg("Triple-buffered render targets created: %dx%d (3 sets)\n", w, h);
+  g_allocatedRenderWidth = renderW;
+  g_allocatedRenderHeight = renderH;
+  dbg("Presentation targets: %dx%d; render targets: %dx%d (%d slots)\n",
+      outputW, outputH, renderW, renderH,
+      g_activeSurfaceSlots.load(std::memory_order_relaxed));
 
-  g_hizWidth = w;
-  g_hizHeight = h;
-  int hizW = std::max(1, w / 2);
-  int hizH = std::max(1, h / 2);
-  g_hizMipCount = (uint32_t)floor(log2(std::max(hizW, hizH))) + 1;
-  g_hizMipCount = std::min(g_hizMipCount, (uint32_t)12);
-  MTLTextureDescriptor *hizDesc = [MTLTextureDescriptor
-      texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
-                                   width:hizW
-                                  height:hizH
-                               mipmapped:YES];
-  hizDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-  hizDesc.storageMode = MTLStorageModePrivate;
-  hizDesc.mipmapLevelCount = g_hizMipCount;
-  g_hizPyramid = [g_device newTextureWithDescriptor:hizDesc];
-  dbg("Created Hi-Z pyramid: %dx%d, %d mips\n", hizW, hizH, g_hizMipCount);
+  g_hizWidth = renderW;
+  g_hizHeight = renderH;
+  g_hizMipCount = 0;
+  if (kHiZPathValidated) {
+    int hizW = std::max(1, renderW / 2);
+    int hizH = std::max(1, renderH / 2);
+    g_hizMipCount =
+        (uint32_t)floor(log2(std::max(hizW, hizH))) + 1;
+    g_hizMipCount = std::min(g_hizMipCount, (uint32_t)12);
+    MTLTextureDescriptor *hizDesc = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                     width:hizW
+                                    height:hizH
+                                 mipmapped:YES];
+    hizDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    hizDesc.storageMode = MTLStorageModePrivate;
+    hizDesc.mipmapLevelCount = g_hizMipCount;
+    g_hizPyramid = [g_device newTextureWithDescriptor:hizDesc];
+  } else {
+    dbg("Hi-Z disabled: multi-mip build/occlusion path is not yet validated\n");
+  }
 
   if (g_oitAccumTex) {
     [g_oitAccumTex release];
@@ -1757,36 +2158,36 @@ static void ensure_offscreen() {
   }
   MTLTextureDescriptor *oitAccumDesc = [MTLTextureDescriptor
       texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
-                                   width:w
-                                  height:h
+                                   width:renderW
+                                  height:renderH
                                mipmapped:NO];
   oitAccumDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-#if defined(__aarch64__)
-  oitAccumDesc.storageMode = MTLStorageModeMemoryless;
-#else
+  // OIT is accumulated in one render pass and sampled in another, so these
+  // resources must survive the pass boundary.
   oitAccumDesc.storageMode = MTLStorageModePrivate;
-#endif
   g_oitAccumTex = [g_device newTextureWithDescriptor:oitAccumDesc];
   MTLTextureDescriptor *oitRevDesc = [MTLTextureDescriptor
       texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
-                                   width:w
-                                  height:h
+                                   width:renderW
+                                  height:renderH
                                mipmapped:NO];
   oitRevDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-#if defined(__aarch64__)
-  oitRevDesc.storageMode = MTLStorageModeMemoryless;
-#else
   oitRevDesc.storageMode = MTLStorageModePrivate;
-#endif
   g_oitRevealTex = [g_device newTextureWithDescriptor:oitRevDesc];
-  dbg("OIT render targets created: %dx%d (accum RGBA16F + revealage R8)\n", w,
-      h);
-  NSUInteger depthBufSize = (NSUInteger)(w * h * 4);
-  if (!g_depthReadBuffer || g_depthReadBuffer.length < depthBufSize) {
-    if (g_depthReadBuffer)
-      [g_depthReadBuffer release];
-    g_depthReadBuffer = [g_device newBufferWithLength:depthBufSize
-                                              options:MTLStorageModeShared];
+  dbg("OIT private render targets: %dx%d (accum RGBA16F + revealage R8)\n",
+      renderW, renderH);
+  g_depthReadBytesPerRow =
+      ((NSUInteger)renderW * sizeof(float) + 255u) & ~255u;
+  g_depthReadWidth = renderW;
+  g_depthReadHeight = renderH;
+  NSUInteger depthBufSize =
+      g_depthReadBytesPerRow * (NSUInteger)renderH;
+  for (int s = 0; s < kTripleBufferCount; s++) {
+    g_tbDepthReadBuffer[s] =
+        [g_device newBufferWithLength:depthBufSize
+                              options:MTLStorageModeShared];
+    g_tbDepthReadBuffer[s].label =
+        [NSString stringWithFormat:@"MetalRender depth readback %d", s];
   }
 }
 extern "C" JNIEXPORT jboolean JNICALL
@@ -1801,8 +2202,8 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nInit(
   ensure_device();
   g_rtWidth = (int)width;
   g_rtHeight = (int)height;
-  g_scale = scale;
-  g_shuttingDown = false;
+  g_scale = std::max(0.2f, std::min(1.0f, (float)scale));
+  g_shuttingDown.store(false, std::memory_order_release);
   ensure_offscreen();
   load_shaders();
   return (g_device != nil) ? (jlong)0x1 : (jlong)0;
@@ -1813,7 +2214,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nResize(
   (void)handle;
   g_rtWidth = (int)width;
   g_rtHeight = (int)height;
-  g_scale = scale;
+  g_scale = std::max(0.2f, std::min(1.0f, (float)scale));
   ensure_offscreen();
 }
 static bool g_reuseTerrainFrame = false;
@@ -1835,29 +2236,26 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nBeginFrame(
   ensure_offscreen();
 }
 extern "C" JNIEXPORT void JNICALL
-Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawTerrain(
-    JNIEnv *, jclass, jlong handle, jint layerId) {}
-extern "C" JNIEXPORT void JNICALL
-Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawOverlay(
-    JNIEnv *, jclass, jlong handle, jint layerId) {}
-extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nOnWorldLoaded(
-    JNIEnv *, jclass, jlong handle) {}
+    JNIEnv *, jclass, jlong handle) {
+  (void)handle;
+  g_shuttingDown.store(false, std::memory_order_release);
+}
 extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nOnWorldUnloaded(
     JNIEnv *, jclass, jlong handle) {
-  g_shuttingDown = true;
-  if (g_frameSemaphore) {
-    dispatch_semaphore_signal(g_frameSemaphore);
-  }
+  (void)handle;
+  g_shuttingDown.store(true, std::memory_order_release);
+  g_surfaceSlotChanged.notify_all();
+  drain_surface_slots(true);
 }
 extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDestroy(
     JNIEnv *, jclass, jlong handle) {
-  g_shuttingDown = true;
-  if (g_frameSemaphore) {
-    dispatch_semaphore_signal(g_frameSemaphore);
-  }
+  (void)handle;
+  g_shuttingDown.store(true, std::memory_order_release);
+  g_surfaceSlotChanged.notify_all();
+  drain_surface_slots(true);
 }
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetDeviceName(
@@ -1880,13 +2278,139 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSupportsMeshShader
   MetalFeatureCaps caps = current_feature_caps();
   return caps.meshShaders ? JNI_TRUE : JNI_FALSE;
 }
+extern "C" JNIEXPORT void JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nConfigureRuntime(
+    JNIEnv *, jclass, jboolean enableMetal4, jint memoryBudgetMB,
+    jint targetFrameRate, jboolean tripleBuffering) {
+  g_metal4Requested.store(enableMetal4 == JNI_TRUE,
+                          std::memory_order_release);
+  if (memoryBudgetMB > 0) {
+    size_t requestedMB =
+        (size_t)std::min((int)(kMegaVBHardMaximum / kMiB),
+                         std::max(1, (int)memoryBudgetMB));
+    g_requestedMemoryBudgetBytes = requestedMB * kMiB;
+  }
+  if (targetFrameRate > 0) {
+    int clampedFps = std::max(30, std::min(1000, (int)targetFrameRate));
+    g_targetFrameTimeMs = 1000.0f / (float)clampedFps;
+  }
+  bool useTripleBuffering = tripleBuffering == JNI_TRUE;
+  bool bufferingChanged =
+      g_tripleBufferingEnabled.exchange(useTripleBuffering,
+                                         std::memory_order_acq_rel) !=
+      useTripleBuffering;
+  g_activeSurfaceSlots.store(useTripleBuffering ? 3 : 2,
+                             std::memory_order_release);
+
+  ensure_device();
+  if (bufferingChanged && g_tbColor[0])
+    drain_surface_slots(true);
+  recreate_mega_vertex_buffer_if_empty();
+  if (enableMetal4 == JNI_TRUE) {
+    configure_metal4_scaffold();
+  } else if (g_metal4ScaffoldActive.exchange(false,
+                                              std::memory_order_acq_rel)) {
+    if (g_metal4CommandQueue) {
+      [g_metal4CommandQueue release];
+      g_metal4CommandQueue = nil;
+    }
+    if (g_metal4CommandAllocator) {
+      [g_metal4CommandAllocator release];
+      g_metal4CommandAllocator = nil;
+    }
+  }
+  dbg("Runtime configured: metal4Requested=%d metal4Scaffold=%d "
+      "arena=%zuMB target=%.2fms surfaces=%d\n",
+      enableMetal4 == JNI_TRUE ? 1 : 0,
+      g_metal4ScaffoldActive.load(std::memory_order_relaxed) ? 1 : 0,
+      g_megaVBCapacity / kMiB, g_targetFrameTimeMs,
+      g_activeSurfaceSlots.load(std::memory_order_relaxed));
+}
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSupportsMetal4(
+    JNIEnv *, jclass) {
+  ensure_device();
+  configure_metal4_scaffold();
+  return g_metal4Supported.load(std::memory_order_acquire) ? JNI_TRUE
+                                                           : JNI_FALSE;
+}
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nIsMetal4Active(
+    JNIEnv *, jclass) {
+  // "Active" here means the macOS 26 runtime accepted the MTL4 queue and
+  // command-allocator scaffold. Use nIsMetal4DrawPathActive to distinguish the
+  // later, fully migrated encoder/pipeline path from this hybrid mode.
+  return g_metal4ScaffoldActive.load(std::memory_order_acquire) ? JNI_TRUE
+                                                                : JNI_FALSE;
+}
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nIsMetal4DrawPathActive(
+    JNIEnv *, jclass) {
+  return g_metal4DrawPathActive.load(std::memory_order_acquire) ? JNI_TRUE
+                                                                : JNI_FALSE;
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetBackendMode(
+    JNIEnv *env, jclass) {
+  const char *mode = "METAL3";
+  if (g_metal4DrawPathActive.load(std::memory_order_acquire)) {
+    mode = "METAL4";
+  } else if (g_metal4ScaffoldActive.load(std::memory_order_acquire)) {
+    mode = "METAL4_HYBRID_METAL3_RENDER";
+  } else if (g_metal4Requested.load(std::memory_order_acquire) &&
+             g_metal4Supported.load(std::memory_order_acquire)) {
+    mode = "METAL3_FALLBACK_METAL4_INIT_FAILED";
+  } else if (g_metal4Requested.load(std::memory_order_acquire) &&
+             !g_metal4Supported.load(std::memory_order_acquire)) {
+    mode = "METAL3_FALLBACK_NO_METAL4";
+  }
+  return env->NewStringUTF(mode);
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSetCurrentThreadQoS(
+    JNIEnv *, jclass, jint qosClass) {
+  qos_class_t qos = QOS_CLASS_DEFAULT;
+  switch ((int)qosClass) {
+  case 1:
+    qos = QOS_CLASS_USER_INTERACTIVE;
+    break;
+  case 2:
+    qos = QOS_CLASS_USER_INITIATED;
+    break;
+  case 3:
+    qos = QOS_CLASS_UTILITY;
+    break;
+  case 4:
+    qos = QOS_CLASS_BACKGROUND;
+    break;
+  default:
+    qos = QOS_CLASS_DEFAULT;
+    break;
+  }
+  int result = pthread_set_qos_class_self_np(qos, 0);
+  if (result != 0)
+    dbg("WARN: pthread_set_qos_class_self_np failed: %d\n", result);
+}
 static std::shared_mutex g_bufferMutex;
 static uint64_t store_buffer(id<MTLBuffer> buf) {
   if (!buf)
     return 0;
   std::unique_lock<std::shared_mutex> lock(g_bufferMutex);
+  size_t length = (size_t)buf.length;
+  if (g_megaVBBudget > 0 &&
+      g_megaVBCapacity + g_individualBufferBytes + length >
+          g_megaVBBudget) {
+    dbg("Buffer allocation rejected by runtime budget: request=%zuKB "
+        "arena=%zuMB individual=%zuMB budget=%zuMB\n",
+        length / 1024, g_megaVBCapacity / kMiB,
+        g_individualBufferBytes / kMiB, g_megaVBBudget / kMiB);
+    [buf release];
+    return 0;
+  }
   uint64_t h = g_nextHandle++;
   g_buffers[h] = buf;
+  g_bufferSizes[h] = length;
+  g_individualBufferBytes += length;
   return h;
 }
 static id<MTLBuffer> get_buffer(uint64_t h) {
@@ -1970,7 +2494,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_MetalBackend_render(
     rp.depthAttachment.texture = g_depth;
     rp.depthAttachment.loadAction = MTLLoadActionClear;
     rp.depthAttachment.storeAction = MTLStoreActionStore;
-    rp.depthAttachment.clearDepth = 1.0;
+    rp.depthAttachment.clearDepth = 0.0;
     id<MTLRenderCommandEncoder> enc =
         [cb renderCommandEncoderWithDescriptor:rp];
     [enc endEncoding];
@@ -2017,7 +2541,10 @@ Java_com_pebbles_1boon_metalrender_nativebridge_MetalBackend_destroyBuffer(
   (void)handle;
   uint64_t h = (uint64_t)bufferHandle;
   std::lock_guard<std::mutex> lock(g_deferredMutex);
-  g_deferredDeletions.push_back({h, g_frameCount, isMegaHandle(h)});
+  uint64_t retireAfter =
+      g_submittedFrameSerial.load(std::memory_order_acquire) +
+      kDeferredSubmissionDelay;
+  g_deferredDeletions.push_back({h, retireAfter, isMegaHandle(h)});
 }
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCreateBufferWithHint(
@@ -2025,17 +2552,16 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCreateBufferWithHi
     jlong oldHandle) {
   (void)deviceHandle;
   (void)storageMode;
+  (void)oldHandle;
   ensure_device();
   if (!g_device || sizeBytes <= 0)
     return 0;
   size_t aligned = (size_t)((sizeBytes + 255) & ~255);
-  if (oldHandle != 0 && isMegaHandle((uint64_t)oldHandle)) {
-    MegaSubAlloc existing;
-    if (megaGetAlloc((uint64_t)oldHandle, existing) &&
-        existing.size >= aligned) {
-      return (jlong)oldHandle;
-    }
-  }
+  // A chunk rebuild is prepared before it replaces the published mesh. Never
+  // upload into oldHandle in place: the previous mesh can still be selected by
+  // the render thread or referenced by an in-flight command buffer. Allocate a
+  // distinct range and let the normal deferred-deletion path retire the old
+  // handle only after publication.
   if (g_megaVB && aligned <= 16 * 1024 * 1024) {
     uint64_t megaH = megaAlloc(aligned);
     if (megaH != 0) {
@@ -2069,67 +2595,83 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUploadBufferData(
     JNIEnv *env, jclass, jlong bufferHandle, jbyteArray data, jint offset,
     jint length) {
+  if (!data || offset < 0 || length <= 0 ||
+      (jlong)length > (jlong)env->GetArrayLength(data))
+    return;
+  size_t destinationOffset = (size_t)offset;
+  size_t copyLength = (size_t)length;
   uint64_t h = (uint64_t)bufferHandle;
   if (isMegaHandle(h)) {
     MegaSubAlloc alloc;
+    if (!megaGetAlloc(h, alloc) || destinationOffset > alloc.size ||
+        copyLength > alloc.size - destinationOffset)
+      return;
     void *dst = megaGetPointer(h);
-    if (!dst || !data || length <= 0)
+    if (!dst)
       return;
     jbyte *bytes = env->GetByteArrayElements(data, nullptr);
     if (bytes) {
-      memcpy((uint8_t *)dst + offset, bytes, (size_t)length);
-      if (megaGetAlloc(h, alloc)) {
-        [g_megaVB
-            didModifyRange:NSMakeRange((NSUInteger)(alloc.offset + offset),
-                                       (NSUInteger)length)];
-      }
+      memcpy((uint8_t *)dst + destinationOffset, bytes, copyLength);
+      [g_megaVB
+          didModifyRange:NSMakeRange(
+                             (NSUInteger)(alloc.offset + destinationOffset),
+                             (NSUInteger)copyLength)];
       env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
     }
     return;
   }
   id<MTLBuffer> buf = get_buffer(h);
-  if (!buf || !data)
+  if (!buf || destinationOffset > (size_t)buf.length ||
+      copyLength > (size_t)buf.length - destinationOffset)
     return;
   jbyte *bytes = env->GetByteArrayElements(data, nullptr);
-  if (bytes && length > 0 && (size_t)(offset + length) <= [buf length]) {
-    memcpy((uint8_t *)[buf contents] + offset, bytes, (size_t)length);
+  if (bytes) {
+    memcpy((uint8_t *)[buf contents] + destinationOffset, bytes, copyLength);
+    env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
   }
-  env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
 }
 extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUploadBufferDataDirect(
     JNIEnv *env, jclass, jlong bufferHandle, jobject directBuffer, jint offset,
     jint length) {
+  if (!directBuffer || offset < 0 || length <= 0)
+    return;
+  jlong capacity = env->GetDirectBufferCapacity(directBuffer);
+  if (capacity < 0 || (jlong)offset > capacity ||
+      (jlong)length > capacity - (jlong)offset)
+    return;
+  void *ptr = env->GetDirectBufferAddress(directBuffer);
+  if (!ptr)
+    return;
+  size_t sourceOffset = (size_t)offset;
+  size_t copyLength = (size_t)length;
   uint64_t h = (uint64_t)bufferHandle;
   if (isMegaHandle(h)) {
     MegaSubAlloc alloc;
-    void *dst = megaGetPointer(h);
-    if (!dst || !directBuffer || length <= 0)
+    if (!megaGetAlloc(h, alloc) || copyLength > alloc.size)
       return;
-    void *ptr = env->GetDirectBufferAddress(directBuffer);
-    if (ptr) {
-      memcpy((uint8_t *)dst, (uint8_t *)ptr + offset, (size_t)length);
-      if (megaGetAlloc(h, alloc)) {
-        [g_megaVB didModifyRange:NSMakeRange((NSUInteger)alloc.offset,
-                                             (NSUInteger)length)];
-      }
-    }
+    void *dst = megaGetPointer(h);
+    if (!dst)
+      return;
+    memcpy((uint8_t *)dst, (uint8_t *)ptr + sourceOffset, copyLength);
+    [g_megaVB didModifyRange:NSMakeRange((NSUInteger)alloc.offset,
+                                         (NSUInteger)copyLength)];
     return;
   }
   id<MTLBuffer> buf = get_buffer(h);
-  if (!buf || !directBuffer)
+  if (!buf || copyLength > (size_t)buf.length)
     return;
-  void *ptr = env->GetDirectBufferAddress(directBuffer);
-  if (ptr && length > 0 && (size_t)(offset + length) <= [buf length]) {
-    memcpy((uint8_t *)[buf contents], (uint8_t *)ptr + offset, (size_t)length);
-  }
+  memcpy((uint8_t *)[buf contents], (uint8_t *)ptr + sourceOffset, copyLength);
 }
 extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDestroyBuffer(
     JNIEnv *, jclass, jlong bufferHandle) {
   uint64_t h = (uint64_t)bufferHandle;
   std::lock_guard<std::mutex> lock(g_deferredMutex);
-  g_deferredDeletions.push_back({h, g_frameCount, isMegaHandle(h)});
+  uint64_t retireAfter =
+      g_submittedFrameSerial.load(std::memory_order_acquire) +
+      kDeferredSubmissionDelay;
+  g_deferredDeletions.push_back({h, retireAfter, isMegaHandle(h)});
 }
 static id<MTLRenderPipelineState> g_currentPipeline = nil;
 static float g_chunkOffsetX = 0, g_chunkOffsetY = 0, g_chunkOffsetZ = 0;
@@ -2137,8 +2679,6 @@ static float g_projMatrix[16] = {};
 static float g_mvMatrix[16] = {};
 static float g_mvpMatrix[16] = {};
 static double g_camX = 0, g_camY = 0, g_camZ = 0;
-id<MTLRenderCommandEncoder> g_currentEncoder = nil;
-static id<MTLCommandBuffer> g_currentCmdBuffer = nil;
 extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSetPipelineState(
     JNIEnv *, jclass, jlong frameContext, jlong pipelineHandle) {
@@ -2402,9 +2942,11 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawIndexedBatch(
     static const int MIN_BUDGET = 16384;
     static const int MAX_BUDGET = 65536;
     float gpuMs = g_lastGpuMs.load(std::memory_order_relaxed);
-    if (gpuMs > 14.0f && g_drawBudget > MIN_BUDGET) {
+    float gpuHighWatermark = g_targetFrameTimeMs * 0.90f;
+    float gpuLowWatermark = g_targetFrameTimeMs * 0.75f;
+    if (gpuMs > gpuHighWatermark && g_drawBudget > MIN_BUDGET) {
       g_drawBudget = MAX(MIN_BUDGET, (int)(g_drawBudget * 0.92f));
-    } else if (gpuMs < 12.0f && g_drawBudget < MAX_BUDGET) {
+    } else if (gpuMs < gpuLowWatermark && g_drawBudget < MAX_BUDGET) {
       g_drawBudget = MIN(MAX_BUDGET, (int)(g_drawBudget * 1.12f) + 2);
     }
     int preCapCount = validCount;
@@ -2442,15 +2984,18 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawIndexedBatch(
       icbCandidateCount++;
     }
     bool canICB =
-        (g_icbCapable && icbCandidateCount > 0 && g_pipelineInhouseICB &&
-         g_fragArgBuf && g_fragArgEncoder && g_blockAtlas && g_lightmap);
+        (g_gpuDrivenEnabled && g_icbCapable && icbCandidateCount > 0 &&
+         g_pipelineInhouseICB && g_fragArgBuf[g_renderSlot] &&
+         g_fragArgEncoder && g_blockAtlas && g_lightmap);
     if (canICB) {
       [g_currentEncoder setRenderPipelineState:g_pipelineInhouseICB];
       g_currentPipeline = g_pipelineInhouseICB;
-      [g_fragArgEncoder setArgumentBuffer:g_fragArgBuf offset:0];
+      [g_fragArgEncoder setArgumentBuffer:g_fragArgBuf[g_renderSlot] offset:0];
       [g_fragArgEncoder setTexture:g_blockAtlas atIndex:0];
       [g_fragArgEncoder setTexture:g_lightmap atIndex:1];
-      [g_currentEncoder setFragmentBuffer:g_fragArgBuf offset:0 atIndex:0];
+      [g_currentEncoder setFragmentBuffer:g_fragArgBuf[g_renderSlot]
+                                   offset:0
+                                  atIndex:0];
       [g_currentEncoder useResource:g_blockAtlas
                               usage:MTLResourceUsageRead
                              stages:MTLRenderStageFragment];
@@ -2737,86 +3282,6 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUnregisterChunkMes
     }
   }
   g_activeMeshCount--;
-}
-
-extern "C" JNIEXPORT jint JNICALL
-Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nBatchPackFaces(
-    JNIEnv *env, jclass, jlong outAddr, jint outOffset, jobject faceDataBuf,
-    jint faceCount) {
-  if (faceCount <= 0 || !outAddr)
-    return 0;
-  uint8_t *out = (uint8_t *)(uintptr_t)outAddr + outOffset;
-  const uint8_t *faceData =
-      (const uint8_t *)env->GetDirectBufferAddress(faceDataBuf);
-  if (!faceData)
-    return 0;
-
-  static const uint8_t FACE_VERTS[6][12] = {
-      {0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1},
-      {0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0},
-      {1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0},
-      {0, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1},
-      {0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1},
-      {1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0},
-  };
-
-  static const uint8_t UV_PAT[4][2] = {{0, 0}, {0, 1}, {1, 1}, {1, 0}};
-
-  for (int f = 0; f < faceCount; f++) {
-    const uint8_t *fd = faceData + f * 20;
-    int16_t bx = *(const int16_t *)(fd + 0);
-    int16_t by = *(const int16_t *)(fd + 2);
-    int16_t bz = *(const int16_t *)(fd + 4);
-    uint8_t nIdx = fd[6];
-    int16_t uMin = *(const int16_t *)(fd + 7);
-    int16_t uMax = *(const int16_t *)(fd + 9);
-    int16_t vMin = *(const int16_t *)(fd + 11);
-    int16_t vMax = *(const int16_t *)(fd + 13);
-    uint8_t r = fd[15], g = fd[16], b = fd[17], a = fd[18];
-    uint8_t light = fd[19];
-
-    int16_t sx = bx * 256, sy = by * 256, sz = bz * 256;
-    int16_t ex = (bx + 1) * 256;
-    int16_t ey = (by + 1) * 256;
-    int16_t ez = (bz + 1) * 256;
-
-    const uint8_t *pat = FACE_VERTS[nIdx < 6 ? nIdx : 0];
-    int16_t xs[2] = {sx, ex}, ys[2] = {sy, ey}, zs[2] = {sz, ez};
-    int16_t us[2] = {uMin, uMax}, vs[2] = {vMin, vMax};
-
-    for (int v = 0; v < 4; v++) {
-      uint8_t *dst = out + (f * 4 + v) * 16;
-      int16_t px = xs[pat[v * 3 + 0]];
-      int16_t py = ys[pat[v * 3 + 1]];
-      int16_t pz = zs[pat[v * 3 + 2]];
-      int16_t uu = us[UV_PAT[v][0]];
-      int16_t vv = vs[UV_PAT[v][1]];
-#ifdef __aarch64__
-
-      uint64_t w0 = (uint16_t)px | ((uint64_t)(uint16_t)py << 16) |
-                    ((uint64_t)(uint16_t)pz << 32) |
-                    ((uint64_t)(uint16_t)uu << 48);
-      uint64_t w1 = (uint16_t)vv | ((uint64_t)r << 16) | ((uint64_t)g << 24) |
-                    ((uint64_t)b << 32) | ((uint64_t)a << 40) |
-                    ((uint64_t)light << 48) | ((uint64_t)nIdx << 56);
-      *(uint64_t *)(dst + 0) = w0;
-      *(uint64_t *)(dst + 8) = w1;
-#else
-      *(int16_t *)(dst + 0) = px;
-      *(int16_t *)(dst + 2) = py;
-      *(int16_t *)(dst + 4) = pz;
-      *(int16_t *)(dst + 6) = uu;
-      *(int16_t *)(dst + 8) = vv;
-      dst[10] = r;
-      dst[11] = g;
-      dst[12] = b;
-      dst[13] = a;
-      dst[14] = light;
-      dst[15] = nIdx;
-#endif
-    }
-  }
-  return faceCount * 4;
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -3510,28 +3975,35 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawAllVisibleChun
           visibleFacingMaskForAabb(s_cmds[i].ox, s_cmds[i].oy, s_cmds[i].oz));
     }
     bool canICB =
-        (g_icbCapable && icbCandidateCount > 0 && g_pipelineInhouseICB &&
-         g_fragArgBuf && g_fragArgEncoder && g_blockAtlas && g_lightmap);
+        (g_gpuDrivenEnabled && g_icbCapable && icbCandidateCount > 0 &&
+         g_pipelineInhouseICB && g_fragArgBuf[g_renderSlot] &&
+         g_fragArgEncoder && g_blockAtlas && g_lightmap);
     bool useOpaqueICB = canICB && g_pipelineInhouseICBOpaque &&
-                        g_fragArgBufOpaque && g_fragArgEncoderOpaque;
+                        g_fragArgBufOpaque[g_renderSlot] &&
+                        g_fragArgEncoderOpaque;
     bool useOpaque = g_pipelineInhouseOpaque != nil;
     if (canICB) {
       if (useOpaqueICB) {
         [g_currentEncoder setRenderPipelineState:g_pipelineInhouseICBOpaque];
         g_currentPipeline = g_pipelineInhouseICBOpaque;
-        [g_fragArgEncoderOpaque setArgumentBuffer:g_fragArgBufOpaque offset:0];
+        [g_fragArgEncoderOpaque
+            setArgumentBuffer:g_fragArgBufOpaque[g_renderSlot]
+                       offset:0];
         [g_fragArgEncoderOpaque setTexture:g_blockAtlas atIndex:0];
         [g_fragArgEncoderOpaque setTexture:g_lightmap atIndex:1];
-        [g_currentEncoder setFragmentBuffer:g_fragArgBufOpaque
+        [g_currentEncoder setFragmentBuffer:g_fragArgBufOpaque[g_renderSlot]
                                      offset:0
                                     atIndex:0];
       } else {
         [g_currentEncoder setRenderPipelineState:g_pipelineInhouseICB];
         g_currentPipeline = g_pipelineInhouseICB;
-        [g_fragArgEncoder setArgumentBuffer:g_fragArgBuf offset:0];
+        [g_fragArgEncoder setArgumentBuffer:g_fragArgBuf[g_renderSlot]
+                                     offset:0];
         [g_fragArgEncoder setTexture:g_blockAtlas atIndex:0];
         [g_fragArgEncoder setTexture:g_lightmap atIndex:1];
-        [g_currentEncoder setFragmentBuffer:g_fragArgBuf offset:0 atIndex:0];
+        [g_currentEncoder setFragmentBuffer:g_fragArgBuf[g_renderSlot]
+                                     offset:0
+                                    atIndex:0];
       }
       [g_currentEncoder useResource:g_blockAtlas
                               usage:MTLResourceUsageRead
@@ -3857,117 +4329,79 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetCurrentFrameCon
     return 0;
   if (g_gpuNeedsRecovery.load(std::memory_order_acquire)) {
     g_gpuNeedsRecovery.store(false, std::memory_order_release);
-    dbg("GPU_RECOVERY: Recreating command queue after GPU error\n");
-    for (int i = 0; i < kTripleBufferCount; i++) {
-      if (g_tbCmdBuf[i]) {
-        [g_tbCmdBuf[i] release];
-        g_tbCmdBuf[i] = nil;
-      }
-      g_tbSlotReady[i].store(true, std::memory_order_release);
-    }
-    g_tbLastCompleted.store(0, std::memory_order_release);
-    g_currentFrameReady = true;
+    dbg("GPU_RECOVERY: draining resources before recreating command queue\n");
     if (g_currentEncoder) {
       [g_currentEncoder endEncoding];
       [g_currentEncoder release];
       g_currentEncoder = nil;
     }
-    if (g_currentCmdBuffer && g_hizDownsamplePipeline && g_hizPyramid &&
-        !g_useMemorylessTargets) {
-      id<MTLComputeCommandEncoder> hizEnc =
-          [g_currentCmdBuffer computeCommandEncoder];
-      if (hizEnc) {
-        [hizEnc setComputePipelineState:g_hizDownsamplePipeline];
-        id<MTLTexture> srcDepth = g_depth;
-        if (srcDepth) {
-          [hizEnc setTexture:srcDepth atIndex:0];
-          [hizEnc setTexture:g_hizPyramid atIndex:1];
-          hizUpdateThreadgroupSize(srcDepth);
-          [hizEnc dispatchThreadgroups:g_hizGroups
-                 threadsPerThreadgroup:g_hizThreads];
-        }
-        [hizEnc endEncoding];
-      }
-    }
     if (g_currentCmdBuffer) {
+      [g_currentCmdBuffer commit];
+      [g_currentCmdBuffer waitUntilCompleted];
       [g_currentCmdBuffer release];
       g_currentCmdBuffer = nil;
     }
+    drain_surface_slots(true);
     [g_queue release];
     g_queue = [g_device newCommandQueue];
-    if (g_frameSemaphore) {
-
-      for (int _si = 0; _si < kTripleBufferCount; _si++)
-        dispatch_semaphore_signal(g_frameSemaphore);
-      dispatch_release(g_frameSemaphore);
-      g_frameSemaphore = dispatch_semaphore_create(kTripleBufferCount - 1);
-    }
+    g_queue.label = @"MetalRender Metal 3 compatibility queue";
   }
   if (g_currentEncoder)
     return (jlong)0x1;
   @autoreleasepool {
-    bool reuseFrame = g_reuseTerrainFrame;
+    bool reuseFrame = false;
+    if (g_reuseTerrainFrame) {
+      static bool loggedUnsafeReuse = false;
+      if (!loggedUnsafeReuse) {
+        dbg("Terrain frame reuse disabled: an IOSurface bound to OpenGL must "
+            "not be modified by Metal\n");
+        loggedUnsafeReuse = true;
+      }
+    }
     g_reuseTerrainFrame = false;
-    g_wasReuseFrame = reuseFrame;
-    if (reuseFrame) {
+    g_wasReuseFrame = false;
 
-      int prevSlot = (g_currentBufferIndex + 2) % 3;
-
-      if (!g_tbSlotReady[prevSlot].load(std::memory_order_acquire)) {
-
-        int slot1 = (g_currentBufferIndex + 1) % 3;
-        int slot0 = g_currentBufferIndex;
-        if (g_tbSlotReady[slot1].load(std::memory_order_acquire)) {
-          g_renderSlot = slot1;
-          g_color = g_tbColor[g_renderSlot];
-          g_depth = g_tbDepth[g_renderSlot];
-          g_ioSurface = g_tbIOSurface[g_renderSlot];
-        } else if (g_tbSlotReady[slot0].load(std::memory_order_acquire)) {
-          g_renderSlot = slot0;
-          g_color = g_tbColor[g_renderSlot];
-          g_depth = g_tbDepth[g_renderSlot];
-          g_ioSurface = g_tbIOSurface[g_renderSlot];
-        } else {
-
-          reuseFrame = false;
-          g_wasReuseFrame = false;
-        }
-      } else {
-        g_renderSlot = prevSlot;
-        g_color = g_tbColor[g_renderSlot];
-        g_depth = g_tbDepth[g_renderSlot];
-        g_ioSurface = g_tbIOSurface[g_renderSlot];
+    bool semaphoreAcquired = false;
+    if (g_frameSemaphore &&
+        !g_shuttingDown.load(std::memory_order_acquire)) {
+      int waitMs = std::max(8, (int)ceilf(g_targetFrameTimeMs * 2.0f));
+      dispatch_time_t timeout =
+          dispatch_time(DISPATCH_TIME_NOW, (int64_t)waitMs * NSEC_PER_MSEC);
+      if (dispatch_semaphore_wait(g_frameSemaphore, timeout) != 0) {
+        static int timeoutCount = 0;
+        if (++timeoutCount <= 10 || timeoutCount % 100 == 0)
+          dbg("Frame skipped: in-flight GPU limit timed out (%d)\n",
+              timeoutCount);
+        return 0;
       }
+      semaphoreAcquired = true;
     }
-    if (!reuseFrame) {
 
-      if (g_frameSemaphore && !g_shuttingDown) {
-        dispatch_time_t timeout =
-            dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC);
-        long result = dispatch_semaphore_wait(g_frameSemaphore, timeout);
-        if (result != 0) {
-
-          static int timeoutCount = 0;
-          timeoutCount++;
-          if (timeoutCount <= 10 || timeoutCount % 100 == 0) {
-            fprintf(stderr,
-                    "[GPU STALL] Semaphore timeout #%d — forcing recovery\n",
-                    timeoutCount);
-          }
-
-          for (int i = 0; i < kTripleBufferCount; i++) {
-            g_tbSlotReady[i].store(true, std::memory_order_release);
-          }
-        }
-      }
-      g_renderSlot = g_currentBufferIndex;
-      g_color = g_tbColor[g_renderSlot];
-      g_depth = g_tbDepth[g_renderSlot];
-      g_ioSurface = g_tbIOSurface[g_renderSlot];
-      g_tbSlotReady[g_renderSlot].store(false, std::memory_order_release);
+    int acquiredSlot = acquire_surface_slot(g_currentBufferIndex);
+    if (acquiredSlot < 0) {
+      if (semaphoreAcquired && g_frameSemaphore)
+        dispatch_semaphore_signal(g_frameSemaphore);
+      static int noSlotCount = 0;
+      if (++noSlotCount <= 10 || noSlotCount % 100 == 0)
+        dbg("Frame skipped: no IOSurface slot is safe for Metal (%d)\n",
+            noSlotCount);
+      return 0;
     }
-    g_currentFrameReady = false;
+    g_renderSlot = acquiredSlot;
+    g_color = g_tbColor[g_renderSlot];
+    g_depth = g_tbDepth[g_renderSlot];
+    g_ioSurface = g_tbIOSurface[g_renderSlot];
+    g_currentFrameReady.store(false, std::memory_order_release);
     g_currentCmdBuffer = [[g_queue commandBuffer] retain];
+    if (!g_currentCmdBuffer) {
+      g_tbSlotState[g_renderSlot].store(SurfaceSlotAvailable,
+                                        std::memory_order_release);
+      g_tbSlotReady[g_renderSlot].store(true, std::memory_order_release);
+      g_surfaceSlotChanged.notify_all();
+      if (semaphoreAcquired && g_frameSemaphore)
+        dispatch_semaphore_signal(g_frameSemaphore);
+      return 0;
+    }
     static MTLRenderPassDescriptor *s_cachedRP = nil;
     if (!s_cachedRP) {
       s_cachedRP = [[MTLRenderPassDescriptor renderPassDescriptor] retain];
@@ -3975,9 +4409,8 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetCurrentFrameCon
       s_cachedRP.colorAttachments[0].clearColor =
           MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
 
-      s_cachedRP.depthAttachment.storeAction =
-          g_useMemorylessTargets ? MTLStoreActionDontCare : MTLStoreActionStore;
-      s_cachedRP.depthAttachment.clearDepth = 1.0;
+      s_cachedRP.depthAttachment.storeAction = MTLStoreActionStore;
+      s_cachedRP.depthAttachment.clearDepth = 0.0;
     }
 #ifdef METALRENDER_HAS_METALFX
 
@@ -3985,12 +4418,15 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetCurrentFrameCon
     id<MTLTexture> depthTarget = g_depth;
     bool usingLR = false;
     if (@available(macOS 13.0, *)) {
-      if (g_mfxScaler && g_lrColor[g_renderSlot] && !reuseFrame) {
+      if (g_mfxScaler && g_lrColor[g_renderSlot]) {
         renderTarget = g_lrColor[g_renderSlot];
         depthTarget = g_lrDepth[g_renderSlot];
         usingLR = true;
       }
     }
+    g_frameColorTarget = renderTarget;
+    g_frameDepthTarget = depthTarget;
+    g_wasLowResolutionFrame = usingLR;
     s_cachedRP.colorAttachments[0].texture = renderTarget;
     s_cachedRP.colorAttachments[0].loadAction =
         (reuseFrame && !usingLR) ? MTLLoadActionLoad : MTLLoadActionClear;
@@ -3998,6 +4434,9 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetCurrentFrameCon
     s_cachedRP.depthAttachment.loadAction =
         (reuseFrame && !usingLR) ? MTLLoadActionLoad : MTLLoadActionClear;
 #else
+    g_frameColorTarget = g_color;
+    g_frameDepthTarget = g_depth;
+    g_wasLowResolutionFrame = false;
     s_cachedRP.colorAttachments[0].texture = g_color;
     s_cachedRP.colorAttachments[0].loadAction =
         reuseFrame ? MTLLoadActionLoad : MTLLoadActionClear;
@@ -4050,13 +4489,14 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
   @autoreleasepool {
     (void)handle;
     uint64_t _prof_ef_t0 = mach_absolute_time();
-    g_frameCount++;
+    g_frameCount.fetch_add(1, std::memory_order_acq_rel);
     static uint64_t ft_last = 0;
     static uint64_t ft_acc = 0;
     static int ft_count = 0;
     uint64_t ft_now = mach_absolute_time();
-    if (ft_last > 0) {
-      ft_acc += (ft_now - ft_last);
+    uint64_t ft_previous = ft_last;
+    if (ft_previous > 0) {
+      ft_acc += (ft_now - ft_previous);
       ft_count++;
     }
     ft_last = ft_now;
@@ -4074,9 +4514,10 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
 
     {
       ensureTimebase();
-      if (ft_last > 0 && ft_now > ft_last) {
-        float frameMs = (float)((ft_now - ft_last) * g_cachedTimebase.numer /
-                                g_cachedTimebase.denom) /
+      if (ft_previous > 0 && ft_now > ft_previous) {
+        float frameMs =
+            (float)((ft_now - ft_previous) * g_cachedTimebase.numer /
+                    g_cachedTimebase.denom) /
                         1000000.0f;
         g_avgFrameTimeMs = g_avgFrameTimeMs * 0.95f + frameMs * 0.05f;
       }
@@ -4085,7 +4526,8 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
       dbg("EndFrame #%d: draws=%d skips=%d encoder=%p pipeline=%p "
           "pipelineInhouse=%p texture=%dx%d proj[0]=%.3f mv[0]=%.3f "
           "cam=%.1f,%.1f,%.1f gpuDriven=%d meshShaders=%d\n",
-          g_frameCount, g_drawCallCount, g_drawSkipCount, g_currentEncoder,
+          g_frameCount.load(std::memory_order_relaxed), g_drawCallCount,
+          g_drawSkipCount, g_currentEncoder,
           g_currentPipeline, g_pipelineInhouse,
           g_color ? (int)g_color.width : 0, g_color ? (int)g_color.height : 0,
           g_projMatrix[0], g_mvMatrix[0], g_camX, g_camY, g_camZ,
@@ -4095,7 +4537,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
     if (g_frameCount % 300 == 0) {
       NSLog(@"[MetalRender] Frame %d — ActivePath: %@  ICB=%@  MeshShaders=%@  "
             @"OIT=%@  ArgBuf=%@  draws=%d",
-            g_frameCount,
+            g_frameCount.load(std::memory_order_relaxed),
             g_meshShadersActive
                 ? @"MESH_SHADER"
                 : (g_gpuDrivenEnabled ? @"ICB_GPU_DRIVEN" : @"INHOUSE_VERTEX"),
@@ -4111,13 +4553,37 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
       [g_currentEncoder release];
       g_currentEncoder = nil;
     }
-    if (g_currentCmdBuffer && g_hizDownsamplePipeline && g_hizPyramid &&
+    // Keep diagnostic/screenshot depth readback asynchronous with the frame.
+    // A per-slot staging buffer avoids cross-frame writes. Dynamic-resolution
+    // depth is not upscaled, so fail closed for that mode in nReadbackDepth.
+    if (g_currentCmdBuffer && !g_wasLowResolutionFrame &&
+        g_frameDepthTarget && g_tbDepthReadBuffer[g_renderSlot]) {
+      id<MTLBlitCommandEncoder> depthBlit =
+          [g_currentCmdBuffer blitCommandEncoder];
+      if (depthBlit) {
+        [depthBlit
+            copyFromTexture:g_frameDepthTarget
+                sourceSlice:0
+                sourceLevel:0
+               sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceSize:MTLSizeMake((NSUInteger)g_depthReadWidth,
+                                        (NSUInteger)g_depthReadHeight, 1)
+                   toBuffer:g_tbDepthReadBuffer[g_renderSlot]
+          destinationOffset:0
+     destinationBytesPerRow:g_depthReadBytesPerRow
+   destinationBytesPerImage:g_depthReadBytesPerRow *
+                            (NSUInteger)g_depthReadHeight];
+        [depthBlit endEncoding];
+      }
+    }
+    if (kHiZPathValidated && g_currentCmdBuffer &&
+        g_hizDownsamplePipeline && g_hizPyramid &&
         !g_useMemorylessTargets) {
       id<MTLComputeCommandEncoder> hizEnc =
           [g_currentCmdBuffer computeCommandEncoder];
       if (hizEnc) {
         [hizEnc setComputePipelineState:g_hizDownsamplePipeline];
-        id<MTLTexture> srcDepth = g_depth;
+        id<MTLTexture> srcDepth = g_frameDepthTarget;
         if (srcDepth) {
           [hizEnc setTexture:srcDepth atIndex:0];
           [hizEnc setTexture:g_hizPyramid atIndex:1];
@@ -4131,11 +4597,31 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
 #ifdef METALRENDER_HAS_METALFX
 
     if (@available(macOS 13.0, *)) {
-      if (g_mfxScaler && !g_reuseTerrainFrame && g_lrColor[g_renderSlot] &&
+      if (g_mfxScaler && g_wasLowResolutionFrame &&
+          g_lrColor[g_renderSlot] &&
+          g_mfxOutput[g_renderSlot] &&
           g_currentCmdBuffer) {
         g_mfxScaler.colorTexture = g_lrColor[g_renderSlot];
-        g_mfxScaler.outputTexture = g_color;
+        g_mfxScaler.inputContentWidth = g_lrColor[g_renderSlot].width;
+        g_mfxScaler.inputContentHeight = g_lrColor[g_renderSlot].height;
+        g_mfxScaler.outputTexture = g_mfxOutput[g_renderSlot];
         [g_mfxScaler encodeToCommandBuffer:g_currentCmdBuffer];
+        id<MTLBlitCommandEncoder> upscaleCopy =
+            [g_currentCmdBuffer blitCommandEncoder];
+        if (upscaleCopy) {
+          [upscaleCopy
+              copyFromTexture:g_mfxOutput[g_renderSlot]
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(g_mfxOutput[g_renderSlot].width,
+                                          g_mfxOutput[g_renderSlot].height, 1)
+                    toTexture:g_color
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+          [upscaleCopy endEncoding];
+        }
       }
     }
 #endif
@@ -4145,12 +4631,6 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
         [g_currentCmdBuffer encodeSignalEvent:g_frameEvent
                                         value:g_eventCounter];
       }
-      if (g_depthCmdBuffer) {
-        [g_depthCmdBuffer release];
-        g_depthCmdBuffer = nil;
-      }
-      g_depthCmdBuffer = [g_currentCmdBuffer retain];
-
       int completedSlot = g_renderSlot;
 
       bool wasReuseForThisFrame = g_wasReuseFrame;
@@ -4159,26 +4639,57 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
       }
       g_tbCmdBuf[completedSlot] = [g_currentCmdBuffer retain];
       {
-        static uint64_t gpu_acc = 0;
-        static int gpu_frame_count = 0;
-
         dispatch_semaphore_t capSema = g_frameSemaphore;
         if (capSema)
           dispatch_retain(capSema);
+        uint64_t submissionSerial =
+            g_submittedFrameSerial.fetch_add(1,
+                                              std::memory_order_acq_rel) +
+            1;
         [g_currentCmdBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-          if (cb.GPUEndTime > cb.GPUStartTime) {
-            g_lastGpuFrameMs = (float)((cb.GPUEndTime - cb.GPUStartTime) * 1e3);
-          }
-          if (cb.status == MTLCommandBufferStatusError) {
+          mark_frame_submission_completed(submissionSerial);
+          bool commandSucceeded =
+              cb.status == MTLCommandBufferStatusCompleted;
+          if (!commandSucceeded) {
             NSError *err = cb.error;
-            dbg("GPU_ERROR: slot=%d err=%s code=%ld\n", completedSlot,
+            dbg("GPU_ERROR: slot=%d status=%ld err=%s code=%ld\n",
+                completedSlot, (long)cb.status,
                 err ? [[err localizedDescription] UTF8String] : "unknown",
                 (long)(err ? err.code : -1));
             g_gpuNeedsRecovery.store(true, std::memory_order_release);
           }
-          g_tbSlotReady[completedSlot].store(true, std::memory_order_release);
-          g_tbLastCompleted.store(completedSlot, std::memory_order_release);
-          g_currentFrameReady = true;
+          {
+            std::lock_guard<std::mutex> lock(g_surfaceSlotMutex);
+            if (commandSucceeded) {
+              g_tbSlotState[completedSlot].store(
+                  SurfaceSlotReadyForPresentation, std::memory_order_release);
+              g_tbSlotReady[completedSlot].store(true,
+                                                 std::memory_order_release);
+              g_tbLastCompleted.store(completedSlot,
+                                      std::memory_order_release);
+              g_currentFrameReady.store(true, std::memory_order_release);
+            } else {
+              // Never publish a partial or undefined IOSurface. Invalidate any
+              // unpresented older frame too, so Java cannot mistake a stale
+              // surface for successful completion of this frame.
+              for (int slot = 0; slot < kTripleBufferCount; slot++) {
+                if (g_tbSlotState[slot].load(std::memory_order_acquire) ==
+                    SurfaceSlotReadyForPresentation) {
+                  g_tbSlotState[slot].store(SurfaceSlotAvailable,
+                                            std::memory_order_release);
+                  g_tbSlotReady[slot].store(true,
+                                            std::memory_order_release);
+                }
+              }
+              g_tbSlotState[completedSlot].store(
+                  SurfaceSlotAvailable, std::memory_order_release);
+              g_tbSlotReady[completedSlot].store(true,
+                                                 std::memory_order_release);
+              g_tbLastCompleted.store(-1, std::memory_order_release);
+              g_currentFrameReady.store(false, std::memory_order_release);
+            }
+          }
+          g_surfaceSlotChanged.notify_all();
           if (capSema && !wasReuseForThisFrame) {
             dispatch_semaphore_signal(capSema);
           }
@@ -4191,14 +4702,25 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
               double gpuMs = (gpuEnd - gpuStart) * 1000.0;
               g_lastGpuMs.store((float)gpuMs, std::memory_order_relaxed);
               uint64_t gpuUs = (uint64_t)(gpuMs * 1000.0);
-              gpu_acc += gpuUs;
-              gpu_frame_count++;
-              if (gpu_frame_count % 120 == 0) {
-                double avg = (double)gpu_acc / gpu_frame_count;
-                dbg("GPU_TIMING: avg=%.2fms (%.1f max-FPS) over %d frames\n",
-                    avg / 1000.0, 1000000.0 / avg, gpu_frame_count);
-                gpu_acc = 0;
-                gpu_frame_count = 0;
+              uint64_t reportAccumulatedUs = 0;
+              uint32_t reportCompletedFrames = 0;
+              {
+                std::lock_guard<std::mutex> lock(g_gpuTelemetryMutex);
+                g_gpuTelemetryAccumulatedUs += gpuUs;
+                g_gpuTelemetryCompletedFrames++;
+                if (g_gpuTelemetryCompletedFrames >= 120) {
+                  reportAccumulatedUs = g_gpuTelemetryAccumulatedUs;
+                  reportCompletedFrames = g_gpuTelemetryCompletedFrames;
+                  g_gpuTelemetryAccumulatedUs = 0;
+                  g_gpuTelemetryCompletedFrames = 0;
+                }
+              }
+              if (reportCompletedFrames > 0) {
+                double avg =
+                    (double)reportAccumulatedUs / reportCompletedFrames;
+                dbg("GPU_TIMING: avg=%.2fms (%.1f max-FPS) over %u frames\n",
+                    avg / 1000.0, 1000000.0 / avg,
+                    reportCompletedFrames);
               }
             }
           }
@@ -4207,7 +4729,10 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
       [g_currentCmdBuffer commit];
 
       if (!wasReuseForThisFrame) {
-        g_currentBufferIndex = (g_currentBufferIndex + 1) % kTripleBufferCount;
+        int slotCount = std::max(
+            2, std::min(kTripleBufferCount,
+                        g_activeSurfaceSlots.load(std::memory_order_acquire)));
+        g_currentBufferIndex = (g_currentBufferIndex + 1) % slotCount;
       }
       [g_currentCmdBuffer release];
       g_currentCmdBuffer = nil;
@@ -4237,13 +4762,16 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
       }
 
       if (g_thermalQualityLevel == 0 && g_avgFrameTimeMs > 0.0f) {
-        if (g_avgFrameTimeMs > 18.0f) {
+        float frameHighWatermark = g_targetFrameTimeMs * 1.08f;
+        float frameLowWatermark = g_targetFrameTimeMs * 0.84f;
+        if (g_avgFrameTimeMs > frameHighWatermark) {
 
           g_dynamicLODScale = fminf(g_dynamicLODScale * 1.02f, 1.6f);
           if (g_frameCount % 300 == 0)
-            dbg("ADAPTIVE_LOD: frame_time=%.1fms > 18ms, scale UP to %.2f\n",
-                g_avgFrameTimeMs, g_dynamicLODScale);
-        } else if (g_avgFrameTimeMs < 14.0f && g_dynamicLODScale > 1.0f) {
+            dbg("ADAPTIVE_LOD: frame=%.1fms target=%.1fms, scale UP to %.2f\n",
+                g_avgFrameTimeMs, g_targetFrameTimeMs, g_dynamicLODScale);
+        } else if (g_avgFrameTimeMs < frameLowWatermark &&
+                   g_dynamicLODScale > 1.0f) {
 
           g_dynamicLODScale = fmaxf(g_dynamicLODScale * 0.98f, 1.0f);
         }
@@ -4256,7 +4784,9 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
       size_t i = 0;
       while (i < g_deferredDeletions.size()) {
         auto &dd = g_deferredDeletions[i];
-        if (g_frameCount - dd.frameQueued >= DEFERRED_FRAME_DELAY) {
+        uint64_t completedSubmission =
+            g_completedFrameSerial.load(std::memory_order_acquire);
+        if (completedSubmission >= dd.retireAfterSubmission) {
           if (dd.isMega) {
             megaFree(dd.handle);
           } else {
@@ -4265,6 +4795,12 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
             if (bufIt != g_buffers.end()) {
               [bufIt->second release];
               g_buffers.erase(bufIt);
+              auto sizeIt = g_bufferSizes.find(dd.handle);
+              if (sizeIt != g_bufferSizes.end()) {
+                g_individualBufferBytes -=
+                    std::min(g_individualBufferBytes, sizeIt->second);
+                g_bufferSizes.erase(sizeIt);
+              }
             }
           }
 
@@ -4477,9 +5013,30 @@ extern "C" JNIEXPORT jlong JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCreateTexture2D(
     JNIEnv *env, jclass, jlong deviceHandle, jint width, jint height,
     jbyteArray pixelData) {
-  (void)deviceHandle;
-  if (!g_device || width <= 0 || height <= 0)
+  static constexpr size_t kMaxTextureDimension2D = 16384;
+  if (!env || !g_device || deviceHandle == 0 || !pixelData ||
+      width <= 0 || height <= 0 ||
+      (size_t)width > kMaxTextureDimension2D ||
+      (size_t)height > kMaxTextureDimension2D)
     return 0;
+  if ((uintptr_t)deviceHandle !=
+      (uintptr_t)(__bridge void *)g_device)
+    return 0;
+
+  const size_t textureWidth = (size_t)width;
+  const size_t textureHeight = (size_t)height;
+  if (textureWidth > std::numeric_limits<size_t>::max() / 4)
+    return 0;
+  const size_t bytesPerRow = textureWidth * 4;
+  if (textureHeight >
+      std::numeric_limits<size_t>::max() / bytesPerRow)
+    return 0;
+  const size_t requiredBytes = bytesPerRow * textureHeight;
+  if (requiredBytes >
+          (size_t)std::numeric_limits<jsize>::max() ||
+      (size_t)env->GetArrayLength(pixelData) < requiredBytes)
+    return 0;
+
   jbyte *data = env->GetByteArrayElements(pixelData, NULL);
   if (!data)
     return 0;
@@ -4529,7 +5086,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCreateTexture2D(
       [tex replaceRegion:region
              mipmapLevel:0
                withBytes:data
-             bytesPerRow:(NSUInteger)(width * 4)];
+             bytesPerRow:(NSUInteger)bytesPerRow];
       dbg("nCreateTexture2D: created %dx%d RGBA texture %p\n", width, height,
           tex);
     } else {
@@ -4537,7 +5094,9 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCreateTexture2D(
     }
   }
   env->ReleaseByteArrayElements(pixelData, data, JNI_ABORT);
-  return tex ? (jlong)(uintptr_t)(__bridge_retained void *)tex : 0;
+  // newTextureWithDescriptor already returns a +1 object under manual retain
+  // counting; the Java handle owns that reference until nDestroyTexture2D.
+  return tex ? (jlong)(uintptr_t)(__bridge void *)tex : 0;
 }
 extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDestroyTexture2D(
@@ -4559,34 +5118,83 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUpdateTexture2D(
     JNIEnv *env, jclass, jlong textureHandle, jint width, jint height,
     jbyteArray pixelData) {
-  if (!textureHandle || width <= 0 || height <= 0)
+  if (!textureHandle || !pixelData || width <= 0 || height <= 0)
     return;
+  ensure_device();
   id<MTLTexture> tex =
       (__bridge id<MTLTexture>)(void *)(uintptr_t)textureHandle;
-  if (!tex)
+  if (!tex || !g_device || !g_queue ||
+      tex.pixelFormat != MTLPixelFormatRGBA8Unorm ||
+      (NSUInteger)width > tex.width || (NSUInteger)height > tex.height)
     return;
-  jbyte *data = env->GetByteArrayElements(pixelData, NULL);
-  if (data) {
-    MTLRegion region =
-        MTLRegionMake2D(0, 0, (NSUInteger)width, (NSUInteger)height);
+  size_t tightBytesPerRow = (size_t)width * 4;
+  if (tightBytesPerRow / 4 != (size_t)width)
+    return;
+  size_t requiredBytes = tightBytesPerRow * (size_t)height;
+  if ((size_t)height != 0 &&
+      requiredBytes / (size_t)height != tightBytesPerRow)
+    return;
+  if ((size_t)env->GetArrayLength(pixelData) < requiredBytes)
+    return;
 
-    if (false && tex.pixelFormat == MTLPixelFormatASTC_4x4_LDR) {
-      size_t compSize = 0;
-      uint8_t *comp = compress_rgba_to_astc4x4((const uint8_t *)data, width,
-                                               height, &compSize);
-      [tex replaceRegion:region
-             mipmapLevel:0
-               withBytes:comp
-             bytesPerRow:(NSUInteger)((width / 4) * 16)];
-      delete[] comp;
-    } else {
-      [tex replaceRegion:region
-             mipmapLevel:0
-               withBytes:data
-             bytesPerRow:(NSUInteger)(width * 4)];
+  jbyte *data = env->GetByteArrayElements(pixelData, NULL);
+  if (!data)
+    return;
+
+  // CPU-side replaceRegion on a shared texture races older in-flight frames
+  // that still sample that texture. Stage the upload and commit a blit on the
+  // same queue instead: previous draw command buffers finish before the blit,
+  // and the next frame is committed after it.
+  size_t stagedBytesPerRow = (tightBytesPerRow + 255u) & ~255u;
+  size_t stagedLength = stagedBytesPerRow * (size_t)height;
+  id<MTLBuffer> staging =
+      [g_device newBufferWithLength:stagedLength
+                            options:(MTLResourceStorageModeShared |
+                                     MTLResourceCPUCacheModeWriteCombined)];
+  if (staging) {
+    uint8_t *destination = (uint8_t *)[staging contents];
+    const uint8_t *source = (const uint8_t *)data;
+    for (int row = 0; row < height; row++) {
+      memcpy(destination + (size_t)row * stagedBytesPerRow,
+             source + (size_t)row * tightBytesPerRow,
+             tightBytesPerRow);
     }
-    env->ReleaseByteArrayElements(pixelData, data, JNI_ABORT);
+
+    @autoreleasepool {
+      id<MTLCommandBuffer> uploadCommandBuffer = [g_queue commandBuffer];
+      id<MTLBlitCommandEncoder> blit =
+          uploadCommandBuffer ? [uploadCommandBuffer blitCommandEncoder] : nil;
+      if (blit) {
+        [blit copyFromBuffer:staging
+                sourceOffset:0
+           sourceBytesPerRow:stagedBytesPerRow
+         sourceBytesPerImage:stagedLength
+                  sourceSize:MTLSizeMake((NSUInteger)width,
+                                         (NSUInteger)height, 1)
+                   toTexture:tex
+            destinationSlice:0
+            destinationLevel:0
+           destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        [uploadCommandBuffer commit];
+        {
+          std::lock_guard<std::mutex> lock(g_textureUploadMutex);
+          if (g_lastTextureUploadCommandBuffer)
+            [g_lastTextureUploadCommandBuffer release];
+          g_lastTextureUploadCommandBuffer =
+              [uploadCommandBuffer retain];
+        }
+      } else {
+        dbg("WARN: Could not create staged texture upload encoder\n");
+      }
+    }
+    // Command buffers retain encoded resources by default.
+    [staging release];
+  } else {
+    dbg("WARN: Could not allocate %zu-byte staged texture upload\n",
+        stagedLength);
   }
+  env->ReleaseByteArrayElements(pixelData, data, JNI_ABORT);
 }
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetDeviceHandle(
@@ -4639,62 +5247,120 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nIsFrameReady(
   (void)handle;
 
   int last = g_tbLastCompleted.load(std::memory_order_acquire);
-  if (last >= 0 && g_tbSlotReady[last].load(std::memory_order_acquire))
+  if (last >= 0 &&
+      g_tbSlotState[last].load(std::memory_order_acquire) ==
+          SurfaceSlotReadyForPresentation)
     return JNI_TRUE;
-  return g_currentFrameReady ? JNI_TRUE : JNI_FALSE;
+  return JNI_FALSE;
 }
 extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nWaitForRender(
     JNIEnv *, jclass, jlong handle) {
   (void)handle;
   uint64_t _prof_wr_t0 = mach_absolute_time();
-  int last = g_tbLastCompleted.load(std::memory_order_acquire);
-  if (last >= 0 && g_tbSlotReady[last].load(std::memory_order_acquire)) {
-    g_prof_waitRender_acc += (mach_absolute_time() - _prof_wr_t0);
-    return;
-  }
-  static int waitDbgCount = 0;
-  waitDbgCount++;
-  if (waitDbgCount <= 5 || waitDbgCount % 500 == 0) {
-    dbg("WAIT_DBG: fast-path MISS last=%d ready=[%d,%d,%d] frameReady=%d\n",
-        last, g_tbSlotReady[0].load(std::memory_order_relaxed) ? 1 : 0,
-        g_tbSlotReady[1].load(std::memory_order_relaxed) ? 1 : 0,
-        g_tbSlotReady[2].load(std::memory_order_relaxed) ? 1 : 0,
-        g_currentFrameReady ? 1 : 0);
-  }
-  if (!g_currentFrameReady) {
-    int spins = 0;
-    while (!g_currentFrameReady && spins < 10000) {
-      std::this_thread::yield();
-      spins++;
-    }
-    if (!g_currentFrameReady && g_depthCmdBuffer) {
-      [g_depthCmdBuffer waitUntilCompleted];
-    }
+  std::unique_lock<std::mutex> lock(g_surfaceSlotMutex);
+  auto frameReady = [] {
+    int last = g_tbLastCompleted.load(std::memory_order_acquire);
+    return g_shuttingDown.load(std::memory_order_acquire) ||
+           (last >= 0 &&
+            g_tbSlotState[last].load(std::memory_order_acquire) ==
+                SurfaceSlotReadyForPresentation);
+  };
+  if (!frameReady()) {
+    int waitMs = std::max(8, (int)ceilf(g_targetFrameTimeMs * 4.0f));
+    g_surfaceSlotChanged.wait_for(lock, std::chrono::milliseconds(waitMs),
+                                 frameReady);
   }
   g_prof_waitRender_acc += (mach_absolute_time() - _prof_wr_t0);
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nRecycleUnpresentedFrames(
+    JNIEnv *, jclass, jlong handle) {
+  (void)handle;
+  bool recycled = false;
+  {
+    std::lock_guard<std::mutex> lock(g_surfaceSlotMutex);
+    for (int slot = 0; slot < kTripleBufferCount; slot++) {
+      if (g_tbSlotState[slot].load(std::memory_order_acquire) ==
+          SurfaceSlotReadyForPresentation) {
+        g_tbSlotState[slot].store(SurfaceSlotAvailable,
+                                  std::memory_order_release);
+        recycled = true;
+      }
+    }
+    if (recycled) {
+      g_tbLastCompleted.store(-1, std::memory_order_release);
+      g_currentFrameReady.store(false, std::memory_order_release);
+    }
+  }
+  if (recycled)
+    g_surfaceSlotChanged.notify_all();
 }
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nBindIOSurfaceToTexture(
     JNIEnv *, jclass, jlong handle, jint glTexture) {
   (void)handle;
   uint64_t _prof_cgl_t0 = mach_absolute_time();
+  CGLContextObj cglCtx = CGLGetCurrentContext();
+  if (!cglCtx || glTexture == 0 || g_rtWidth <= 0 || g_rtHeight <= 0)
+    return JNI_FALSE;
+
+  // CGL has no cross-API fence that Metal can wait on here. Finish the previous
+  // GL use before detaching its IOSurface; this is the conservative ownership
+  // hand-off and prevents Metal from overwriting a surface still being sampled.
+  glFinish();
+
+  std::lock_guard<std::mutex> lock(g_surfaceSlotMutex);
+  int previousBound = g_glBoundSlot.exchange(-1, std::memory_order_acq_rel);
+  if (previousBound >= 0) {
+    g_tbSlotState[previousBound].store(SurfaceSlotAvailable,
+                                       std::memory_order_release);
+  }
 
   int blitSlot = g_tbLastCompleted.load(std::memory_order_acquire);
-  IOSurfaceRef blitSurface =
-      (blitSlot >= 0) ? g_tbIOSurface[blitSlot] : g_ioSurface;
-  if (!blitSurface || glTexture == 0 || g_rtWidth <= 0 || g_rtHeight <= 0)
+  if (blitSlot < 0 ||
+      g_tbSlotState[blitSlot].load(std::memory_order_acquire) !=
+          SurfaceSlotReadyForPresentation) {
+    for (int i = 0; i < kTripleBufferCount; i++) {
+      if (g_tbSlotState[i].load(std::memory_order_acquire) ==
+          SurfaceSlotReadyForPresentation) {
+        blitSlot = i;
+        break;
+      }
+    }
+  }
+  if (blitSlot < 0 ||
+      g_tbSlotState[blitSlot].load(std::memory_order_acquire) !=
+          SurfaceSlotReadyForPresentation ||
+      !g_tbIOSurface[blitSlot]) {
+    g_surfaceSlotChanged.notify_all();
     return JNI_FALSE;
-  CGLContextObj cglCtx = CGLGetCurrentContext();
-  if (!cglCtx)
-    return JNI_FALSE;
-  int w = std::max(1, (int)(g_rtWidth * g_scale));
-  int h = std::max(1, (int)(g_rtHeight * g_scale));
+  }
+
+  IOSurfaceRef blitSurface = g_tbIOSurface[blitSlot];
+  int w = std::max(1, g_rtWidth);
+  int h = std::max(1, g_rtHeight);
   glBindTexture(GL_TEXTURE_RECTANGLE_ARB, (GLuint)glTexture);
   CGLError err = CGLTexImageIOSurface2D(
       cglCtx, GL_TEXTURE_RECTANGLE_ARB, GL_RGBA, (GLsizei)w, (GLsizei)h,
       GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, blitSurface, 0);
   glBindTexture(GL_TEXTURE_RECTANGLE_ARB, 0);
+  if (err == kCGLNoError) {
+    g_tbSlotState[blitSlot].store(SurfaceSlotBoundToGL,
+                                  std::memory_order_release);
+    g_glBoundSlot.store(blitSlot, std::memory_order_release);
+    // Completed frames older than the one selected above will never be
+    // presented. Recycle them now rather than exhausting the ring.
+    for (int i = 0; i < kTripleBufferCount; i++) {
+      if (i != blitSlot &&
+          g_tbSlotState[i].load(std::memory_order_acquire) ==
+              SurfaceSlotReadyForPresentation) {
+        g_tbSlotState[i].store(SurfaceSlotAvailable,
+                               std::memory_order_release);
+      }
+    }
+  }
+  g_surfaceSlotChanged.notify_all();
   g_prof_cglBind_acc += (mach_absolute_time() - _prof_cgl_t0);
   return (err == kCGLNoError) ? JNI_TRUE : JNI_FALSE;
 }
@@ -4722,24 +5388,31 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nReadbackDepth(
     JNIEnv *env, jclass, jlong handle, jobject dest) {
   (void)handle;
-  if (!g_depthReadBuffer || !dest || !env)
+  if (!dest || !env || g_wasLowResolutionFrame)
+    return JNI_FALSE;
+  int slot = g_tbLastCompleted.load(std::memory_order_acquire);
+  if (slot < 0 || !g_tbDepthReadBuffer[slot] ||
+      !g_tbSlotReady[slot].load(std::memory_order_acquire))
     return JNI_FALSE;
   void *destPtr = env->GetDirectBufferAddress(dest);
   if (!destPtr)
     return JNI_FALSE;
   jlong capacity = env->GetDirectBufferCapacity(dest);
-  NSUInteger bufLen = g_depthReadBuffer.length;
-  if (capacity < (jlong)bufLen)
+  NSUInteger tightRow = (NSUInteger)g_depthReadWidth * sizeof(float);
+  NSUInteger tightSize = tightRow * (NSUInteger)g_depthReadHeight;
+  if (capacity < (jlong)tightSize)
     return JNI_FALSE;
-
-  if (!g_currentFrameReady && g_depthCmdBuffer) {
-    [g_depthCmdBuffer waitUntilCompleted];
+  const uint8_t *source =
+      (const uint8_t *)g_tbDepthReadBuffer[slot].contents;
+  uint8_t *destination = (uint8_t *)destPtr;
+  if (g_depthReadBytesPerRow == tightRow) {
+    memcpy(destination, source, tightSize);
+  } else {
+    for (int row = 0; row < g_depthReadHeight; row++) {
+      memcpy(destination + (NSUInteger)row * tightRow,
+             source + (NSUInteger)row * g_depthReadBytesPerRow, tightRow);
+    }
   }
-  if (g_depthCmdBuffer) {
-    [g_depthCmdBuffer release];
-    g_depthCmdBuffer = nil;
-  }
-  memcpy(destPtr, g_depthReadBuffer.contents, bufLen);
   return JNI_TRUE;
 }
 extern "C" JNIEXPORT jlong JNICALL
@@ -4813,7 +5486,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nBindEntityTexture(
   g_entityTexture = (__bridge id<MTLTexture>)(void *)(uintptr_t)textureHandle;
   if (g_frameCount < 5) {
     dbg("nBindEntityTexture: set g_entityTexture=%p (handle=%lld)\n",
-        g_entityTexture, textureHandle);
+        g_entityTexture, (long long)textureHandle);
   }
 }
 extern "C" JNIEXPORT void JNICALL
@@ -4999,7 +5672,6 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSetGPUDrivenEnable
   dbg("GPU-driven rendering: %s (icbCapable=%d)\n",
       g_gpuDrivenEnabled ? "enabled" : "disabled", g_icbCapable ? 1 : 0);
 }
-static int g_cullMode = 0;
 extern "C" JNIEXPORT jint JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nRunGPUCulling(
     JNIEnv *, jclass, jlong handle, jint chunkCount) {
@@ -5018,72 +5690,10 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nRunGPUCulling(
     g_visibleIndicesBuffer =
         [g_device newBufferWithLength:neededSize options:MTLStorageModeShared];
   }
-  if (g_cullMode == 1 && g_queue && g_cullEncodePipeline &&
-      g_resetCullPipeline && g_subChunkBuffer && g_cullStatsBuffer) {
-    int bufIdx = g_currentBufferIndex % kTripleBufferCount;
-    id<MTLBuffer> cameraBuf = g_tripleBuffers[bufIdx];
-    if (!cameraBuf) {
-      g_cullMode = 0;
-      goto cpu_path;
-    }
-    CameraUniformsCPU *cam = (CameraUniformsCPU *)[cameraBuf contents];
-    cam->totalChunks = count;
-    cam->hizMipCount = 0;
-    id<MTLTexture> hizTex = g_hizPyramid;
-    if (!hizTex) {
-      if (!g_hizFallbackTexture) {
-        MTLTextureDescriptor *desc = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
-                                         width:1
-                                        height:1
-                                     mipmapped:NO];
-        desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModePrivate;
-        g_hizFallbackTexture = [g_device newTextureWithDescriptor:desc];
-      }
-      hizTex = g_hizFallbackTexture;
-    }
-    @autoreleasepool {
-      id<MTLCommandBuffer> cmdBuf = [g_queue commandBuffer];
-      if (!cmdBuf)
-        goto cpu_path;
-      id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
-      if (!encoder)
-        goto cpu_path;
-      [encoder setComputePipelineState:g_resetCullPipeline];
-      [encoder setBuffer:g_cullDrawCountBuffer offset:0 atIndex:0];
-      [encoder setBuffer:g_cullStatsBuffer offset:0 atIndex:1];
-      [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-      [encoder setComputePipelineState:g_cullEncodePipeline];
-      [encoder setBuffer:g_subChunkBuffer offset:0 atIndex:0];
-      [encoder setBuffer:g_visibleIndicesBuffer offset:0 atIndex:1];
-      [encoder setBuffer:g_cullDrawCountBuffer offset:0 atIndex:2];
-      [encoder setBuffer:g_cullStatsBuffer offset:0 atIndex:3];
-      [encoder setBuffer:cameraBuf offset:0 atIndex:4];
-      [encoder setTexture:hizTex atIndex:0];
-      NSUInteger threadCount = (NSUInteger)count;
-      if (g_cullMaxTG == 0)
-        g_cullMaxTG =
-            (NSUInteger)g_cullEncodePipeline.maxTotalThreadsPerThreadgroup;
-      NSUInteger tgSize =
-          std::min(threadCount, std::min(g_cullMaxTG, (NSUInteger)256));
-      [encoder dispatchThreads:MTLSizeMake(threadCount, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
-      [encoder endEncoding];
-      [cmdBuf commit];
-      [cmdBuf waitUntilCompleted];
-    }
-    uint32_t visibleCount = *(uint32_t *)[g_cullDrawCountBuffer contents];
-    if (g_frameCount < 5 || (g_frameCount % 300 == 0)) {
-      uint32_t *stats = (uint32_t *)[g_cullStatsBuffer contents];
-      dbg("GPU Cull [compute]: input=%u visible=%u frustumCulled=%u "
-          "distCulled=%u\n",
-          count, visibleCount, stats[1], stats[3]);
-    }
-    return (jint)visibleCount;
-  }
-cpu_path: {
+  // The previous implementation committed a separate command buffer and
+  // immediately waited for it, stalling every frame. Until culling is encoded
+  // into the main frame command stream with ping-ponged results, use the safe
+  // CPU passthrough instead.
   uint32_t *indices = (uint32_t *)[g_visibleIndicesBuffer contents];
   for (uint32_t i = 0; i < count; i++) {
     indices[i] = i;
@@ -5093,7 +5703,6 @@ cpu_path: {
     dbg("GPU Cull [cpu-passthrough]: all %u chunks marked visible\n", count);
   }
   return (jint)count;
-}
 }
 extern "C" JNIEXPORT jint JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetGPUVisibleCount(
@@ -5187,6 +5796,20 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetThermalState(
   return (jint)g_thermalState;
 }
 extern "C" JNIEXPORT void JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSetTemporalScale(
+    JNIEnv *, jclass, jfloat scale) {
+  float clamped = std::max(0.2f, std::min(1.0f, (float)scale));
+  if (fabsf(clamped - g_scale) < 0.001f)
+    return;
+  g_scale = clamped;
+  g_targetScale = clamped;
+  g_allocatedRenderWidth = 0;
+  g_allocatedRenderHeight = 0;
+  if (!g_currentEncoder)
+    ensure_offscreen();
+  dbg("Dynamic resolution scale set to %.3f\n", clamped);
+}
+extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSetRenderDistance(
     JNIEnv *, jclass, jint distanceBlocks) {
 
@@ -5208,11 +5831,14 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSetFeatureFlags(
       (meshShaders == JNI_TRUE) && caps.meshShaders && g_meshPipelineCount > 0;
   g_useArgumentBuffers = requestedArgumentBuffers;
   g_useProgrammableBlending = (progBlend == JNI_TRUE);
-  g_useMemorylessTargets = caps.memorylessTargets;
+  // Depth and OIT are consumed across multiple passes. A memoryless target is
+  // only legal after those passes are merged into a single tile-local pass.
+  g_useMemorylessTargets = false;
 
   if (prevMemoryless != g_useMemorylessTargets) {
-    g_rtWidth = 0;
-    g_rtHeight = 0;
+    g_allocatedRenderWidth = 0;
+    g_allocatedRenderHeight = 0;
+    ensure_offscreen();
   }
   dbg("nSetFeatureFlags: ICB=%d mesh=%d argBuf=%d OIT=%d memoryless=%d\n",
       g_gpuDrivenEnabled ? 1 : 0, g_meshShadersActive ? 1 : 0,
@@ -5328,7 +5954,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawOITPass(
   (void)handle;
   if (!g_useProgrammableBlending)
     return;
-  if (!g_device || !g_currentCmdBuffer || !g_color)
+  if (!g_device || !g_currentCmdBuffer || !g_frameColorTarget)
     return;
   if (!g_oitAccumTex || !g_oitRevealTex)
     return;
@@ -5344,13 +5970,14 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawOITPass(
       [g_currentEncoder release];
       g_currentEncoder = nil;
     }
-    if (g_currentCmdBuffer && g_hizDownsamplePipeline && g_hizPyramid &&
+    if (kHiZPathValidated && g_currentCmdBuffer &&
+        g_hizDownsamplePipeline && g_hizPyramid &&
         !g_useMemorylessTargets) {
       id<MTLComputeCommandEncoder> hizEnc =
           [g_currentCmdBuffer computeCommandEncoder];
       if (hizEnc) {
         [hizEnc setComputePipelineState:g_hizDownsamplePipeline];
-        id<MTLTexture> srcDepth = g_depth;
+        id<MTLTexture> srcDepth = g_frameDepthTarget;
         if (srcDepth) {
           [hizEnc setTexture:srcDepth atIndex:0];
           [hizEnc setTexture:g_hizPyramid atIndex:1];
@@ -5376,16 +6003,16 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawOITPass(
       rp.colorAttachments[1].storeAction = MTLStoreActionStore;
       rp.colorAttachments[1].clearColor = MTLClearColorMake(1, 0, 0, 0);
 
-      if (!g_useMemorylessTargets && g_depth) {
-        rp.depthAttachment.texture = g_depth;
+      if (g_frameDepthTarget) {
+        rp.depthAttachment.texture = g_frameDepthTarget;
         rp.depthAttachment.loadAction = MTLLoadActionLoad;
-        rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
       }
       id<MTLRenderCommandEncoder> enc =
           [g_currentCmdBuffer renderCommandEncoderWithDescriptor:rp];
       if (enc) {
         [enc setRenderPipelineState:g_pipelineOITAccum];
-        if (!g_useMemorylessTargets && g_depthStateNoWrite)
+        if (g_depthStateNoWrite)
           [enc setDepthStencilState:g_depthStateNoWrite];
         [enc setCullMode:MTLCullModeNone];
         MTLViewport vp;
@@ -5446,7 +6073,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawOITPass(
     {
       MTLRenderPassDescriptor *cRp =
           [MTLRenderPassDescriptor renderPassDescriptor];
-      cRp.colorAttachments[0].texture = g_color;
+      cRp.colorAttachments[0].texture = g_frameColorTarget;
       cRp.colorAttachments[0].loadAction = MTLLoadActionLoad;
       cRp.colorAttachments[0].storeAction = MTLStoreActionStore;
       id<MTLRenderCommandEncoder> cEnc =
@@ -5469,13 +6096,13 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawOITPass(
       if (!s_resumeRP) {
         s_resumeRP = [[MTLRenderPassDescriptor renderPassDescriptor] retain];
         s_resumeRP.colorAttachments[0].storeAction = MTLStoreActionStore;
-        s_resumeRP.depthAttachment.clearDepth = 1.0;
+        s_resumeRP.depthAttachment.clearDepth = 0.0;
       }
-      s_resumeRP.colorAttachments[0].texture = g_color;
+      s_resumeRP.colorAttachments[0].texture = g_frameColorTarget;
       s_resumeRP.colorAttachments[0].loadAction = MTLLoadActionLoad;
 
-      if (!g_useMemorylessTargets && g_depth) {
-        s_resumeRP.depthAttachment.texture = g_depth;
+      if (g_frameDepthTarget) {
+        s_resumeRP.depthAttachment.texture = g_frameDepthTarget;
         s_resumeRP.depthAttachment.loadAction = MTLLoadActionLoad;
         s_resumeRP.depthAttachment.storeAction = MTLStoreActionStore;
       } else {
@@ -5489,8 +6116,8 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrawOITPass(
         MTLViewport vp;
         vp.originX = 0;
         vp.originY = 0;
-        vp.width = (double)g_color.width;
-        vp.height = (double)g_color.height;
+        vp.width = (double)g_frameColorTarget.width;
+        vp.height = (double)g_frameColorTarget.height;
         vp.znear = 0.0;
         vp.zfar = 1.0;
         [g_currentEncoder setViewport:vp];
@@ -5526,7 +6153,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetAvailableMemory
     return (jlong)(freePages * pageSize);
   }
 
-  return (jlong)(MEGA_VB_CAPACITY);
+  return (jlong)g_megaVBBudget;
 }
 extern "C" JNIEXPORT jint JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetHiZMipCount(
@@ -5604,6 +6231,12 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nFlushDeferredDelet
           if (it != g_buffers.end()) {
             [it->second release];
             g_buffers.erase(it);
+            auto sizeIt = g_bufferSizes.find(dd.handle);
+            if (sizeIt != g_bufferSizes.end()) {
+              g_individualBufferBytes -=
+                  std::min(g_individualBufferBytes, sizeIt->second);
+              g_bufferSizes.erase(sizeIt);
+            }
           }
         }
         freed++;
@@ -5650,29 +6283,9 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nFlushFrames(
     JNIEnv *, jclass) {
   @autoreleasepool {
     dbg("nFlushFrames: draining all in-flight GPU frames\n");
-
-    for (int i = 0; i < kTripleBufferCount; i++) {
-      if (g_tbCmdBuf[i]) {
-        [g_tbCmdBuf[i] waitUntilCompleted];
-      }
-    }
-
-    if (g_frameSemaphore) {
-      for (int i = 0; i < kTripleBufferCount; i++)
-        dispatch_semaphore_signal(g_frameSemaphore);
-      dispatch_release(g_frameSemaphore);
-    }
-    g_frameSemaphore = dispatch_semaphore_create(kTripleBufferCount - 1);
-    dbg("nFlushFrames: semaphore recreated (count=%d)\n",
-        kTripleBufferCount - 1);
-
-    for (int i = 0; i < kTripleBufferCount; i++) {
-      g_tbSlotReady[i].store(true, std::memory_order_release);
-    }
-    g_currentFrameReady = true;
-
+    drain_surface_slots(true);
     g_gpuNeedsRecovery.store(false, std::memory_order_release);
-    dbg("nFlushFrames: complete — semaphore clean, all slots ready\n");
+    dbg("nFlushFrames: complete; GPU and GL ownership drained\n");
   }
 }
 
@@ -5680,18 +6293,11 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nWatchdogReset(
     JNIEnv *, jclass) {
   @autoreleasepool {
-    dbg("WATCHDOG: Reset triggered!\n");
-
-    if (g_frameSemaphore) {
-      dispatch_semaphore_signal(g_frameSemaphore);
-    }
-
-    g_currentFrameReady = true;
-
-    for (int i = 0; i < 3; i++) {
-      g_tbSlotReady[i].store(true, std::memory_order_release);
-    }
-    dbg("WATCHDOG: Semaphore signalled, frame marked ready\n");
+    // Never fabricate completion or make an in-flight IOSurface reusable. The
+    // next frame performs a real drain before recreating the command queue.
+    dbg("WATCHDOG: recovery requested; preserving slot ownership\n");
+    g_gpuNeedsRecovery.store(true, std::memory_order_release);
+    g_surfaceSlotChanged.notify_all();
   }
 }
 
@@ -5704,8 +6310,8 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetGpuFrameTimeMs(
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nAreResidencySetsSupported(
     JNIEnv *, jclass) {
-#if defined(__aarch64__) && (__MAC_OS_X_VERSION_MAX_ALLOWED >= 140000)
-  if (@available(macOS 14.0, *)) {
+#if defined(__aarch64__) && (__MAC_OS_X_VERSION_MAX_ALLOWED >= 150000)
+  if (@available(macOS 15.0, *)) {
     return g_device != nil && [g_device supportsFamily:MTLGPUFamilyApple6]
                ? JNI_TRUE
                : JNI_FALSE;
@@ -5717,18 +6323,21 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nAreResidencySetsSu
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCreateResidencySet(
     JNIEnv *, jclass, jlong device) {
-#if defined(__aarch64__) && (__MAC_OS_X_VERSION_MAX_ALLOWED >= 140000)
-  if (@available(macOS 14.0, *)) {
+#if defined(__aarch64__) && (__MAC_OS_X_VERSION_MAX_ALLOWED >= 150000)
+  if (@available(macOS 15.0, *)) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)(void *)device;
-    if (dev != nil && [dev respondsToSelector:@selector(newResidencySet:
-                                                                  error:)]) {
+    if (dev != nil &&
+        [dev respondsToSelector:@selector(newResidencySetWithDescriptor:
+                                                            error:)]) {
       MTLResidencySetDescriptor *desc =
           [[MTLResidencySetDescriptor alloc] init];
       desc.label = @"entity_atlas_residency";
       NSError *error = nil;
-      id<MTLResidencySet> set = [dev newResidencySet:desc error:&error];
+      id<MTLResidencySet> set =
+          [dev newResidencySetWithDescriptor:desc error:&error];
+      [desc release];
       if (set != nil) {
-        return (jlong)(void *)CFBridgingRetain(set);
+        return (jlong)(uintptr_t)(__bridge void *)set;
       }
     }
   }
@@ -5739,25 +6348,21 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCreateResidencySet
 extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUpdateResidencySet(
     JNIEnv *env, jclass, jlong setHandle, jlongArray textureHandles) {
-#if defined(__aarch64__) && (__MAC_OS_X_VERSION_MAX_ALLOWED >= 140000)
-  if (@available(macOS 14.0, *)) {
+#if defined(__aarch64__) && (__MAC_OS_X_VERSION_MAX_ALLOWED >= 150000)
+  if (@available(macOS 15.0, *)) {
     id<MTLResidencySet> set = (__bridge id<MTLResidencySet>)(void *)setHandle;
     if (set == nil)
       return;
     jsize count = env->GetArrayLength(textureHandles);
     jlong *handles = env->GetLongArrayElements(textureHandles, nullptr);
-    NSMutableArray<id<MTLTexture>> *textures =
-        [NSMutableArray arrayWithCapacity:count];
+    [set removeAllAllocations];
     for (jsize i = 0; i < count; i++) {
       id<MTLTexture> tex = (__bridge id<MTLTexture>)(void *)handles[i];
       if (tex != nil)
-        [textures addObject:tex];
+        [set addAllocation:(id<MTLAllocation>)tex];
     }
     env->ReleaseLongArrayElements(textureHandles, handles, JNI_ABORT);
-    if (textures.count > 0) {
-      [set setResources:textures];
-      [set commit];
-    }
+    [set commit];
   }
 #endif
 }
@@ -5765,10 +6370,12 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUpdateResidencySet
 extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDestroyResidencySet(
     JNIEnv *, jclass, jlong setHandle) {
-#if defined(__aarch64__) && (__MAC_OS_X_VERSION_MAX_ALLOWED >= 140000)
-  if (@available(macOS 14.0, *)) {
+#if defined(__aarch64__) && (__MAC_OS_X_VERSION_MAX_ALLOWED >= 150000)
+  if (@available(macOS 15.0, *)) {
     if (setHandle != 0) {
-      CFRelease((CFTypeRef)(void *)setHandle);
+      id<MTLResidencySet> set =
+          (__bridge id<MTLResidencySet>)(void *)setHandle;
+      [set release];
     }
   }
 #endif

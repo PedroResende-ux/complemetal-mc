@@ -17,6 +17,7 @@ import org.lwjgl.opengl.GL42;
 
 public final class IOSurfaceBlitter {
   private static final int GL_TEXTURE_RECTANGLE = 0x84F5;
+  private static final int GL_TEXTURE_BINDING_RECTANGLE = 0x84F6;
   private static final int GL_BGRA = 0x80E1;
   private final int[] blitViewportBuf = new int[4];
   private int glTextureRect = 0;
@@ -53,28 +54,6 @@ public final class IOSurfaceBlitter {
   private byte[] depthRowA = null;
   private byte[] depthRowB = null;
   private final float[] prevClearColor = new float[4];
-
-  private int cachedPrevReadFbo = -1;
-  private int cachedPrevDrawFbo = -1;
-  private boolean cachedScissor = false;
-  private boolean glStateQueried = false;
-
-  private int cachedQuadPrevProgram = -1;
-  private int cachedQuadPrevVao = -1;
-  private int cachedQuadPrevActiveTexture = -1;
-  private int cachedQuadPrevTex = -1;
-  private boolean cachedQuadWasDepth = false;
-  private boolean cachedQuadWasBlend = false;
-  private boolean cachedQuadWasCull = false;
-  private boolean cachedQuadWasScissor = false;
-  private boolean cachedQuadWasStencil = false;
-  private boolean cachedQuadWasDepthMask = false;
-  private boolean cachedQuadCmR = true, cachedQuadCmG = true,
-      cachedQuadCmB = true, cachedQuadCmA = true;
-  private int cachedQuadBSrcRGB = -1, cachedQuadBDstRGB = -1,
-      cachedQuadBSrcA = -1, cachedQuadBDstA = -1;
-  private final int[] cachedQuadViewport = new int[4];
-  private boolean quadStateQueried = false;
 
   private final ByteBuffer reusableCmBuf = BufferUtils.createByteBuffer(4);
   private long blitWaitAccNs = 0;
@@ -202,6 +181,8 @@ public final class IOSurfaceBlitter {
   private boolean initialize() {
     if (initialized)
       return true;
+    int previousVao = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
+    int previousArrayBuffer = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
     try {
       vao = GL30.glGenVertexArrays();
       vbo = GL15.glGenBuffers();
@@ -216,20 +197,24 @@ public final class IOSurfaceBlitter {
       GL20.glVertexAttribPointer(1, 2, GL11.GL_FLOAT, false, 4 * Float.BYTES,
           2L * Float.BYTES);
       GL20.glEnableVertexAttribArray(1);
-      GL30.glBindVertexArray(0);
-      GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, 0);
       initialized = true;
-      MetalLogger.info("[iosurface] weady");
+      MetalLogger.info("[iosurface] ready");
       return true;
     } catch (Exception e) {
       MetalLogger.error("[iosurface] init fail: %s", e.getMessage());
       destroy();
       return false;
+    } finally {
+      GL30.glBindVertexArray(previousVao);
+      GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, previousArrayBuffer);
     }
   }
 
   private boolean blitGPUComposite(long metalHandle, int width, int height,
       boolean skipWait) {
+    int previousActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
+    int previousRectangleTexture =
+        GL11.glGetInteger(GL_TEXTURE_BINDING_RECTANGLE);
     try {
       long t0 = System.nanoTime();
       if (!skipWait && !NativeBridge.nIsFrameReady(metalHandle)) {
@@ -294,6 +279,9 @@ public final class IOSurfaceBlitter {
         }
       }
       return false;
+    } finally {
+      GL13.glActiveTexture(previousActiveTexture);
+      GL11.glBindTexture(GL_TEXTURE_RECTANGLE, previousRectangleTexture);
     }
   }
 
@@ -309,23 +297,11 @@ public final class IOSurfaceBlitter {
   }
 
   private boolean blitToIntermediateImpl(int width, int height) {
-
-    int prevReadFbo, prevDrawFbo;
-    boolean scissor;
-    if (!glStateQueried) {
-      prevReadFbo = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
-      prevDrawFbo = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
-      scissor = GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
-      GL11.glGetFloatv(GL11.GL_COLOR_CLEAR_VALUE, prevClearColor);
-      cachedPrevReadFbo = prevReadFbo;
-      cachedPrevDrawFbo = prevDrawFbo;
-      cachedScissor = scissor;
-      glStateQueried = true;
-    } else {
-      prevReadFbo = cachedPrevReadFbo;
-      prevDrawFbo = cachedPrevDrawFbo;
-      scissor = cachedScissor;
-    }
+    int prevReadFbo = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
+    int prevDrawFbo = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
+    int prevTexture = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
+    boolean scissor = GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
+    GL11.glGetFloatv(GL11.GL_COLOR_CLEAR_VALUE, prevClearColor);
     try {
       if (ioSurfaceFbo == 0) {
         ioSurfaceFbo = GL30.glGenFramebuffers();
@@ -371,8 +347,12 @@ public final class IOSurfaceBlitter {
           GL_TEXTURE_RECTANGLE, 0, 0);
       GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, prevReadFbo);
       GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, prevDrawFbo);
-      if (scissor)
+      GL11.glBindTexture(GL11.GL_TEXTURE_2D, prevTexture);
+      if (scissor) {
         GL11.glEnable(GL11.GL_SCISSOR_TEST);
+      } else {
+        GL11.glDisable(GL11.GL_SCISSOR_TEST);
+      }
       GL11.glClearColor(prevClearColor[0], prevClearColor[1], prevClearColor[2],
           prevClearColor[3]);
     }
@@ -433,31 +413,45 @@ public final class IOSurfaceBlitter {
   }
 
   private void uploadToTexture(int width, int height) {
-    if (width != boundWidth || height != boundHeight || glTexture == 0) {
-      if (glTexture != 0)
-        GL11.glDeleteTextures(glTexture);
-      glTexture = GL11.glGenTextures();
-      GL11.glBindTexture(GL11.GL_TEXTURE_2D, glTexture);
-      GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER,
-          GL11.GL_NEAREST);
-      GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER,
-          GL11.GL_NEAREST);
-      GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S,
-          GL12.GL_CLAMP_TO_EDGE);
-      GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T,
-          GL12.GL_CLAMP_TO_EDGE);
-      GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, 1, GL11.GL_RGBA8, width, height);
-      boundWidth = width;
-      boundHeight = height;
-    } else {
-      GL11.glBindTexture(GL11.GL_TEXTURE_2D, glTexture);
+    int previousTexture = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
+    int previousRowLength = GL11.glGetInteger(GL11.GL_UNPACK_ROW_LENGTH);
+    int previousSkipPixels = GL11.glGetInteger(GL11.GL_UNPACK_SKIP_PIXELS);
+    int previousSkipRows = GL11.glGetInteger(GL11.GL_UNPACK_SKIP_ROWS);
+    int previousAlignment = GL11.glGetInteger(GL11.GL_UNPACK_ALIGNMENT);
+    try {
+      if (width != boundWidth || height != boundHeight || glTexture == 0) {
+        if (glTexture != 0)
+          GL11.glDeleteTextures(glTexture);
+        glTexture = GL11.glGenTextures();
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, glTexture);
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER,
+            GL11.GL_NEAREST);
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER,
+            GL11.GL_NEAREST);
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S,
+            GL12.GL_CLAMP_TO_EDGE);
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T,
+            GL12.GL_CLAMP_TO_EDGE);
+        GL42.glTexStorage2D(GL11.GL_TEXTURE_2D, 1, GL11.GL_RGBA8, width,
+            height);
+        boundWidth = width;
+        boundHeight = height;
+      } else {
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, glTexture);
+      }
+      GL11.glPixelStorei(GL11.GL_UNPACK_ROW_LENGTH, 0);
+      GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_PIXELS, 0);
+      GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_ROWS, 0);
+      GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4);
+      GL11.glTexSubImage2D(GL11.GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA,
+          GL11.GL_UNSIGNED_BYTE, pixelBuffer);
+    } finally {
+      GL11.glBindTexture(GL11.GL_TEXTURE_2D, previousTexture);
+      GL11.glPixelStorei(GL11.GL_UNPACK_ROW_LENGTH, previousRowLength);
+      GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_PIXELS, previousSkipPixels);
+      GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_ROWS, previousSkipRows);
+      GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, previousAlignment);
     }
-    GL11.glPixelStorei(GL11.GL_UNPACK_ROW_LENGTH, 0);
-    GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_PIXELS, 0);
-    GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_ROWS, 0);
-    GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4);
-    GL11.glTexSubImage2D(GL11.GL_TEXTURE_2D, 0, 0, 0, width, height, GL_BGRA,
-        GL11.GL_UNSIGNED_BYTE, pixelBuffer);
   }
 
   private boolean drawDirectRect(int width, int height) {
@@ -557,80 +551,39 @@ public final class IOSurfaceBlitter {
         MetalLogger.error("[iosurface] shader create fail");
         return false;
       }
+      int previousProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
       GL20.glUseProgram(shaderProgram);
       int loc = GL20.glGetUniformLocation(shaderProgram, "uTexture");
       if (loc >= 0)
         GL20.glUniform1i(loc, 0);
-      GL20.glUseProgram(0);
+      GL20.glUseProgram(previousProgram);
     }
 
-    int prevProgram, prevVao, prevActiveTexture, prevTex;
-    boolean wasDepth, wasBlend, wasCull, wasScissor, wasStencil, wasDepthMask;
-    boolean cmR, cmG, cmB, cmA;
-    int bSrcRGB, bDstRGB, bSrcA, bDstA;
-    if (!quadStateQueried) {
-      prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
-      prevVao = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
-      prevActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
-      prevTex = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
-      wasDepth = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
-      wasBlend = GL11.glIsEnabled(GL11.GL_BLEND);
-      wasCull = GL11.glIsEnabled(GL11.GL_CULL_FACE);
-      wasScissor = GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
-      wasStencil = GL11.glIsEnabled(GL11.GL_STENCIL_TEST);
-      wasDepthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
-      reusableCmBuf.clear();
-      GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK, reusableCmBuf);
-      ByteBuffer cmBuf = reusableCmBuf;
-      cmR = cmBuf.get(0) != 0;
-      cmG = cmBuf.get(1) != 0;
-      cmB = cmBuf.get(2) != 0;
-      cmA = cmBuf.get(3) != 0;
-      bSrcRGB = GL11.glGetInteger(GL14.GL_BLEND_SRC_RGB);
-      bDstRGB = GL11.glGetInteger(GL14.GL_BLEND_DST_RGB);
-      bSrcA = GL11.glGetInteger(GL14.GL_BLEND_SRC_ALPHA);
-      bDstA = GL11.glGetInteger(GL14.GL_BLEND_DST_ALPHA);
-      cachedQuadPrevProgram = prevProgram;
-      cachedQuadPrevVao = prevVao;
-      cachedQuadPrevActiveTexture = prevActiveTexture;
-      cachedQuadPrevTex = prevTex;
-      cachedQuadWasDepth = wasDepth;
-      cachedQuadWasBlend = wasBlend;
-      cachedQuadWasCull = wasCull;
-      cachedQuadWasScissor = wasScissor;
-      cachedQuadWasStencil = wasStencil;
-      cachedQuadWasDepthMask = wasDepthMask;
-      cachedQuadCmR = cmR;
-      cachedQuadCmG = cmG;
-      cachedQuadCmB = cmB;
-      cachedQuadCmA = cmA;
-      cachedQuadBSrcRGB = bSrcRGB;
-      cachedQuadBDstRGB = bDstRGB;
-      cachedQuadBSrcA = bSrcA;
-      cachedQuadBDstA = bDstA;
-      GL11.glGetIntegerv(GL11.GL_VIEWPORT, cachedQuadViewport);
-      quadStateQueried = true;
-    } else {
-      prevProgram = cachedQuadPrevProgram;
-      prevVao = cachedQuadPrevVao;
-      prevActiveTexture = cachedQuadPrevActiveTexture;
-      prevTex = cachedQuadPrevTex;
-      wasDepth = cachedQuadWasDepth;
-      wasBlend = cachedQuadWasBlend;
-      wasCull = cachedQuadWasCull;
-      wasScissor = cachedQuadWasScissor;
-      wasStencil = cachedQuadWasStencil;
-      wasDepthMask = cachedQuadWasDepthMask;
-      cmR = cachedQuadCmR;
-      cmG = cachedQuadCmG;
-      cmB = cachedQuadCmB;
-      cmA = cachedQuadCmA;
-      bSrcRGB = cachedQuadBSrcRGB;
-      bDstRGB = cachedQuadBDstRGB;
-      bSrcA = cachedQuadBSrcA;
-      bDstA = cachedQuadBDstA;
-    }
-    int[] prevViewport = cachedQuadViewport;
+    int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
+    int prevVao = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
+    int prevActiveTexture = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
+    GL13.glActiveTexture(GL13.GL_TEXTURE0);
+    int prevTexture0 = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
+    GL13.glActiveTexture(prevActiveTexture);
+    boolean wasDepth = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
+    boolean wasBlend = GL11.glIsEnabled(GL11.GL_BLEND);
+    boolean wasCull = GL11.glIsEnabled(GL11.GL_CULL_FACE);
+    boolean wasScissor = GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
+    boolean wasStencil = GL11.glIsEnabled(GL11.GL_STENCIL_TEST);
+    boolean wasDepthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+    reusableCmBuf.clear();
+    GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK, reusableCmBuf);
+    ByteBuffer cmBuf = reusableCmBuf;
+    boolean cmR = cmBuf.get(0) != 0;
+    boolean cmG = cmBuf.get(1) != 0;
+    boolean cmB = cmBuf.get(2) != 0;
+    boolean cmA = cmBuf.get(3) != 0;
+    int bSrcRGB = GL11.glGetInteger(GL14.GL_BLEND_SRC_RGB);
+    int bDstRGB = GL11.glGetInteger(GL14.GL_BLEND_DST_RGB);
+    int bSrcA = GL11.glGetInteger(GL14.GL_BLEND_SRC_ALPHA);
+    int bDstA = GL11.glGetInteger(GL14.GL_BLEND_DST_ALPHA);
+    int[] prevViewport = blitViewportBuf;
+    GL11.glGetIntegerv(GL11.GL_VIEWPORT, prevViewport);
     try {
       GL11.glViewport(0, 0, width, height);
       GL11.glDisable(GL11.GL_DEPTH_TEST);
@@ -655,8 +608,9 @@ public final class IOSurfaceBlitter {
           prevViewport[3]);
       GL20.glUseProgram(prevProgram);
       GL30.glBindVertexArray(prevVao);
+      GL13.glActiveTexture(GL13.GL_TEXTURE0);
+      GL11.glBindTexture(GL11.GL_TEXTURE_2D, prevTexture0);
       GL13.glActiveTexture(prevActiveTexture);
-      GL11.glBindTexture(GL11.GL_TEXTURE_2D, prevTex);
       GL11.glDepthMask(wasDepthMask);
       GL11.glColorMask(cmR, cmG, cmB, cmA);
       if (wasDepth)
@@ -1111,9 +1065,6 @@ public final class IOSurfaceBlitter {
     }
     boundWidth = 0;
     boundHeight = 0;
-
-    glStateQueried = false;
-    quadStateQueried = false;
     resetFastPathState();
   }
 

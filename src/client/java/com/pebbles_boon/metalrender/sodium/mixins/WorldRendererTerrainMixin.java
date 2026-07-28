@@ -2,82 +2,49 @@ package com.pebbles_boon.metalrender.sodium.mixins;
 
 import com.mojang.blaze3d.textures.GpuSampler;
 import com.pebbles_boon.metalrender.MetalRenderClient;
+import com.pebbles_boon.metalrender.render.MetalRenderHookState;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
-import com.pebbles_boon.metalrender.util.MetalLogger;
+import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayerGroup;
 import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-@Mixin(targets = "net.minecraft.client.renderer.LevelRenderer", remap = false)
+@Mixin(LevelRenderer.class)
 public class WorldRendererTerrainMixin {
-  @Unique
-  private int metalrender$skippedTerrainGroups = 0;
-  @Unique
-  private boolean metalrender$loggedWaitingForMetalDraw = false;
-
-  @Unique
-  private boolean metalrender$shouldSkipVanillaTerrain() {
-    if (!MetalRenderClient.isEnabled()) {
-      metalrender$loggedWaitingForMetalDraw = false;
-      return false;
-    }
-    MetalWorldRenderer wr = MetalRenderClient.getWorldRenderer();
-    if (wr == null || !wr.metalActive()) {
-      metalrender$loggedWaitingForMetalDraw = false;
-      return false;
-    }
-
-    if (!metalrender$loggedWaitingForMetalDraw) {
-      MetalLogger.info("[terrainmix] metal on; vanilla locked");
-      metalrender$loggedWaitingForMetalDraw = true;
-    }
-    return true;
-  }
-
   @Redirect(method = "lambda$addMainPass$0", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/chunk/"
       + "ChunkSectionsToRender;renderGroup(Lnet/minecraft/"
       + "client/renderer/chunk/ChunkSectionLayerGroup;Lcom/"
-      + "mojang/blaze3d/textures/GpuSampler;)V", ordinal = 0), require = 0)
-  private void metalrender$skipOpaqueTerrainGroup(ChunkSectionsToRender sections,
+      + "mojang/blaze3d/textures/GpuSampler;)V"), require = 2, allow = 2)
+  private void metalrender$replaceTerrainGroups(ChunkSectionsToRender sections,
       ChunkSectionLayerGroup group,
       GpuSampler sampler) {
-    if (metalrender$shouldSkipVanillaTerrain()) {
+    boolean replaceOpaque =
+        group == ChunkSectionLayerGroup.OPAQUE &&
+        MetalRenderHookState.canReplaceTerrain();
+    if (!replaceOpaque) {
+      sections.renderGroup(group, sampler);
+    }
+    if (group != ChunkSectionLayerGroup.OPAQUE ||
+        !MetalRenderHookState.canPresentFrame()) {
       return;
     }
-    sections.renderGroup(group, sampler);
-  }
 
-  @Redirect(method = "lambda$addMainPass$0", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/chunk/"
-      + "ChunkSectionsToRender;renderGroup(Lnet/minecraft/"
-      + "client/renderer/chunk/ChunkSectionLayerGroup;Lcom/"
-      + "mojang/blaze3d/textures/GpuSampler;)V", ordinal = 1), require = 0)
-  private void metalrender$skipTranslucentTerrainGroup(ChunkSectionsToRender sections,
-      ChunkSectionLayerGroup group,
-      GpuSampler sampler) {
-    if (metalrender$shouldSkipVanillaTerrain()) {
+    MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
+    if (worldRenderer == null || !worldRenderer.metalActive()) {
       return;
     }
-    sections.renderGroup(group, sampler);
-  }
-
-  @Inject(method = "lambda$addMainPass$0", at = @At("HEAD"),
-      cancellable = true, require = 0)
-  private void metalrender$terrainHookHeartbeat(CallbackInfo ci) {
-    if (!metalrender$shouldSkipVanillaTerrain()) {
-      return;
+    try {
+      if (worldRenderer.forceBlitNow()) {
+        MetalRenderHookState.markPresentationSucceeded();
+      } else {
+        MetalRenderHookState.markPresentationAttemptFailed(
+            "opaque-pass-composite", null);
+      }
+    } catch (Throwable error) {
+      MetalRenderHookState.markPresentationAttemptFailed(
+          "opaque-pass-composite", error);
     }
-    metalrender$skippedTerrainGroups++;
-    if (metalrender$skippedTerrainGroups <= 3 ||
-        metalrender$skippedTerrainGroups % 1000 == 0) {
-      MetalLogger.info(
-          "[terrainmix] cancelled pass #%d (section iteration skipped)",
-          metalrender$skippedTerrainGroups);
-    }
-    ci.cancel();
   }
 }

@@ -14,7 +14,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(ClientLevel.class)
 public class ClientWorldMixin {
 
-  @Inject(method = "sendBlockUpdated", at = @At("RETURN"), require = 0)
+  @Inject(method = "sendBlockUpdated", at = @At("RETURN"), require = 1)
   private void metalrender$onHandleBlockUpdate(BlockPos pos, BlockState state,
       BlockState oldState, int flags,
       CallbackInfo ci) {
@@ -22,12 +22,12 @@ public class ClientWorldMixin {
   }
 
   private void metalrender$triggerRebuild(BlockPos pos) {
-    if (!MetalRenderClient.getConfig().enableMetalRendering)
+    if (!MetalRenderClient.isEnabled())
       return;
     MetalWorldRenderer worldRenderer = MetalWorldRenderer.getInstance();
     if (worldRenderer == null || !worldRenderer.isReady()) {
       MetalLogger.debug(
-          "block [%d,%d,%d] skip; wendewer not weady",
+          "block [%d,%d,%d] skipped; renderer not ready",
           pos.getX(), pos.getY(), pos.getZ());
       return;
     }

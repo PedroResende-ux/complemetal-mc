@@ -16,7 +16,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(ClientChunkCache.class)
 public class ChunkLoadMixin {
-  @Inject(method = "replaceWithPacketData", at = @At("RETURN"), require = 0)
+  @Inject(method = "replaceWithPacketData", at = @At("RETURN"), require = 1)
   private void metalrender$onChunkLoaded(
       int x, int z, FriendlyByteBuf buf, Map<?, ?> heightmaps,
       Consumer<ClientboundLevelChunkPacketData.BlockEntityTagOutput> blockEntityOutput,
@@ -26,7 +26,7 @@ public class ChunkLoadMixin {
     MetalWorldRenderer wr = MetalWorldRenderer.getInstance();
     if (wr == null || !wr.isReady()) {
       MetalLogger.debug(
-          "chunk [%d,%d] skip; wendewer not weady",
+          "chunk [%d,%d] skipped; renderer not ready",
           x, z);
       return;
     }

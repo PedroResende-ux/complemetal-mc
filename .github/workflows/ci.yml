@@ -1,0 +1,52 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Ensure the offline Metal compiler is installed
+        run: |
+          if ! xcrun --sdk macosx metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun --sdk macosx metal --version
+          xcrun --sdk macosx --find metallib
+
+      - name: Compile, test, package, and verify
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: ./gradlew --no-daemon clean test check build releaseCheck
+
+      - name: Smoke-test packaged native payload
+        run: ./scripts/smoke_release_payload.sh
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metalrender-mc26.2
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+          if-no-files-found: error
