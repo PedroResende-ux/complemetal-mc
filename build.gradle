@@ -1,0 +1,82 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.15-SNAPSHOT'
+    id 'maven-publish'
+}
+
+group = "com.pebbles_boon.metalrender"
+version = "v0.1.7"
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(25)
+}
+repositories {
+
+    maven {
+        name = "Fabric"
+        url = "https://maven.fabricmc.net/"
+    }
+    mavenCentral()
+    maven {
+        name = "Modrinth"
+        url = "https://api.modrinth.com/maven"
+    }
+        maven {
+            name = "LWJGL"
+            url = "https://repo.lwjgl.org/"
+        }
+}
+dependencies {
+    minecraft "com.mojang:minecraft:26.1"
+    implementation "net.fabricmc:fabric-loader:0.19.2"
+    implementation "net.fabricmc.fabric-api:fabric-api:0.149.0+26.1.2"
+    implementation "org.lwjgl:lwjgl:3.3.3"
+    implementation "org.lwjgl:lwjgl-glfw:3.3.3"
+    implementation "org.lwjgl:lwjgl:3.3.3:natives-macos"
+    implementation "org.lwjgl:lwjgl-glfw:3.3.3:natives-macos"
+    implementation 'org.joml:joml:1.10.5'
+    compileOnly "maven.modrinth:sodium:mc26.1.1-0.8.9-fabric"
+}
+
+loom {
+    splitEnvironmentSourceSets()
+
+    runs {
+        client {
+            client()
+            source sourceSets.client
+            vmArg "-Djava.library.path=${projectDir}/src/main/resources"
+            vmArg "--enable-preview"
+            vmArg "--enable-native-access=ALL-UNNAMED"
+            if (project.hasProperty('zgc')) {
+                vmArg "-XX:+UseZGC"
+            } else {
+                vmArg "-XX:+UseG1GC"
+            }
+            vmArg "-Xmx8g"
+            vmArg "-Xms2g"
+            vmArg "-XX:+AlwaysPreTouch"
+            
+            if (project.hasProperty('gl2metal')) {
+                vmArg "-Dmetalrender.gl2metal=true"
+            }
+            
+            ['state', 'drawcalls', 'buffers', 'textures', 'shaders', 'fbos', 'vaos', 'debug'].each { category ->
+                if (project.hasProperty("gl2metal.${category}")) {
+                    vmArg "-Dmetalrender.gl2metal.${category}=true"
+                }
+            }
+        }
+    }
+}
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+    options.release = 25
+    options.compilerArgs += ['--enable-preview']
+}
+    jar {
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+        from('src/main/resources/native') {
+            include 'metalrender.h', 'metalrender.mm'
+            into 'native'
+        }
+    }

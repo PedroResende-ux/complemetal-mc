@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "metalrender",
+  "version": "0.1.7",
+  "license": "Apache-2.0",
+  "authors": [
+    "pebbles_boon"
+  ],
+  "name": "MetalRender",
+  "description": "funny MacOS mod",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.pebbles_boon.metalrender.MetalRenderClient"
+    ]
+  },
+  "mixins": [
+    "metalrender.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.2",
+    "minecraft": "26.1",
+    "fabric-api": "*"
+  }
+}
