@@ -1,6 +1,7 @@
 package com.pebbles_boon.metalrender.gui;
 
 import com.pebbles_boon.metalrender.MetalRenderClient;
+import com.pebbles_boon.metalrender.compat.IrisCompatibility;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.gui.components.MetalOptionSlider;
 import com.pebbles_boon.metalrender.nativebridge.MetalHardwareChecker;
@@ -633,6 +634,7 @@ public class MetalRenderSettingsScreen extends Screen {
     nfo("Metal 4 Active", metal4Active());
     nfo("Apple Silicon", MetalHardwareChecker.appleSilicon() ? "Yes" : "No");
     nfo("Sodium", MetalRenderClient.isSodiumLoaded() ? "Installed" : "Not Installed");
+    nfo("Iris", IrisCompatibility.statusDescription());
     nfo("Mesh Shaders", "Experimental - validation locked");
   }
 
@@ -691,9 +693,9 @@ public class MetalRenderSettingsScreen extends Screen {
     tog("Sacrifice TPS for FPS", config.prioritizeFpsOverTps, v -> config.prioritizeFpsOverTps = v);
     nfo("FPS Priority Mode", config.prioritizeFpsOverTps ? "Simulation Distance <= 5" : "Off");
     sec("Memory");
-    sld("Native Buffer Budget (MB)", 512, 2048, 512, pendingMaxMemMb,
+    sld("Requested Native Buffer Limit (MB)", 512, 2048, 512, pendingMaxMemMb,
         v -> pendingMaxMemMb = (int) (float) v);
-    nfo("Memory Pressure Fallback", "Not Available");
+    nfo("Device Working-Set Cap", "Applied at initialization");
     sec("Runtime");
     Runtime rt = Runtime.getRuntime();
     long used = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
@@ -705,6 +707,10 @@ public class MetalRenderSettingsScreen extends Screen {
     sec("Metal Features");
     nfo("Fast Terrain Replacement", "Disabled pending depth interop validation");
     nfo("Entities & Particles", "Vanilla overlay (safe beta default)");
+    nfo("Iris Shader Compatibility",
+        IrisCompatibility.requiresShaderCompatibilityMode()
+            ? "Active - Iris owns terrain"
+            : "Ready");
     tog("Argument Buffers", config.enableArgumentBuffers, v -> config.enableArgumentBuffers = v);
     tog("Indirect CMD Buffers", config.enableIndirectCommandBuffers, v -> config.enableIndirectCommandBuffers = v);
     tog("Programmable Blending", config.enableProgrammableBlending, v -> config.enableProgrammableBlending = v);

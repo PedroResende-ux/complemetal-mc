@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender.sodium.mixins;
 
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.StartupBlocker;
+import com.pebbles_boon.metalrender.compat.IrisCompatibility;
 import com.pebbles_boon.metalrender.gui.StartupBlockerOverlay;
 import com.pebbles_boon.metalrender.performance.PerformanceController;
 import com.pebbles_boon.metalrender.render.MetalRenderHookState;
@@ -78,7 +79,12 @@ public class MinecraftClientMixin {
       }
       if (level != null) {
         if (wr != null && wr.metalActive()) {
-          wr.prepareMeshes();
+          boolean irisCompatibilityMode =
+              IrisCompatibility.requiresShaderCompatibilityMode();
+          wr.setIrisCompatibilityPaused(irisCompatibilityMode);
+          if (!irisCompatibilityMode) {
+            wr.prepareMeshes();
+          }
         }
       }
     } else {

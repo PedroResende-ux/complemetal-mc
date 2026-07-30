@@ -29,6 +29,21 @@ public final class ReleasePayloadSmoke {
           "native library was not extracted from the release JAR: "
               + loadedLibrary);
     }
+    String implementationVersion =
+        NativeBridge.class.getPackage().getImplementationVersion();
+    if (implementationVersion == null || implementationVersion.isBlank()) {
+      throw new IllegalStateException(
+          "release JAR has no Implementation-Version");
+    }
+    String expectedCacheVersion =
+        implementationVersion.replaceAll("[^A-Za-z0-9._-]", "_");
+    Path versionDirectory = loadedLibrary.getParent().getParent();
+    if (!expectedCacheVersion.equals(
+        versionDirectory.getFileName().toString())) {
+      throw new IllegalStateException(
+          "native payload cache has the wrong version directory: "
+              + versionDirectory);
+    }
     Path shaderLibrary = loadedLibrary.resolveSibling("shaders.metallib");
     byte[] magic = Files.readAllBytes(shaderLibrary);
     if (magic.length < 4
@@ -94,6 +109,18 @@ public final class ReleasePayloadSmoke {
       if (backendMode == null || backendMode.isBlank()) {
         throw new IllegalStateException("native backend mode is empty");
       }
+      boolean metal4Supported = NativeBridge.nSupportsMetal4();
+      boolean metal4Active = NativeBridge.nIsMetal4Active();
+      if (isMacOs26OrNewer()
+          && (!metal4Supported || !metal4Active
+              || !"METAL4_RUNTIME_VERIFIED_METAL3_RENDER".equals(
+                  backendMode))) {
+        throw new IllegalStateException(
+            "macOS 26 release payload did not complete the Metal 4 runtime "
+                + "probe: supported=" + metal4Supported
+                + " active=" + metal4Active
+                + " backend=" + backendMode);
+      }
       if (NativeBridge.nIsMetal4DrawPathActive()) {
         throw new IllegalStateException(
             "this release must not advertise an unvalidated MTL4 draw path");
@@ -102,13 +129,26 @@ public final class ReleasePayloadSmoke {
           "release-payload-smoke: loaded=%s available=true metal4Supported=%s "
               + "metal4Active=%s metal4Draw=false backend=%s shaderBytes=%d%n",
           loadedLibrary,
-          NativeBridge.nSupportsMetal4(),
-          NativeBridge.nIsMetal4Active(),
+          metal4Supported,
+          metal4Active,
           backendMode,
           magic.length);
       NativeBridge.nFlushFrames();
     } finally {
       NativeBridge.nDestroy(handle);
+    }
+  }
+
+  private static boolean isMacOs26OrNewer() {
+    if (!System.getProperty("os.name", "")
+        .toLowerCase(java.util.Locale.ROOT).contains("mac")) {
+      return false;
+    }
+    try {
+      return Runtime.Version.parse(
+          System.getProperty("os.version", "0")).feature() >= 26;
+    } catch (IllegalArgumentException ignored) {
+      return false;
     }
   }
 }

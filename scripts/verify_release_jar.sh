@@ -20,6 +20,7 @@ required_entries=(
   "META-INF/MANIFEST.MF"
   "fabric.mod.json"
   "metalrender.mixins.json"
+  "metalrender.iris.mixins.json"
   "libmetalrender.dylib"
   "shaders.metallib"
   "LICENSE"
@@ -41,7 +42,8 @@ tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/metalrender-jar.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 (cd "$tmp_dir" && jar xf "$jar_path" \
   libmetalrender.dylib shaders.metallib \
-  fabric.mod.json metalrender.mixins.json LICENSE META-INF/MANIFEST.MF)
+  fabric.mod.json metalrender.mixins.json metalrender.iris.mixins.json \
+  LICENSE META-INF/MANIFEST.MF)
 
 if ! file "$tmp_dir/libmetalrender.dylib" | grep -q 'Mach-O 64-bit.*arm64'; then
   echo "Packaged native library is not macOS arm64" >&2
@@ -80,6 +82,18 @@ fi
 if ! grep -Fq '"compatibilityLevel": "JAVA_25"' \
   "$tmp_dir/metalrender.mixins.json"; then
   echo "Mixin configuration does not target Java 25" >&2
+  exit 1
+fi
+
+if ! grep -Fq '"compatibilityLevel": "JAVA_25"' \
+  "$tmp_dir/metalrender.iris.mixins.json"; then
+  echo "Optional Iris mixin configuration does not target Java 25" >&2
+  exit 1
+fi
+
+if ! grep -Fq '"required": false' \
+  "$tmp_dir/metalrender.iris.mixins.json"; then
+  echo "Iris mixin configuration must remain optional" >&2
   exit 1
 fi
 

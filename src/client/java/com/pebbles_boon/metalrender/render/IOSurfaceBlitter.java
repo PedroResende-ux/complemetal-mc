@@ -170,10 +170,28 @@ public final class IOSurfaceBlitter {
       GL11.glDeleteTextures(intermediateTexture);
       intermediateTexture = 0;
     }
+    if (depthTexture != 0) {
+      GL11.glDeleteTextures(depthTexture);
+      depthTexture = 0;
+    }
+    if (depthShaderProgram != 0) {
+      GL20.glDeleteProgram(depthShaderProgram);
+      depthShaderProgram = 0;
+    }
+    if (depthSrcFbo != 0) {
+      GL30.glDeleteFramebuffers(depthSrcFbo);
+      depthSrcFbo = 0;
+    }
     initialized = false;
     boundWidth = 0;
     boundHeight = 0;
     pixelBuffer = null;
+    depthPixelBuffer = null;
+    depthRowA = null;
+    depthRowB = null;
+    depthTextureWidth = 0;
+    depthTextureHeight = 0;
+    depthBlitFrameCount = 0;
     resetFastPathState();
     MetalLogger.info("[iosurface] destroyed");
   }
@@ -217,8 +235,21 @@ public final class IOSurfaceBlitter {
         GL11.glGetInteger(GL_TEXTURE_BINDING_RECTANGLE);
     try {
       long t0 = System.nanoTime();
-      if (!skipWait && !NativeBridge.nIsFrameReady(metalHandle)) {
+      if (!NativeBridge.nIsFrameReady(metalHandle)) {
+        if (skipWait) {
+          return false;
+        }
         NativeBridge.nWaitForRender(metalHandle);
+        // nWaitForRender is deliberately bounded so a stalled GPU cannot hang
+        // the client. A timeout is not permission to read the current render
+        // slot: it may still be owned by Metal.
+        if (!NativeBridge.nIsFrameReady(metalHandle)) {
+          if (blitFrameCount <= 10 || blitFrameCount % 600 == 0) {
+            MetalLogger.warn(
+                "[iosurface] frame not ready after bounded wait; presentation skipped");
+          }
+          return false;
+        }
       }
       long t1 = System.nanoTime();
       if (!ioSurfaceFailed &&
@@ -1073,6 +1104,21 @@ public final class IOSurfaceBlitter {
     consecutiveFastPathFailures = 0;
     lastIOSurfaceWidth = 0;
     lastIOSurfaceHeight = 0;
+  }
+
+  /**
+   * Ends the OpenGL ownership side of the IOSurface hand-off before Metal
+   * presentation is paused for an Iris shader pack. The native slot must only
+   * be released after this method returns.
+   */
+  public void suspendPresentation() {
+    if (destroyed) {
+      return;
+    }
+    GL11.glFinish();
+    invalidateTextures();
+    readFboVerified = false;
+    drawFboVerified = false;
   }
 
   private void deleteShaderProgram() {

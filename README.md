@@ -17,7 +17,7 @@ remains on the Metal 3 compatibility stream.
 
 | Component | Supported configuration |
 | --- | --- |
-| MetalRender | `0.2.0-beta.1+mc26.2` |
+| MetalRender | `0.2.0-beta.2+mc26.2` |
 | Minecraft | 26.2 |
 | Loader | Fabric Loader 0.19.3 or newer |
 | Fabric API | 0.156.0+26.2 or newer compatible 26.2 build |
@@ -26,6 +26,7 @@ remains on the Metal 3 compatibility stream.
 | Native deployment target | macOS 14.0 |
 | Metal 4 | Runtime-detected, optional hybrid path |
 | Sodium | Optional; 0.9.1 for Minecraft 26.2 is the compatibility target |
+| Iris | Optional; 1.11.2 for Minecraft 26.2 is the compatibility target |
 | Other operating systems / Intel Macs | Safe vanilla fallback, no MetalRender acceleration |
 
 The packaged native library is arm64-only. Metal 4 is never assumed from a
@@ -45,15 +46,20 @@ result in the settings screen and `/metalrender status`.
   fenced texture-to-buffer handoff.
 - Reworked IOSurface reuse around per-slot state and completion fences.
 - Corrected reversed-Z depth state and private OIT texture allocation.
-- Replaced the fixed 3 GiB native arena with a bounded working-set budget.
+- Replaced the fixed 3 GiB native arena with a startup budget that is capped
+  against Metal's `recommendedMaxWorkingSetSize`. This is a static safety cap,
+  not a runtime memory-pressure handler.
 - Added optional MetalFX scaling and runtime QoS controls.
 - Match the native frame-time budget to the active display refresh and the
   user's Minecraft FPS cap by default.
 - Disabled unvalidated mesh-shader and Hi-Z paths by default.
 - Added unit, JNI parity and packaged-JAR verification.
+- Added automatic Iris shader-pack compatibility pause plus an opt-in,
+  fail-open capture and GLSL-to-SPIR-V-to-MSL translation foundation.
 
 See [Metal 4 status](docs/METAL4_STATUS.md) for the exact implementation
-boundary and [the changelog](CHANGELOG.md) for release details.
+boundary, [Iris to Metal pipeline](docs/IRIS_METAL_PIPELINE.md) for the shader
+translation contract, and [the changelog](CHANGELOG.md) for release details.
 
 ## Install
 
@@ -133,8 +139,11 @@ path still uses unsafe raw OpenGL texture readback on the current macOS driver.
 See [COMMANDS.md](COMMANDS.md) for the complete command list.
 
 This beta is not a complete MTL4 renderer and carries no claim of stable visual
-parity or a guaranteed performance uplift. The native payload and lifecycle
-checks complement, but do not replace, visual comparison on real hardware.
+parity or a guaranteed performance uplift. Its opt-in Iris translator prepares
+SPIR-V/MSL cache artifacts in the background but does not replace Iris'
+OpenGL compilation or draws, so it does not currently increase Iris FPS. The
+native payload and lifecycle checks complement, but do not replace, visual
+comparison on real hardware.
 
 ## Reporting bugs
 

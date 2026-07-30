@@ -23,10 +23,12 @@ final class MetalRenderConfigTest {
   }
 
   @Test
+  @SuppressWarnings("deprecation")
   void copiedValuesAreValidated() {
     MetalRenderConfig source = MetalRenderConfig.defaults();
     source.targetFrameRate = -1;
     source.maxMemoryMB = Integer.MAX_VALUE;
+    source.enableMemoryPressureFallback = true;
     source.requireMetal4 = true;
     source.enableMetal4 = false;
     source.enableMeshShaders = true;
@@ -37,6 +39,7 @@ final class MetalRenderConfigTest {
 
     assertEquals(30, destination.targetFrameRate);
     assertEquals(2048, destination.maxMemoryMB);
+    assertFalse(destination.enableMemoryPressureFallback);
     assertTrue(destination.enableMetal4);
     assertFalse(destination.enableMeshShaders);
     assertFalse(destination.enableHiZCull);

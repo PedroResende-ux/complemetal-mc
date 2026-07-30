@@ -3,12 +3,12 @@
 This document distinguishes implemented behavior from planned work. It is part
 of the release contract: the status exposed by the game must match this table.
 
-| Area | `0.2.0-beta.1+mc26.2` status |
+| Area | `0.2.0-beta.2+mc26.2` status |
 | --- | --- |
 | Runtime API detection | Implemented |
-| Metal 4 command queue / allocator scaffold | Implemented when exposed by the OS |
+| Metal 4 command queue / allocator / completion probe | Implemented when exposed by the OS |
 | Runtime configuration and status reporting | Implemented |
-| Bounded native working-set budget | Implemented |
+| Static native arena startup cap | Implemented with `recommendedMaxWorkingSetSize` |
 | IOSurface slot ownership and completion fences | Implemented |
 | Reversed-Z depth state | Implemented |
 | MetalFX spatial scaling path | Implemented, opt-in; hardware conformance pending |
@@ -33,24 +33,30 @@ frame. Stable-release conformance must include deliberate late-failure tests.
 
 ## Backend names
 
-- `METAL4_HYBRID_METAL3_RENDER`: Metal 4 runtime objects are active, but draw
-  commands use the compatibility stream.
+- `METAL4_RUNTIME_VERIFIED_METAL3_RENDER`: an MTL4 command buffer was encoded,
+  committed and completed without feedback errors, but draw commands still use
+  the Metal 3 compatibility stream.
 - `METAL3`: Metal 4 was not requested.
 - `METAL3_FALLBACK_NO_METAL4`: Metal 4 was requested but is not exposed by the
   current device/operating-system runtime.
-- `METAL3_FALLBACK_METAL4_INIT_FAILED`: Metal 4 is exposed, but the queue or
-  allocator scaffold could not be created.
+- `METAL3_FALLBACK_METAL4_PROBE_PENDING`: MTL4 objects exist, but the completion
+  probe has not established a usable runtime.
+- `METAL3_FALLBACK_METAL4_PROBE_FAILED`: Metal 4 is exposed, but the real
+  command-buffer completion probe failed.
 - `UNAVAILABLE`: native initialization did not complete and Minecraft retains
   its normal renderer.
 
-`nIsMetal4Active()` reports the runtime scaffold. It must not be interpreted as
-proof that MTL4 draw encoding is active. `nIsMetal4DrawPathActive()` is the
-separate draw-path signal and is false in this release.
+`nIsMetal4Active()` reports the completed runtime probe. It must not be
+interpreted as proof that the renderer's draw stream uses MTL4.
+`nIsMetal4DrawPathActive()` is the separate draw-path signal and is false in
+this release.
 
 The packaged native-payload smoke test verifies extraction, initialization,
 ABI/status signals and selected resource lifetimes. The client game test adds
-world lifecycle and screenshot-file coverage. Neither test performs pixel
-comparison, so neither is proof of visual parity.
+world lifecycle plus coarse shader-toggle image checks. Those checks reject
+uniform output and verify that the re-enabled Iris image is closer to the
+initial Iris image than to the shaders-off image, but they are not full
+reference-image parity proof.
 
 ## Stable-release exit gate
 
@@ -65,7 +71,8 @@ Before changing the version from beta to stable:
    and transparency against the normal renderer.
 6. Exercise window resize, fullscreen, Retina scaling, sleep/wake and display
    hot-plug.
-7. Run a sustained memory-pressure and 200 Hz frame-pacing test.
+7. Run sustained high native-buffer allocation at the static device cap and a
+   200 Hz frame-pacing test.
 8. Confirm safe fallback with Metal 4 disabled and with the native library
    intentionally unavailable.
 9. Confirm entity/particle native replacement remains release-locked.

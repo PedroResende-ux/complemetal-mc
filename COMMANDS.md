@@ -33,14 +33,15 @@ The important fields are:
 
 - `Init state`: whether MetalRender reached the running state;
 - `Fallback reason`: why the normal Minecraft renderer was retained;
-- `Native backend`: `METAL4_HYBRID_METAL3_RENDER` means the Metal 4 runtime
-  scaffold is ready while draw encoding uses the Metal 3 compatibility path;
-- `Metal 4 runtime`: availability of the probed Metal 4 queue/allocator layer;
+- `Native backend`: `METAL4_RUNTIME_VERIFIED_METAL3_RENDER` means an MTL4
+  command buffer completed successfully while renderer draw encoding still
+  uses the Metal 3 compatibility path;
+- `Metal 4 runtime`: result of the real MTL4 command-buffer completion probe;
 - `Metal 4 draw path`: `Compatibility` is expected in the current release.
 
 `Ready` for the Metal 4 runtime is not proof of MTL4 draw encoding. For
-`0.2.0-beta.1+mc26.2`, the expected combination is runtime `Ready`, draw path
-`Compatibility`, and backend `METAL4_HYBRID_METAL3_RENDER`.
+`0.2.0-beta.2+mc26.2`, the expected combination is runtime `Ready`, draw path
+`Compatibility`, and backend `METAL4_RUNTIME_VERIFIED_METAL3_RENDER`.
 
 ## Recovery order
 

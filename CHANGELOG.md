@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.2.0-beta.2+mc26.2
+
+### Iris shader foundation
+
+- Pause and fully detach the hybrid Metal presentation path while an Iris
+  shader pack is active, retaining Iris' OpenGL renderer as the safe fallback.
+- Add an opt-in, bounded capture path for Iris' final linked GLSL stages.
+- Translate captured stages in process through shaderc to SPIR-V and
+  SPIRV-Cross to MSL without persisting source GLSL or program names.
+- Add content-addressed, integrity-checked SPIR-V/MSL artifacts and an
+  immutable, size-bounded disk cache.
+- Keep the bounded capture queue large enough for a complete shader-pack link,
+  then delay and throttle background translation so it does not compete with
+  Iris' initial shader-pack and world-load work.
+
+### Metal pipeline preparation
+
+- Replace the availability-only Metal 4 check with a real command-buffer,
+  compute-encoder and completion-feedback probe.
+- Populate Metal binary archives before pipeline creation, retry safely
+  without a bad archive and serialize cache updates atomically.
+- Add an inactive Metal 4 compiler/dataset serializer scaffold for future Iris
+  MSL pipelines. It is not connected to the draw path in this beta.
+
+### Verification
+
+- Add an isolated exact-release-JAR harness using Fabric, Iris, Sodium and
+  Complementary Reimagined with shader on/off/on screenshots.
+- Verify that Metal presentation and IOSurface ownership stop while Iris is
+  active and resume after shaders are disabled.
+- Validate the translation cache structure and support cold/warm cache runs.
+
+### Known boundary
+
+The translated MSL and future pipeline-cache plumbing are preparation only.
+Iris still compiles and executes its shader passes through OpenGL, and the
+translated artifacts are not submitted to a Metal render graph. Consequently
+this beta does not claim an average-FPS improvement from Iris translation; the
+opt-in translator can add startup work while the future execution path is
+unfinished.
+
 ## 0.2.0-beta.1+mc26.2
 
 ### Platform

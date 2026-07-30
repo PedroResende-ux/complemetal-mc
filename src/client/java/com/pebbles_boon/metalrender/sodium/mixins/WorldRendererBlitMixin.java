@@ -4,6 +4,7 @@ import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.backend.MetalRenderer;
+import com.pebbles_boon.metalrender.compat.IrisCompatibility;
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import com.pebbles_boon.metalrender.render.CapturedMatrices;
 import com.pebbles_boon.metalrender.render.MetalRenderHookState;
@@ -47,6 +48,13 @@ public class WorldRendererBlitMixin {
     metalrender$frameActive = false;
     if (!MetalRenderHookState.isGraphicsBackendSupported() ||
         !MetalRenderClient.isEnabled()) {
+      return;
+    }
+    if (IrisCompatibility.requiresShaderCompatibilityMode()) {
+      MetalRenderer renderer = MetalRenderClient.getRenderer();
+      if (renderer != null && renderer.getHandle() != 0) {
+        NativeBridge.nRecycleUnpresentedFrames(renderer.getHandle());
+      }
       return;
     }
     MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();

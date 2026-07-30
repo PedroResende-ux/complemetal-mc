@@ -1,0 +1,14 @@
+{
+  "required": false,
+  "minVersion": "0.8.7",
+  "package": "com.pebbles_boon.metalrender.compat.iris.mixin",
+  "plugin": "com.pebbles_boon.metalrender.compat.iris.mixin.IrisMixinPlugin",
+  "compatibilityLevel": "JAVA_25",
+  "mixins": [],
+  "client": [
+    "IrisShaderCreatorMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}

@@ -19,7 +19,13 @@ public final class MetalRenderConfig {
   public boolean prioritizeFpsOverTps = false;
   public int maxMemoryMB = 2048;
   public boolean enableTripleBuffering = true;
-  public boolean enableMemoryPressureFallback = true;
+
+  /**
+   * Retained for source and binary compatibility with older integrations.
+   * This flag never controlled a runtime memory-pressure handler and is ignored.
+   */
+  @Deprecated(forRemoval = false)
+  public boolean enableMemoryPressureFallback = false;
   public boolean enableBurstThreadMode = false;
   public boolean enableMeshShaders = false;
   public boolean enableArgumentBuffers = true;
@@ -109,8 +115,6 @@ public final class MetalRenderConfig {
           cfg.maxMemoryMB = obj.get("maxMemoryMB").getAsInt();
         if (obj.has("enableTripleBuffering"))
           cfg.enableTripleBuffering = obj.get("enableTripleBuffering").getAsBoolean();
-        if (obj.has("enableMemoryPressureFallback"))
-          cfg.enableMemoryPressureFallback = obj.get("enableMemoryPressureFallback").getAsBoolean();
         if (obj.has("enableBurstThreadMode"))
           cfg.enableBurstThreadMode = obj.get("enableBurstThreadMode").getAsBoolean();
         if (obj.has("enableMeshShaders"))
@@ -202,7 +206,6 @@ public final class MetalRenderConfig {
       obj.addProperty("prioritizeFpsOverTps", prioritizeFpsOverTps);
       obj.addProperty("maxMemoryMB", maxMemoryMB);
       obj.addProperty("enableTripleBuffering", enableTripleBuffering);
-      obj.addProperty("enableMemoryPressureFallback", enableMemoryPressureFallback);
       obj.addProperty("enableBurstThreadMode", enableBurstThreadMode);
       obj.addProperty("enableMeshShaders", enableMeshShaders);
       obj.addProperty("enableArgumentBuffers", enableArgumentBuffers);
@@ -361,7 +364,6 @@ public final class MetalRenderConfig {
     prioritizeFpsOverTps = other.prioritizeFpsOverTps;
     maxMemoryMB = other.maxMemoryMB;
     enableTripleBuffering = other.enableTripleBuffering;
-    enableMemoryPressureFallback = other.enableMemoryPressureFallback;
     enableBurstThreadMode = other.enableBurstThreadMode;
     enableMeshShaders = other.enableMeshShaders;
     enableArgumentBuffers = other.enableArgumentBuffers;

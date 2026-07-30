@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender.render;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.pebbles_boon.metalrender.MetalRenderClient;
+import com.pebbles_boon.metalrender.compat.IrisCompatibility;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import java.util.Locale;
@@ -39,6 +40,10 @@ public final class MetalRenderHookState {
   private static boolean pendingParticleCaptureComplete;
   private static int screenshotFallbackFrames;
   private static long lastFailureLogNanos;
+  private static volatile long successfulPresentationCount;
+  private static volatile long screenshotCaptureCount;
+  private static volatile boolean lastScreenshotUsedMetal;
+  private static volatile long lastScreenshotPresentationCount;
   private static MetalWorldRenderer activeWorldRenderer;
 
   private MetalRenderHookState() {
@@ -127,6 +132,9 @@ public final class MetalRenderHookState {
     } else if (screenshotFallbackFrames > 0) {
       screenshotFallbackFrames--;
     }
+    if (IrisCompatibility.requiresShaderCompatibilityMode()) {
+      presentationReady = false;
+    }
   }
 
   public static void markFramePrepared() {
@@ -156,10 +164,44 @@ public final class MetalRenderHookState {
   }
 
   public static void markPresentationSucceeded() {
-    if (framePrepared && frameFinished) {
+    if (!framePresented && framePrepared && frameFinished) {
       presentationReady = true;
       framePresented = true;
+      successfulPresentationCount++;
     }
+  }
+
+  /**
+   * Process-session monotonic count used by black-box release QA. Unlike the
+   * per-frame handshake it deliberately survives Iris compatibility pauses.
+   */
+  public static long successfulPresentationCount() {
+    return successfulPresentationCount;
+  }
+
+  /**
+   * Called from the screenshot readback hook after the render that supplies the
+   * image. This ties release-QA evidence to the exact captured frame rather than
+   * to an unrelated presentation before or after it.
+   */
+  public static void recordScreenshotCapture() {
+    boolean usedMetal = framePresented && framePrepared && frameFinished;
+    lastScreenshotUsedMetal = usedMetal;
+    lastScreenshotPresentationCount =
+        usedMetal ? successfulPresentationCount : 0;
+    screenshotCaptureCount++;
+  }
+
+  public static long screenshotCaptureCount() {
+    return screenshotCaptureCount;
+  }
+
+  public static boolean lastScreenshotUsedMetal() {
+    return lastScreenshotUsedMetal;
+  }
+
+  public static long lastScreenshotPresentationCount() {
+    return lastScreenshotPresentationCount;
   }
 
   public static void failOpen(String stage, Throwable error) {
@@ -209,6 +251,7 @@ public final class MetalRenderHookState {
   public static boolean canReplaceTerrain() {
     MetalRenderConfig config = MetalRenderClient.getConfig();
     return config != null && config.enableFastTerrainReplacement &&
+        !IrisCompatibility.requiresShaderCompatibilityMode() &&
         screenshotFallbackFrames == 0 &&
         isMetalFrameUsable() && presentationReady;
   }
@@ -226,7 +269,8 @@ public final class MetalRenderHookState {
   }
 
   public static boolean canPresentFrame() {
-    return !framePresented && screenshotFallbackFrames == 0 &&
+    return !IrisCompatibility.requiresShaderCompatibilityMode() &&
+        !framePresented && screenshotFallbackFrames == 0 &&
         isMetalFrameUsable() && frameFinished;
   }
 

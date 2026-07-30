@@ -11,9 +11,11 @@
 #import <OpenGL/gl.h>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <jni.h>
@@ -21,6 +23,7 @@
 #include <mach/mach.h>
 #include <mach/mach_host.h>
 #include <mach/mach_time.h>
+#include <memory>
 #include <mutex>
 #include <pthread/qos.h>
 #include <shared_mutex>
@@ -78,11 +81,15 @@ static id<MTLCommandBuffer> g_lastTextureUploadCommandBuffer = nil;
 static std::atomic<bool> g_metal4Requested{false};
 static std::atomic<bool> g_metal4Supported{false};
 static std::atomic<bool> g_metal4ScaffoldActive{false};
+static std::atomic<bool> g_metal4RuntimeVerified{false};
+static std::atomic<bool> g_metal4ProbeAttempted{false};
 static std::atomic<bool> g_metal4DrawPathActive{false};
-// These are deliberately kept as id and obtained through runtime selectors so
-// the dylib remains weak-link safe on pre-macOS 26 systems.
+// Keep long-lived references dynamically typed so merely loading the dylib on
+// macOS 14/15 cannot require a Metal 4 protocol. They are assigned and used as
+// typed MTL4 objects only inside explicit macOS 26 availability guards.
 static id g_metal4CommandQueue = nil;
 static id g_metal4CommandAllocator = nil;
+static std::mutex g_metal4Mutex;
 static std::atomic<bool> g_tripleBufferingEnabled{true};
 static std::atomic<int> g_activeSurfaceSlots{3};
 static std::unordered_map<uint64_t, id<MTLBuffer>> g_buffers;
@@ -625,41 +632,141 @@ static void recreate_mega_vertex_buffer_if_empty() {
   }
 }
 
+struct Metal4ProbeState {
+  dispatch_semaphore_t done;
+  std::atomic<bool> completed{false};
+  std::atomic<bool> succeeded{false};
+  id allocator;
+
+  explicit Metal4ProbeState(id probeAllocator)
+      : done(dispatch_semaphore_create(0)),
+        allocator([probeAllocator retain]) {}
+
+  ~Metal4ProbeState() {
+    if (allocator)
+      [allocator release];
+#if !OS_OBJECT_USE_OBJC
+    if (done)
+      dispatch_release(done);
+#endif
+  }
+};
+
+static bool verify_metal4_runtime(id queueObject) {
+  if (!queueObject || !g_device)
+    return false;
+  if (@available(macOS 26.0, *)) {
+    id<MTL4CommandAllocator> probeAllocator = nil;
+    id<MTL4CommandBuffer> commandBuffer = nil;
+    MTL4CommitOptions *options = nil;
+    @try {
+      id<MTL4CommandQueue> queue =
+          (id<MTL4CommandQueue>)queueObject;
+      probeAllocator = [g_device newCommandAllocator];
+      commandBuffer = [g_device newCommandBuffer];
+      if (!probeAllocator || !commandBuffer) {
+        if (probeAllocator)
+          [probeAllocator release];
+        if (commandBuffer)
+          [commandBuffer release];
+        return false;
+      }
+
+      [commandBuffer beginCommandBufferWithAllocator:probeAllocator];
+      id<MTL4ComputeCommandEncoder> encoder =
+          [commandBuffer computeCommandEncoder];
+      if (!encoder) {
+        [commandBuffer endCommandBuffer];
+        [commandBuffer release];
+        [probeAllocator release];
+        return false;
+      }
+      [encoder endEncoding];
+      [commandBuffer endCommandBuffer];
+
+      auto state = std::make_shared<Metal4ProbeState>(probeAllocator);
+      options = [[MTL4CommitOptions alloc] init];
+      auto callbackState = state;
+      [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        bool ok = feedback != nil && feedback.error == nil;
+        callbackState->succeeded.store(ok, std::memory_order_release);
+        callbackState->completed.store(true, std::memory_order_release);
+        // The allocator may only be reset after the submitted GPU work is done.
+        id<MTL4CommandAllocator> completedAllocator =
+            (id<MTL4CommandAllocator>)callbackState->allocator;
+        [completedAllocator reset];
+        dispatch_semaphore_signal(callbackState->done);
+      }];
+
+      id<MTL4CommandBuffer> buffers[] = {commandBuffer};
+      [queue commit:buffers count:1 options:options];
+      long waitResult = dispatch_semaphore_wait(
+          state->done,
+          dispatch_time(DISPATCH_TIME_NOW, 2LL * NSEC_PER_SEC));
+      bool verified =
+          waitResult == 0 &&
+          state->completed.load(std::memory_order_acquire) &&
+          state->succeeded.load(std::memory_order_acquire);
+
+      [options release];
+      [commandBuffer release];
+      [probeAllocator release];
+      return verified;
+    } @catch (NSException *exception) {
+      dbg("WARN: Metal 4 probe raised %s: %s\n",
+          exception.name.UTF8String ?: "NSException",
+          exception.reason.UTF8String ?: "unknown reason");
+      if (options)
+        [options release];
+      if (commandBuffer)
+        [commandBuffer release];
+      if (probeAllocator)
+        [probeAllocator release];
+      return false;
+    }
+  }
+  return false;
+}
+
 static void configure_metal4_scaffold() {
   if (!g_device)
     return;
+  std::lock_guard<std::mutex> lock(g_metal4Mutex);
   bool supported = false;
   if (@available(macOS 26.0, *)) {
-    SEL queueSelector = NSSelectorFromString(@"newMTL4CommandQueue");
-    SEL allocatorSelector = NSSelectorFromString(@"newCommandAllocator");
     supported = NSClassFromString(@"MTL4CommandQueueDescriptor") != Nil &&
-                [g_device respondsToSelector:queueSelector] &&
-                [g_device respondsToSelector:allocatorSelector];
+                [g_device respondsToSelector:@selector(newMTL4CommandQueue)] &&
+                [g_device respondsToSelector:@selector(newCommandAllocator)] &&
+                [g_device respondsToSelector:@selector(newCommandBuffer)];
     g_metal4Supported.store(supported, std::memory_order_release);
     if (supported && g_metal4Requested.load(std::memory_order_acquire) &&
-        !g_metal4ScaffoldActive.load(std::memory_order_acquire)) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-      id queue = [g_device performSelector:queueSelector];
-      id allocator = [g_device performSelector:allocatorSelector];
-#pragma clang diagnostic pop
-      if (queue && allocator) {
+        !g_metal4ProbeAttempted.exchange(true, std::memory_order_acq_rel)) {
+      id<MTL4CommandQueue> queue = [g_device newMTL4CommandQueue];
+      id<MTL4CommandAllocator> allocator =
+          [g_device newCommandAllocator];
+      bool verified = queue && allocator && verify_metal4_runtime(queue);
+      if (verified) {
         g_metal4CommandQueue = queue;
         g_metal4CommandAllocator = allocator;
         g_metal4ScaffoldActive.store(true, std::memory_order_release);
-        dbg("Metal 4 runtime scaffold ready (queue + allocator); rendering "
+        g_metal4RuntimeVerified.store(true, std::memory_order_release);
+        dbg("Metal 4 runtime verified by command-buffer completion; rendering "
             "remains on the compatibility command stream\n");
       } else {
         if (queue)
           [queue release];
         if (allocator)
           [allocator release];
-        dbg("WARN: Metal 4 runtime objects could not be created; using Metal "
-            "3 fallback\n");
+        g_metal4ScaffoldActive.store(false, std::memory_order_release);
+        g_metal4RuntimeVerified.store(false, std::memory_order_release);
+        dbg("WARN: Metal 4 command-buffer probe failed; using Metal 3 "
+            "fallback\n");
       }
     }
   } else {
     g_metal4Supported.store(false, std::memory_order_release);
+    g_metal4ScaffoldActive.store(false, std::memory_order_release);
+    g_metal4RuntimeVerified.store(false, std::memory_order_release);
   }
 }
 
@@ -939,12 +1046,76 @@ static MetalFeatureCaps current_feature_caps() {
 
 static id<MTLBinaryArchive> g_pipelineArchive = nil;
 static NSString *g_archivePath = nil;
+static std::mutex g_pipelineArchiveMutex;
+static bool g_pipelineArchiveDirty = false;
+static std::atomic<uint32_t> g_pipelineArchiveWarningCount{0};
+
+static void pipeline_archive_warning(const char *operation,
+                                     const char *detail) {
+  uint32_t warningNumber =
+      g_pipelineArchiveWarningCount.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (warningNumber <= 8 || (warningNumber % 128) == 0) {
+    fprintf(stderr, "[MetalRender] WARN: Pipeline cache %s: %s "
+                    "(warning #%u)\n",
+            operation, detail ? detail : "unknown error", warningNumber);
+    fflush(stderr);
+    dbg("WARN: Pipeline cache %s: %s (warning #%u)\n", operation,
+        detail ? detail : "unknown error", warningNumber);
+  }
+}
+
+static void pipeline_archive_warning(const char *operation, NSError *error) {
+  pipeline_archive_warning(
+      operation,
+      error ? [[error localizedDescription] UTF8String] : "unknown error");
+}
+
+static id<MTLBinaryArchive> new_empty_pipeline_archive(NSError **outErr) {
+  MTLBinaryArchiveDescriptor *descriptor =
+      [[MTLBinaryArchiveDescriptor alloc] init];
+  id<MTLBinaryArchive> archive =
+      [g_device newBinaryArchiveWithDescriptor:descriptor error:outErr];
+  [descriptor release];
+  return archive;
+}
 
 static id<MTLRenderPipelineState>
 makePipeline(MTLRenderPipelineDescriptor *desc, NSError **outErr) {
   if (@available(macOS 11.0, *)) {
-    if (g_pipelineArchive)
-      desc.binaryArchives = @[ g_pipelineArchive ];
+    if (g_pipelineArchive) {
+      std::lock_guard<std::mutex> lock(g_pipelineArchiveMutex);
+      NSArray<id<MTLBinaryArchive>> *originalArchives = desc.binaryArchives;
+      NSError *populationError = nil;
+      BOOL populated = [g_pipelineArchive
+          addRenderPipelineFunctionsWithDescriptor:desc
+                                             error:&populationError];
+      if (!populated) {
+        pipeline_archive_warning("render population failed", populationError);
+      } else {
+        g_pipelineArchiveDirty = true;
+        desc.binaryArchives = @[ g_pipelineArchive ];
+      }
+
+      NSError *creationError = nil;
+      id<MTLRenderPipelineState> pipeline =
+          [g_device newRenderPipelineStateWithDescriptor:desc
+                                                   error:&creationError];
+      if (!pipeline && populated) {
+        // An archive can become unusable after an OS, GPU, driver, or shader
+        // change. A cache hit must never prevent the pipeline from compiling.
+        pipeline_archive_warning("render-assisted creation failed; retrying "
+                                 "without the archive",
+                                 creationError);
+        desc.binaryArchives = originalArchives;
+        creationError = nil;
+        pipeline = [g_device newRenderPipelineStateWithDescriptor:desc
+                                                            error:&creationError];
+      }
+      desc.binaryArchives = originalArchives;
+      if (outErr)
+        *outErr = creationError;
+      return pipeline;
+    }
   }
   return [g_device newRenderPipelineStateWithDescriptor:desc error:outErr];
 }
@@ -952,20 +1123,231 @@ makePipeline(MTLRenderPipelineDescriptor *desc, NSError **outErr) {
 static id<MTLComputePipelineState> makeComputePipeline(id<MTLFunction> func,
                                                        NSError **outErr) {
   if (@available(macOS 11.0, *)) {
+    MTLComputePipelineDescriptor *descriptor =
+        [[MTLComputePipelineDescriptor alloc] init];
+    descriptor.computeFunction = func;
     if (g_pipelineArchive) {
-      MTLComputePipelineDescriptor *cd =
-          [[MTLComputePipelineDescriptor alloc] init];
-      cd.computeFunction = func;
-      cd.binaryArchives = @[ g_pipelineArchive ];
-      return
-          [g_device newComputePipelineStateWithDescriptor:cd
-                                                  options:MTLPipelineOptionNone
-                                               reflection:nil
-                                                    error:outErr];
+      std::lock_guard<std::mutex> lock(g_pipelineArchiveMutex);
+      NSError *populationError = nil;
+      BOOL populated = [g_pipelineArchive
+          addComputePipelineFunctionsWithDescriptor:descriptor
+                                              error:&populationError];
+      if (!populated) {
+        pipeline_archive_warning("compute population failed", populationError);
+      } else {
+        g_pipelineArchiveDirty = true;
+        descriptor.binaryArchives = @[ g_pipelineArchive ];
+      }
+
+      NSError *creationError = nil;
+      id<MTLComputePipelineState> pipeline =
+          [g_device newComputePipelineStateWithDescriptor:descriptor
+                                                   options:MTLPipelineOptionNone
+                                                reflection:nil
+                                                     error:&creationError];
+      if (!pipeline && populated) {
+        pipeline_archive_warning("compute-assisted creation failed; retrying "
+                                 "without the archive",
+                                 creationError);
+        descriptor.binaryArchives = nil;
+        creationError = nil;
+        pipeline =
+            [g_device newComputePipelineStateWithDescriptor:descriptor
+                                                    options:MTLPipelineOptionNone
+                                                 reflection:nil
+                                                      error:&creationError];
+      }
+      [descriptor release];
+      if (outErr)
+        *outErr = creationError;
+      return pipeline;
     }
+    id<MTLComputePipelineState> pipeline =
+        [g_device newComputePipelineStateWithDescriptor:descriptor
+                                                options:MTLPipelineOptionNone
+                                             reflection:nil
+                                                  error:outErr];
+    [descriptor release];
+    return pipeline;
   }
   return [g_device newComputePipelineStateWithFunction:func error:outErr];
 }
+
+static void serialize_pipeline_archive_atomically() {
+  if (@available(macOS 11.0, *)) {
+    if (!g_pipelineArchive || !g_archivePath)
+      return;
+
+    std::lock_guard<std::mutex> lock(g_pipelineArchiveMutex);
+    if (!g_pipelineArchiveDirty)
+      return;
+
+    // Metal writes a complete archive to a sibling temporary path. POSIX
+    // rename then replaces the prior cache in one filesystem operation, so a
+    // crash or serialization failure leaves the known-old file untouched.
+    NSString *temporaryPath = [NSString
+        stringWithFormat:@"%@.tmp.%@", g_archivePath,
+                         [[NSUUID UUID] UUIDString]];
+    NSURL *temporaryURL = [NSURL fileURLWithPath:temporaryPath];
+    NSError *serializationError = nil;
+    BOOL serialized =
+        [g_pipelineArchive serializeToURL:temporaryURL
+                                   error:&serializationError];
+    if (!serialized) {
+      pipeline_archive_warning("serialization failed", serializationError);
+      [[NSFileManager defaultManager] removeItemAtPath:temporaryPath
+                                                error:nil];
+      return;
+    }
+
+    int renameResult =
+        rename([temporaryPath fileSystemRepresentation],
+               [g_archivePath fileSystemRepresentation]);
+    if (renameResult != 0) {
+      pipeline_archive_warning("atomic replace failed", std::strerror(errno));
+      [[NSFileManager defaultManager] removeItemAtPath:temporaryPath
+                                                error:nil];
+      return;
+    }
+
+    g_pipelineArchiveDirty = false;
+    dbg("Pipeline archive saved atomically to: %s\n",
+        [g_archivePath UTF8String]);
+  }
+}
+
+// Metal 4 uses MTL4Compiler + MTL4PipelineDataSetSerializer rather than
+// MTLBinaryArchive. Keep this context wholly separate from the current Metal 3
+// renderer. It is deliberately uncalled until translated Iris MSL pipelines
+// are actually created, and therefore does not imply a Metal 4 draw path.
+static id g_irisMetal4PipelineSerializer = nil;
+static id g_irisMetal4Compiler = nil;
+static id g_irisMetal4LookupArchive = nil;
+static NSString *g_irisMetal4ArchivePath = nil;
+static std::mutex g_irisMetal4PipelineCacheMutex;
+
+[[maybe_unused]] static bool
+prepare_iris_metal4_pipeline_cache_for_translated_msl() {
+  if (!g_device ||
+      !g_metal4RuntimeVerified.load(std::memory_order_acquire))
+    return false;
+  if (@available(macOS 26.0, *)) {
+    std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
+    if (g_irisMetal4Compiler && g_irisMetal4PipelineSerializer)
+      return true;
+
+    if (![g_device
+            respondsToSelector:
+                @selector(newPipelineDataSetSerializerWithDescriptor:)] ||
+        ![g_device respondsToSelector:@selector(newCompilerWithDescriptor:
+                                                       error:)]) {
+      return false;
+    }
+
+    MTL4PipelineDataSetSerializerDescriptor *serializerDescriptor =
+        [[MTL4PipelineDataSetSerializerDescriptor alloc] init];
+    serializerDescriptor.configuration =
+        MTL4PipelineDataSetSerializerConfigurationCaptureBinaries;
+    id<MTL4PipelineDataSetSerializer> serializer =
+        [g_device
+            newPipelineDataSetSerializerWithDescriptor:serializerDescriptor];
+    [serializerDescriptor release];
+    if (!serializer)
+      return false;
+
+    MTL4CompilerDescriptor *compilerDescriptor =
+        [[MTL4CompilerDescriptor alloc] init];
+    compilerDescriptor.label =
+        @"MetalRender translated Iris MSL pipeline compiler";
+    compilerDescriptor.pipelineDataSetSerializer = serializer;
+    NSError *compilerError = nil;
+    id<MTL4Compiler> compiler =
+        [g_device newCompilerWithDescriptor:compilerDescriptor
+                                      error:&compilerError];
+    [compilerDescriptor release];
+    if (!compiler) {
+      pipeline_archive_warning("Metal 4 translated-pipeline compiler setup "
+                               "failed",
+                               compilerError);
+      [serializer release];
+      return false;
+    }
+
+    NSArray *cacheDirectories = NSSearchPathForDirectoriesInDomains(
+        NSCachesDirectory, NSUserDomainMask, YES);
+    NSString *cacheDirectory =
+        cacheDirectories.count > 0 ? cacheDirectories[0]
+                                   : NSTemporaryDirectory();
+    g_irisMetal4ArchivePath = [[cacheDirectory
+        stringByAppendingPathComponent:
+            @"metalrender_iris_pipeline_cache.mtl4archive"] copy];
+    if ([[NSFileManager defaultManager]
+            fileExistsAtPath:g_irisMetal4ArchivePath]) {
+      NSError *archiveError = nil;
+      id<MTL4Archive> lookupArchive =
+          [g_device
+              newArchiveWithURL:
+                  [NSURL fileURLWithPath:g_irisMetal4ArchivePath]
+                           error:&archiveError];
+      if (lookupArchive) {
+        g_irisMetal4LookupArchive = lookupArchive;
+      } else {
+        // Preserve the on-disk archive. Future translated pipeline builds can
+        // proceed with an empty lookup set and later atomically replace it.
+        pipeline_archive_warning("Metal 4 translated-pipeline archive load "
+                                 "failed; continuing empty",
+                                 archiveError);
+      }
+    }
+
+    g_irisMetal4PipelineSerializer = serializer;
+    g_irisMetal4Compiler = compiler;
+    return true;
+  }
+  return false;
+}
+
+[[maybe_unused]] static bool
+serialize_iris_metal4_pipeline_cache_after_translated_builds() {
+  if (@available(macOS 26.0, *)) {
+    std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
+    if (!g_irisMetal4PipelineSerializer || !g_irisMetal4ArchivePath)
+      return false;
+
+    NSString *temporaryPath = [NSString
+        stringWithFormat:@"%@.tmp.%@", g_irisMetal4ArchivePath,
+                         [[NSUUID UUID] UUIDString]];
+    NSError *serializationError = nil;
+    BOOL serialized =
+        [(id<MTL4PipelineDataSetSerializer>)g_irisMetal4PipelineSerializer
+            serializeAsArchiveAndFlushToURL:
+                [NSURL fileURLWithPath:temporaryPath]
+                                      error:&serializationError];
+    if (!serialized) {
+      pipeline_archive_warning("Metal 4 translated-pipeline serialization "
+                               "failed",
+                               serializationError);
+      [[NSFileManager defaultManager] removeItemAtPath:temporaryPath
+                                                error:nil];
+      return false;
+    }
+
+    int renameResult =
+        rename([temporaryPath fileSystemRepresentation],
+               [g_irisMetal4ArchivePath fileSystemRepresentation]);
+    if (renameResult != 0) {
+      pipeline_archive_warning("Metal 4 translated-pipeline atomic replace "
+                               "failed",
+                               std::strerror(errno));
+      [[NSFileManager defaultManager] removeItemAtPath:temporaryPath
+                                                error:nil];
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 static void load_shaders() {
   dbg("load_shaders() called: device=%p shaderLibrary=%p\n", g_device,
       g_shaderLibrary);
@@ -978,20 +1360,37 @@ static void load_shaders() {
         NSCachesDirectory, NSUserDomainMask, YES);
     NSString *cacheDir =
         (caches.count > 0) ? caches[0] : NSTemporaryDirectory();
-    g_archivePath = [cacheDir
-        stringByAppendingPathComponent:@"metalrender_pipeline_cache.metallib"];
+    g_archivePath = [[cacheDir
+        stringByAppendingPathComponent:@"metalrender_pipeline_cache.metallib"]
+        copy];
     MTLBinaryArchiveDescriptor *archDesc =
         [[MTLBinaryArchiveDescriptor alloc] init];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:g_archivePath]) {
+    BOOL existingArchive =
+        [[NSFileManager defaultManager] fileExistsAtPath:g_archivePath];
+    if (existingArchive) {
       archDesc.url = [NSURL fileURLWithPath:g_archivePath];
       dbg("Loading pipeline cache from: %s\n", [g_archivePath UTF8String]);
     }
     NSError *archErr = nil;
     g_pipelineArchive = [g_device newBinaryArchiveWithDescriptor:archDesc
                                                            error:&archErr];
-    if (!g_pipelineArchive && archErr) {
-      dbg("WARN: Could not create MTLBinaryArchive: %s\n",
-          [[archErr localizedDescription] UTF8String]);
+    [archDesc release];
+    if (!g_pipelineArchive && existingArchive) {
+      pipeline_archive_warning(
+          "load failed; preserving the old file and retrying empty", archErr);
+      NSError *emptyArchiveError = nil;
+      g_pipelineArchive =
+          new_empty_pipeline_archive(&emptyArchiveError);
+      if (!g_pipelineArchive) {
+        pipeline_archive_warning("empty fallback creation failed",
+                                 emptyArchiveError);
+      } else {
+        dbg("Pipeline cache recovery is using an empty in-memory archive; "
+            "the old file stays untouched until a complete replacement is "
+            "serialized\n");
+      }
+    } else if (!g_pipelineArchive) {
+      pipeline_archive_warning("empty archive creation failed", archErr);
     }
   }
 
@@ -1748,19 +2147,7 @@ fragment float4 fragment_particle(
     dbg("Created 1x1 white fallback atlas texture\n");
   }
 
-  if (@available(macOS 11.0, *)) {
-    if (g_pipelineArchive && g_archivePath) {
-      NSError *serErr = nil;
-      BOOL ok = [g_pipelineArchive
-          serializeToURL:[NSURL fileURLWithPath:g_archivePath]
-                   error:&serErr];
-      if (!ok)
-        dbg("WARN: Could not serialize pipeline archive: %s\n",
-            serErr ? [[serErr localizedDescription] UTF8String] : "unknown");
-      else
-        dbg("Pipeline archive saved to: %s\n", [g_archivePath UTF8String]);
-    }
-  }
+  serialize_pipeline_archive_atomically();
   dbg("Shaders loaded: terrain inhouse=%p opaque=%p entity=%p "
       "entityTranslucent=%p entityEmissive=%p depth=%p\n",
       g_pipelineInhouse, g_pipelineOpaque, g_pipelineEntity,
@@ -2308,8 +2695,11 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nConfigureRuntime(
   recreate_mega_vertex_buffer_if_empty();
   if (enableMetal4 == JNI_TRUE) {
     configure_metal4_scaffold();
-  } else if (g_metal4ScaffoldActive.exchange(false,
-                                              std::memory_order_acq_rel)) {
+  } else {
+    std::lock_guard<std::mutex> lock(g_metal4Mutex);
+    g_metal4ScaffoldActive.store(false, std::memory_order_release);
+    g_metal4RuntimeVerified.store(false, std::memory_order_release);
+    g_metal4ProbeAttempted.store(false, std::memory_order_release);
     if (g_metal4CommandQueue) {
       [g_metal4CommandQueue release];
       g_metal4CommandQueue = nil;
@@ -2319,10 +2709,10 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nConfigureRuntime(
       g_metal4CommandAllocator = nil;
     }
   }
-  dbg("Runtime configured: metal4Requested=%d metal4Scaffold=%d "
+  dbg("Runtime configured: metal4Requested=%d metal4Verified=%d "
       "arena=%zuMB target=%.2fms surfaces=%d\n",
       enableMetal4 == JNI_TRUE ? 1 : 0,
-      g_metal4ScaffoldActive.load(std::memory_order_relaxed) ? 1 : 0,
+      g_metal4RuntimeVerified.load(std::memory_order_relaxed) ? 1 : 0,
       g_megaVBCapacity / kMiB, g_targetFrameTimeMs,
       g_activeSurfaceSlots.load(std::memory_order_relaxed));
 }
@@ -2337,10 +2727,10 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSupportsMetal4(
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nIsMetal4Active(
     JNIEnv *, jclass) {
-  // "Active" here means the macOS 26 runtime accepted the MTL4 queue and
-  // command-allocator scaffold. Use nIsMetal4DrawPathActive to distinguish the
-  // later, fully migrated encoder/pipeline path from this hybrid mode.
-  return g_metal4ScaffoldActive.load(std::memory_order_acquire) ? JNI_TRUE
+  // "Active" means an actual MTL4 command buffer was encoded, committed and
+  // completed without feedback errors. Use nIsMetal4DrawPathActive to
+  // distinguish the later fully migrated encoder/pipeline path.
+  return g_metal4RuntimeVerified.load(std::memory_order_acquire) ? JNI_TRUE
                                                                 : JNI_FALSE;
 }
 extern "C" JNIEXPORT jboolean JNICALL
@@ -2355,11 +2745,13 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetBackendMode(
   const char *mode = "METAL3";
   if (g_metal4DrawPathActive.load(std::memory_order_acquire)) {
     mode = "METAL4";
+  } else if (g_metal4RuntimeVerified.load(std::memory_order_acquire)) {
+    mode = "METAL4_RUNTIME_VERIFIED_METAL3_RENDER";
   } else if (g_metal4ScaffoldActive.load(std::memory_order_acquire)) {
-    mode = "METAL4_HYBRID_METAL3_RENDER";
+    mode = "METAL3_FALLBACK_METAL4_PROBE_PENDING";
   } else if (g_metal4Requested.load(std::memory_order_acquire) &&
              g_metal4Supported.load(std::memory_order_acquire)) {
-    mode = "METAL3_FALLBACK_METAL4_INIT_FAILED";
+    mode = "METAL3_FALLBACK_METAL4_PROBE_FAILED";
   } else if (g_metal4Requested.load(std::memory_order_acquire) &&
              !g_metal4Supported.load(std::memory_order_acquire)) {
     mode = "METAL3_FALLBACK_NO_METAL4";
@@ -5296,6 +5688,44 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nRecycleUnpresented
   if (recycled)
     g_surfaceSlotChanged.notify_all();
 }
+extern "C" JNIEXPORT void JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nReleaseBoundPresentationSurface(
+    JNIEnv *, jclass, jlong handle) {
+  (void)handle;
+  {
+    std::lock_guard<std::mutex> lock(g_surfaceSlotMutex);
+    int boundSlot = g_glBoundSlot.exchange(-1, std::memory_order_acq_rel);
+    if (boundSlot >= 0 && boundSlot < kTripleBufferCount &&
+        g_tbSlotState[boundSlot].load(std::memory_order_acquire) ==
+            SurfaceSlotBoundToGL) {
+      // The Java caller finishes GL and deletes/detaches its rectangle texture
+      // before this hand-off. Releasing only the slot explicitly owned by GL
+      // preserves the normal ReadyForPresentation recycling rules.
+      g_tbSlotState[boundSlot].store(SurfaceSlotAvailable,
+                                     std::memory_order_release);
+    }
+
+    int lastCompleted =
+        g_tbLastCompleted.load(std::memory_order_acquire);
+    if (lastCompleted == boundSlot || lastCompleted < 0 ||
+        lastCompleted >= kTripleBufferCount ||
+        g_tbSlotState[lastCompleted].load(std::memory_order_acquire) !=
+            SurfaceSlotReadyForPresentation) {
+      int replacementCompleted = -1;
+      for (int slot = 0; slot < kTripleBufferCount; slot++) {
+        if (g_tbSlotState[slot].load(std::memory_order_acquire) ==
+            SurfaceSlotReadyForPresentation) {
+          replacementCompleted = slot;
+        }
+      }
+      g_tbLastCompleted.store(replacementCompleted,
+                              std::memory_order_release);
+      g_currentFrameReady.store(replacementCompleted >= 0,
+                                std::memory_order_release);
+    }
+  }
+  g_surfaceSlotChanged.notify_all();
+}
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nBindIOSurfaceToTexture(
     JNIEnv *, jclass, jlong handle, jint glTexture) {
@@ -5368,20 +5798,61 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nReadbackPixels(
     JNIEnv *env, jclass, jlong handle, jobject dest) {
   (void)handle;
-  if (!g_color || !dest || !env)
+  if (!dest || !env)
     return JNI_FALSE;
   void *destPtr = env->GetDirectBufferAddress(dest);
   if (!destPtr)
     return JNI_FALSE;
-  int w = (int)g_color.width;
-  int h = (int)g_color.height;
-  jlong capacity = env->GetDirectBufferCapacity(dest);
-  if (capacity < (jlong)(w * h * 4))
-    return JNI_FALSE;
-  [g_color getBytes:destPtr
-        bytesPerRow:(NSUInteger)(w * 4)
-         fromRegion:MTLRegionMake2D(0, 0, w, h)
-        mipmapLevel:0];
+  {
+    std::lock_guard<std::mutex> lock(g_surfaceSlotMutex);
+    int readbackSlot = g_tbLastCompleted.load(std::memory_order_acquire);
+    if (readbackSlot < 0 ||
+        g_tbSlotState[readbackSlot].load(std::memory_order_acquire) !=
+            SurfaceSlotReadyForPresentation) {
+      readbackSlot = -1;
+      for (int slot = 0; slot < kTripleBufferCount; slot++) {
+        if (g_tbSlotState[slot].load(std::memory_order_acquire) ==
+            SurfaceSlotReadyForPresentation) {
+          readbackSlot = slot;
+          break;
+        }
+      }
+    }
+    if (readbackSlot < 0 || !g_tbColor[readbackSlot] ||
+        g_tbSlotState[readbackSlot].load(std::memory_order_acquire) !=
+            SurfaceSlotReadyForPresentation) {
+      return JNI_FALSE;
+    }
+
+    id<MTLTexture> readbackTexture = g_tbColor[readbackSlot];
+    int w = (int)readbackTexture.width;
+    int h = (int)readbackTexture.height;
+    jlong capacity = env->GetDirectBufferCapacity(dest);
+    if (w <= 0 || h <= 0 || capacity < (jlong)(w * h * 4))
+      return JNI_FALSE;
+
+    // ReadyForPresentation is published only by the command-buffer completion
+    // handler. Holding the slot lock keeps this exact completed texture from
+    // being recycled while the conservative CPU fallback copies it.
+    [readbackTexture getBytes:destPtr
+                  bytesPerRow:(NSUInteger)(w * 4)
+                   fromRegion:MTLRegionMake2D(0, 0, w, h)
+                  mipmapLevel:0];
+    g_tbSlotState[readbackSlot].store(SurfaceSlotAvailable,
+                                      std::memory_order_release);
+
+    int replacementCompleted = -1;
+    for (int slot = 0; slot < kTripleBufferCount; slot++) {
+      if (g_tbSlotState[slot].load(std::memory_order_acquire) ==
+          SurfaceSlotReadyForPresentation) {
+        replacementCompleted = slot;
+      }
+    }
+    g_tbLastCompleted.store(replacementCompleted, std::memory_order_release);
+    g_currentFrameReady.store(replacementCompleted >= 0,
+                              std::memory_order_release);
+  }
+  g_surfaceSlotChanged.notify_all();
   return JNI_TRUE;
 }
 extern "C" JNIEXPORT jboolean JNICALL

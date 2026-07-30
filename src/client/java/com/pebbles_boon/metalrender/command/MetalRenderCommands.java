@@ -2,9 +2,12 @@ package com.pebbles_boon.metalrender.command;
 
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.pebbles_boon.metalrender.MetalRenderClient;
+import com.pebbles_boon.metalrender.compat.IrisCompatibility;
+import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.nativebridge.MetalHardwareChecker;
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
+import com.pebbles_boon.metalrender.render.MetalRenderHookState;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import net.minecraft.client.Minecraft;
@@ -164,6 +167,26 @@ public final class MetalRenderCommands {
         msg(src, "§7Terrain replacement: "
                 + (cfg != null && cfg.enableFastTerrainReplacement
                     ? "§eExperimental fast" : "§aSafe alpha overlay"));
+        msg(src, "§7Iris: §f" + IrisCompatibility.statusDescription());
+        msg(src, "§7Successful Metal presentations: §f"
+                + MetalRenderHookState.successfulPresentationCount());
+        IrisTranslationCoordinator.Status irisTranslation =
+                IrisTranslationCoordinator.status();
+        msg(src, "§7Iris GLSL translation: "
+                + (irisTranslation.running()
+                    ? "§eExperimental §7(attempted=" + irisTranslation.attempted()
+                        + ", translated=" + irisTranslation.translated()
+                        + ", cacheHits=" + irisTranslation.cacheHits()
+                        + ", failed=" + irisTranslation.failed()
+                        + ", rejected=" + irisTranslation.rejected()
+                        + ", captureFailures="
+                        + irisTranslation.captureFailures() + ")"
+                    : irisTranslation.enabled()
+                        ? "§eEnabled, worker unavailable"
+                        : "§7Disabled"));
+        if (irisTranslation.running()) {
+            msg(src, "§7Iris Metal execution: §ePending; Iris OpenGL active");
+        }
         msg(src, "§7Init state: §f" + MetalRenderClient.getInitState());
         if (MetalRenderClient.getInitFailure() != null) {
             msg(src, "§7Fallback reason: §e" + MetalRenderClient.getInitFailure());

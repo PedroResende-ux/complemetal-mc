@@ -15,7 +15,8 @@
     ]
   },
   "mixins": [
-    "metalrender.mixins.json"
+    "metalrender.mixins.json",
+    "metalrender.iris.mixins.json"
   ],
   "depends": {
     "fabricloader": ">=0.19.3",

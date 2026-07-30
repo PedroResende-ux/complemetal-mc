@@ -120,6 +120,7 @@ public class MetalWorldRenderer {
   private boolean renderingActive;
   private boolean nativeWorldLoaded;
   private boolean texturesReady;
+  private boolean irisCompatibilityPaused;
   private int frameCount;
   private int maxMeshes = DEFAULT_MAX_MESHES;
   private int maxDrawnChunksPerFrame = 65536;
@@ -274,6 +275,7 @@ public class MetalWorldRenderer {
     worldLoaded = false;
     renderingActive = false;
     texturesReady = false;
+    irisCompatibilityPaused = false;
     if (nativeWorldLoaded) {
       MetalRenderer renderer = MetalRenderClient.getRenderer();
       long handle = renderer != null && renderer.isAvailable()
@@ -438,6 +440,75 @@ public class MetalWorldRenderer {
       }
     }
     updateLoadingModeState();
+  }
+
+  /**
+   * Suspends all duplicate terrain preparation while an Iris shader pack owns
+   * the world render graph. Metal 4 remains initialized, but no chunk meshes,
+   * atlas mirrors or presentation surfaces are maintained until Iris disables
+   * the pack.
+   */
+  public void setIrisCompatibilityPaused(boolean paused) {
+    if (irisCompatibilityPaused == paused) {
+      return;
+    }
+    irisCompatibilityPaused = paused;
+    MetalRenderHookState.resetSession();
+    if (paused) {
+      MetalRenderer renderer = MetalRenderClient.getRenderer();
+      if (renderer != null && renderer.getHandle() != 0 &&
+          NativeBridge.isLibLoaded()) {
+        try {
+          // The last presented IOSurface can still be owned by a CGL texture.
+          // Finish/delete that binding before returning its native ring slot.
+          ioSurfaceBlitter.suspendPresentation();
+          NativeBridge.nReleaseBoundPresentationSurface(
+              renderer.getHandle());
+        } catch (Throwable error) {
+          MetalLogger.error(
+              "Failed to release the OpenGL IOSurface before Iris mode", error);
+        }
+        try {
+          // Deferred mesh/texture destruction is keyed to submitted frame
+          // serials. Drain the last Metal work before Iris stops all further
+          // submissions so those resources cannot remain pinned for the
+          // entire shader-pack session.
+          NativeBridge.nFlushFrames();
+          NativeBridge.nRecycleUnpresentedFrames(renderer.getHandle());
+        } catch (Throwable error) {
+          MetalLogger.error(
+              "Failed to drain Metal frames before entering Iris mode", error);
+        }
+      }
+      chunkMesher.clearAllMeshes();
+      pendingBuildSet.clear();
+      sortedBuildList.clear();
+      sortedListDirty = true;
+      textureManager.destroy();
+      if (NativeBridge.isLibLoaded()) {
+        try {
+          NativeBridge.nFlushDeferredDeletions();
+        } catch (Throwable error) {
+          MetalLogger.error(
+              "Failed to flush deferred Metal resources in Iris mode", error);
+        }
+      }
+      texturesReady = false;
+      AsyncCullTask.reset();
+      MetalLogger.info(
+          "Iris shader pack active: duplicate Metal terrain resources released");
+      return;
+    }
+
+    texturesReady = false;
+    scanFrameCounter = 0;
+    scanFrontierRing = 0;
+    lastScanPlayerCX = Integer.MIN_VALUE;
+    lastScanPlayerCZ = Integer.MIN_VALUE;
+    lastScanRenderDist = -1;
+    onConfigScreenClosed();
+    MetalLogger.info(
+        "Iris shader pack disabled: Metal terrain rebuild requested");
   }
 
   public void beginFrame(Camera camera, float tickDelta, Matrix4f projection,
@@ -1468,6 +1539,10 @@ public class MetalWorldRenderer {
 
   public boolean areTexturesReady() {
     return texturesReady;
+  }
+
+  public boolean isIrisCompatibilityPaused() {
+    return irisCompatibilityPaused;
   }
 
   public MetalTextureManager getTextureManager() {

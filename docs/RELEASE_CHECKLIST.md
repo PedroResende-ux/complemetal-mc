@@ -1,4 +1,4 @@
-# `0.2.0-beta.1+mc26.2` release checklist
+# `0.2.0-beta.2+mc26.2` release checklist
 
 ## Automated
 
@@ -6,7 +6,7 @@
 - [x] `./gradlew checkJniParity`
 - [x] `./gradlew compileGametestJava`
 - [x] Packaged dylib is arm64, ad-hoc signed and has deployment target 14.0
-- [x] `scripts/smoke_release_payload.sh build/libs/metalrender-0.2.0-beta.1+mc26.2.jar`
+- [x] `scripts/smoke_release_payload.sh build/libs/metalrender-0.2.0-beta.2+mc26.2.jar`
 - [x] `git diff --check`
 
 ## Full-Xcode build
@@ -18,11 +18,14 @@
 - [x] `./gradlew releaseCheck` rebuilds the native library and offline shaders
 - [x] Every shader compiles
 - [x] `shaders.metallib` is packaged
-- [x] Packaged dylib JNI exports match all 102 `NativeBridge` declarations
+- [x] Packaged dylib JNI exports match all 103 `NativeBridge` declarations
 
 ## In-game hardware validation
 
-- [ ] Fresh Fabric 26.2 profile starts the exact release JAR with Java 25
+- [x] Fresh Fabric 26.2 profile starts the exact release JAR with Java 25
+- [x] Exact-JAR cold cache translates all 76 captured Complementary programs
+      into 152 SPIR-V and 152 MSL stage artifacts with zero failures
+- [x] Exact-JAR warm cache reuses all 76 entries with zero retranslations
 - [x] Active `runClientGameTest` completes with the release native library
 - [x] ASan-instrumented active client test completes with no sanitizer report
 - [x] Native-disabled client baseline completes with
@@ -43,7 +46,8 @@
 - [ ] World/dimension transitions
 - [ ] Sleep/wake and display reconnect
 - [ ] Sustained 200 Hz pacing
-- [ ] Memory-pressure fallback
+- [x] Native arena startup budget is capped against
+      `recommendedMaxWorkingSetSize`
 
 ## Publication
 
@@ -57,11 +61,16 @@
 ## Verified artifacts
 
 - JAR SHA-256:
-  `85d8e609d16877661347927aedf0bb4a82672730e8f5e2fe75d89cbd82b864ae`
+  `6c16501263c5feacca048db170036ac66081a42af4c9900762e54fc81b266ebf`
 - Native dylib SHA-256:
-  `e14df09a80d8b4130eb05f1b37d2f0e4ad6ec208ef6efff66de52d8c1b318f41`
+  `ff563ba1f36587b43b2b87676f2879ddca20fd907efacc961a2f7b5e135b5edb`
 - Metal shader library SHA-256:
   `96acbbeeaad63a4ef6d569367fb2875a01e6bf7a7977904d1582a31d21d183c8`
-- Active hybrid and native-disabled baseline screenshots were visually
-  inspected on Apple M4 Pro with the Microsoft Java 25 runtime bundled by the
-  Minecraft Launcher.
+- Exact-JAR prepare manifest SHA-256:
+  `bc3858da253637c3cbace8de6420d9edfe811e21fa063bd88fc728c20eee06fd`
+- Exact-JAR cold evidence SHA-256:
+  `99851d1914ed656cc2eb28e2e68a50be4b563f0b8bccd992daad9e4e034e2dc8`
+- Exact-JAR warm evidence SHA-256:
+  `b80c2745ec2de6b7d15eb57bca726cf42187e4edefa680e638228464a58d8fa1`
+- Cold and warm Iris on/off/on screenshots were visually inspected at
+  1280x720 on Apple M4 Pro with Java 25.

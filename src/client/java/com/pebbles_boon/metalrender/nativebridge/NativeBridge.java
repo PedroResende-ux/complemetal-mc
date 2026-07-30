@@ -10,6 +10,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.Optional;
 import java.util.Set;
 
 public final class NativeBridge {
@@ -275,9 +276,49 @@ public final class NativeBridge {
   private static String implementationVersion() {
     String version = NativeBridge.class.getPackage().getImplementationVersion();
     if (version == null || version.isBlank()) {
+      version = fabricMetadataVersion();
+    }
+    if (version == null || version.isBlank()) {
       version = System.getProperty("metalrender.version", "development");
     }
     return version.replaceAll("[^A-Za-z0-9._-]", "_");
+  }
+
+  /**
+   * Fabric's Knot class loader does not always expose JAR package manifest
+   * attributes through {@link Package}. Resolve the same version from loader
+   * metadata without adding a hard Fabric runtime dependency to the standalone
+   * packaged-payload smoke test.
+   */
+  private static String fabricMetadataVersion() {
+    try {
+      ClassLoader classLoader = NativeBridge.class.getClassLoader();
+      Class<?> loaderType = Class.forName(
+          "net.fabricmc.loader.api.FabricLoader", false, classLoader);
+      Object loader = loaderType.getMethod("getInstance").invoke(null);
+      Object containerResult = loaderType
+          .getMethod("getModContainer", String.class)
+          .invoke(loader, "metalrender");
+      if (!(containerResult instanceof Optional<?> optional)
+          || optional.isEmpty()) {
+        return null;
+      }
+      Class<?> containerType = Class.forName(
+          "net.fabricmc.loader.api.ModContainer", false, classLoader);
+      Object metadata = containerType.getMethod("getMetadata")
+          .invoke(optional.orElseThrow());
+      Class<?> metadataType = Class.forName(
+          "net.fabricmc.loader.api.metadata.ModMetadata", false, classLoader);
+      Object semanticVersion = metadataType.getMethod("getVersion")
+          .invoke(metadata);
+      Class<?> versionType = Class.forName(
+          "net.fabricmc.loader.api.Version", false, classLoader);
+      Object friendly = versionType.getMethod("getFriendlyString")
+          .invoke(semanticVersion);
+      return friendly instanceof String value ? value : null;
+    } catch (ReflectiveOperationException | LinkageError ignored) {
+      return null;
+    }
   }
 
   private static void markLoaded(String path) {
@@ -412,6 +453,8 @@ public final class NativeBridge {
   public static native boolean nIsFrameReady(long handle);
 
   public static native void nRecycleUnpresentedFrames(long handle);
+
+  public static native void nReleaseBoundPresentationSurface(long handle);
 
   public static native void nSetReuseTerrainFrame(boolean reuse);
 

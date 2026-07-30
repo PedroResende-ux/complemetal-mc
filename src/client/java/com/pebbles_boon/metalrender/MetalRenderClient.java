@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender;
 
 import com.pebbles_boon.metalrender.backend.MetalRenderer;
 import com.pebbles_boon.metalrender.command.MetalRenderCommands;
+import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.culling.AsyncCullTask;
 import com.pebbles_boon.metalrender.gui.MetalDebugEntry;
@@ -16,6 +17,7 @@ import com.pebbles_boon.metalrender.render.unified.MetalRenderCoordinator;
 import com.pebbles_boon.metalrender.sodium.backend.MeshShaderBackend;
 import com.pebbles_boon.metalrender.sodium.backend.SodiumMetalInterface;
 import com.pebbles_boon.metalrender.util.MetalLogger;
+import java.nio.file.Path;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -64,6 +66,7 @@ public class MetalRenderClient implements ClientModInitializer {
     instance = this;
     terminalShutdown = false;
     MetalLogger.info("metalrender ready");
+    startIrisTranslationIfEnabled();
     config = MetalRenderConfig.load();
     cfgWasOn = config != null && config.enableMetalRendering;
     MetalDebugEntry.register();
@@ -624,8 +627,28 @@ public class MetalRenderClient implements ClientModInitializer {
     }
     MetalRenderHookState.resetSession();
     shutdownRenderer();
+    IrisTranslationCoordinator.stop();
     AsyncCullTask.shutdown();
     instance = null;
+  }
+
+  private static void startIrisTranslationIfEnabled() {
+    try {
+      String configuredRoot = System.getProperty(
+          "metalrender.experimental.irisMetalCacheRoot");
+      Path cacheRoot = configuredRoot == null || configuredRoot.isBlank()
+          ? FabricLoader.getInstance().getGameDir()
+              .resolve(".cache").resolve("metalrender")
+          : Path.of(configuredRoot);
+      if (IrisTranslationCoordinator.startIfEnabled(cacheRoot)) {
+        MetalLogger.info(
+            "experimental Iris final-GLSL translation worker enabled");
+      }
+    } catch (Throwable error) {
+      MetalLogger.warn(
+          "Iris translation setup failed open; Iris OpenGL remains active (%s)",
+          error.getClass().getSimpleName());
+    }
   }
 
   private static void logStartDiag(Minecraft mc) {
