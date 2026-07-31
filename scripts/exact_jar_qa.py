@@ -37,7 +37,23 @@ REQUIRED_SODIUM_VERSION = "0.9.1+mc26.2"
 DEFAULT_SHADER_PACK = "ComplementaryReimagined_r5.8.1.zip"
 EXPECTED_COMPLEMENTARY_PROGRAMS = 76
 EXPECTED_COMPLEMENTARY_STAGES = 152
+SUPPORTED_BACKENDS = ("metal4", "metal3")
 QA_MOD_ID = "metalrender-exact-jar-qa"
+FORBIDDEN_RUNTIME_DIAGNOSTICS = (
+    "GPU_ERROR:",
+    "Frame skipped: in-flight GPU limit timed out",
+    "Frame skipped: no IOSurface slot is safe for Metal",
+    "[iosurface] frame not ready after bounded wait; presentation skipped",
+    "[iosurface] fastpath fail",
+    "[iosurface] fastpath off",
+    "[iosurface] composite eww",
+    "[iosurface] read fbo bad",
+    "[iosurface] inter fbo bad",
+    "[iosurface] inter fbo setup bad",
+    "[iosurface] glblit err",
+    "[iosurface] deferred gl err",
+    "[MetalRender] WARN: Pipeline cache",
+)
 SANITIZED_ENVIRONMENT_VARIABLES = (
     "ASAN_OPTIONS",
     "CLASSPATH",
@@ -422,6 +438,13 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     release_metadata = read_mod_metadata(release_jar)
     if release_metadata.get("id") != "metalrender":
         raise HarnessError(f"not a MetalRender JAR: {release_jar}")
+    expected_release_version = parse_project_property("mod_version")
+    if release_metadata.get("version") != expected_release_version:
+        raise HarnessError(
+            "release JAR version does not match project mod_version: "
+            f"expected {expected_release_version}, got "
+            f"{release_metadata.get('version')}"
+        )
     if release_metadata.get("depends", {}).get("minecraft") != MC_VERSION:
         raise HarnessError(
             f"release JAR does not target Minecraft {MC_VERSION}"
@@ -572,10 +595,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             driver_evidence=driver_evidence,
             shader_pack=shader_pack.name,
             asset_index=vanilla["assetIndex"]["id"],
+            backend=args.backend,
         )
 
         manifest = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "status": "PREPARED",
             "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
             "networkDownloadsRequired": False,
@@ -586,6 +610,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             ],
             "productionFabricEnvironment": True,
             "sourceSetClasspathEntries": [],
+            "qaBackend": args.backend,
             "minecraft": {
                 "version": MC_VERSION,
                 "jar": str(classpath[-1]),
@@ -687,6 +712,20 @@ def artifact_record(path: Path, metadata: dict[str, Any]) -> dict[str, str]:
 
 
 def verify_prepared_runtime(manifest: dict[str, Any]) -> None:
+    if (manifest.get("schemaVersion") != 2
+            or manifest.get("status") != "PREPARED"):
+        raise HarnessError("prepared manifest has an unsupported schema/status")
+    backend = manifest.get("qaBackend")
+    if backend not in SUPPORTED_BACKENDS:
+        raise HarnessError(
+            f"prepared manifest has an invalid QA backend: {backend}")
+    release = manifest.get("release")
+    if not isinstance(release, dict):
+        raise HarnessError("prepared manifest has no release attestation")
+    if release.get("version") != parse_project_property("mod_version"):
+        raise HarnessError(
+            "prepared release version no longer matches project mod_version")
+
     records = [
         *manifest.get("runtimeClasspathArtifacts", []),
         *manifest.get("runtimeArtifacts", []),
@@ -704,6 +743,110 @@ def verify_prepared_runtime(manifest: dict[str, Any]) -> None:
         if sha256(path) != record.get("sha256"):
             raise HarnessError(
                 f"prepared artifact changed before launch: {path}")
+    verify_release_source(manifest)
+
+
+def release_source_matches(manifest: dict[str, Any]) -> bool:
+    try:
+        release = manifest["release"]
+        source = Path(release["sourcePath"]).expanduser().resolve()
+        return source.is_file() and sha256(source) == release["sha256"]
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def verify_release_source(manifest: dict[str, Any]) -> None:
+    if not release_source_matches(manifest):
+        raise HarnessError(
+            "source release JAR changed or disappeared after preparation")
+
+
+def expected_backend_mode(backend: str) -> str:
+    if backend == "metal4":
+        return "METAL4_RUNTIME_VERIFIED_METAL3_RENDER"
+    if backend == "metal3":
+        return "METAL3"
+    raise HarnessError(f"unsupported QA backend: {backend}")
+
+
+def fault_counter_group_is_zero(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return all(
+        type(value.get(name)) is int and value.get(name) == 0
+        for name in (
+            "gpuCommandBufferErrors",
+            "inFlightFrameTimeouts",
+            "noIOSurfaceSlotSkips",
+        )
+    )
+
+
+def driver_identity_matches_manifest(
+    driver_result: Any,
+    manifest: dict[str, Any],
+    cache_expectation: str,
+) -> bool:
+    if not isinstance(driver_result, dict):
+        return False
+    try:
+        release = manifest["release"]
+        backend = manifest["qaBackend"]
+        actual_path = Path(driver_result["exactJarPath"]).resolve()
+        expected_path = Path(release["runtimePath"]).resolve()
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+    native_faults = driver_result.get("nativeFaultCounters")
+    iris_translation = driver_result.get("irisTranslation")
+    if not isinstance(iris_translation, dict):
+        return False
+    return (
+        driver_result.get("status") == "PASS"
+        and actual_path == expected_path
+        and driver_result.get("exactJarSha256") == release.get("sha256")
+        and driver_result.get("metalrenderVersion") == release.get("version")
+        and driver_result.get("cacheExpectation") == cache_expectation
+        and driver_result.get("backendExpectation") == backend
+        and driver_result.get("backendMode") == expected_backend_mode(backend)
+        and type(driver_result.get("metal4Active")) is bool
+        and driver_result.get("metal4Active") == (backend == "metal4")
+        and driver_result.get("metal4DrawPathActive") is False
+        and driver_result.get("irisDrawBackend") == "OPENGL"
+        and driver_result.get("generatedMslExecuted") is False
+        and iris_translation.get("pipelineStatus") == "pending"
+        and isinstance(native_faults, dict)
+        and native_faults.get("semantics")
+            == "process-lifetime-monotonic"
+        and fault_counter_group_is_zero(native_faults.get("baseline"))
+        and fault_counter_group_is_zero(native_faults.get("end"))
+        and fault_counter_group_is_zero(native_faults.get("delta"))
+    )
+
+
+def verify_cold_result_for_warm(
+    runtime: Path,
+    manifest: dict[str, Any],
+) -> None:
+    cold_path = require_file(
+        runtime / "evidence" / "run-result-cold.json",
+        "successful cold exact-JAR result",
+    )
+    cold = read_json(cold_path)
+    manifest_path = require_file(
+        runtime / "prepare-manifest.json", "prepared exact-JAR manifest")
+    if cold.get("status") != "PASS":
+        raise HarnessError("warm run requires a PASS cold result")
+    if cold.get("cacheExpectation") != "cold":
+        raise HarnessError("cold result has an invalid cache expectation")
+    if (cold.get("prepareManifest", {}).get("sha256")
+            != sha256(manifest_path)):
+        raise HarnessError(
+            "cold result was produced from a different prepare manifest")
+    if not driver_identity_matches_manifest(
+            cold.get("driverResult"), manifest, "cold"):
+        raise HarnessError(
+            "cold result is not bound to this backend and release JAR")
 
 
 def build_launch_command(
@@ -717,6 +860,7 @@ def build_launch_command(
     driver_evidence: Path,
     shader_pack: str,
     asset_index: str,
+    backend: str,
 ) -> list[str]:
     game = runtime / "game"
     natives = runtime / "natives"
@@ -745,6 +889,9 @@ def build_launch_command(
         f"-Dmetalrender.exactJar.driverEvidencePath={driver_evidence}",
         f"-Dmetalrender.exactJar.shaderPack={shader_pack}",
         "-Dmetalrender.exactJar.cacheExpectation=cold",
+        f"-Dmetalrender.exactJar.backend={backend}",
+        f"-Dmetalrender.feature.metal4="
+        f"{'true' if backend == 'metal4' else 'false'}",
         "-Dmetalrender.experimental.irisMetalPipeline=true",
         "-Dmetalrender.experimental.irisMetalTranslation=true",
         f"-Dmetalrender.experimental.irisMetalCacheRoot="
@@ -934,6 +1081,12 @@ def run_harness(
     if cache_expectation not in {"cold", "warm"}:
         raise HarnessError(
             f"unsupported cache expectation: {cache_expectation}")
+    backend = manifest.get("qaBackend")
+    if backend != args.backend:
+        raise HarnessError(
+            "requested backend does not match prepared runtime: "
+            f"requested {args.backend}, prepared {backend}"
+        )
     log_path = (
         runtime / "evidence" / f"client-{cache_expectation}.log")
     result_path = (
@@ -955,6 +1108,11 @@ def run_harness(
     command = replace_system_property(
         command, "metalrender.exactJar.driverEvidencePath",
         str(driver_result_path))
+    command = replace_system_property(
+        command, "metalrender.exactJar.backend", backend)
+    command = replace_system_property(
+        command, "metalrender.feature.metal4",
+        "true" if backend == "metal4" else "false")
     started = dt.datetime.now(dt.timezone.utc)
     with log_path.open("wb") as log:
         process = subprocess.Popen(
@@ -1005,6 +1163,10 @@ def run_harness(
         (runtime / "game" / "crash-reports").glob("*.txt")
     )
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    forbidden_runtime_diagnostics = [
+        diagnostic for diagnostic in FORBIDDEN_RUNTIME_DIAGNOSTICS
+        if diagnostic in log_text
+    ]
     translation_cache = inspect_translation_cache(
         runtime / "iris-metal-cache")
     iris_translation = (
@@ -1018,9 +1180,14 @@ def run_harness(
         "didNotTimeout": not timed_out,
         "driverReportedPass": bool(
             driver_result and driver_result.get("status") == "PASS"),
+        "driverIdentityMatchesManifest":
+            driver_identity_matches_manifest(
+                driver_result, manifest, cache_expectation),
         "threeShaderToggleScreenshots": len(screenshots) == 3,
         "normalShutdownLogged": "Stopping!" in log_text,
         "noCrashReports": not crash_reports,
+        "noForbiddenRuntimeDiagnostics":
+            not forbidden_runtime_diagnostics,
         "translationCacheValidated":
             translation_cache["status"] == "PASS",
         "translationCacheCountMatchesDriver":
@@ -1041,10 +1208,13 @@ def run_harness(
             == iris_translation.get("translated", 0)
                 + iris_translation.get("cacheHits", 0),
         "preparedManifestPresent": manifest_path.is_file(),
+        "releaseSourceUnchangedAfterRun":
+            release_source_matches(manifest),
     }
     run_result = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "cacheExpectation": cache_expectation,
+        "qaBackend": backend,
         "status": "PASS" if all(checks.values()) else "FAIL",
         "startedAt": started.isoformat(),
         "finishedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1069,6 +1239,7 @@ def run_harness(
             for path in screenshots
         ],
         "translationCache": translation_cache,
+        "forbiddenRuntimeDiagnostics": forbidden_runtime_diagnostics,
         "crashReports": [str(path) for path in crash_reports],
     }
     result_path.write_text(
@@ -1104,6 +1275,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--runtime-dir", default=str(DEFAULT_RUNTIME),
         help="isolated runtime directory (must be below project build/)",
+    )
+    result.add_argument(
+        "--backend", choices=SUPPORTED_BACKENDS, default="metal4",
+        help=(
+            "native runtime profile to verify; use a separate runtime "
+            "directory for each backend"
+        ),
     )
     result.add_argument(
         "--minecraft-home",
@@ -1142,12 +1320,19 @@ def main() -> int:
             if args.action == "warm":
                 manifest = read_json(require_file(
                     manifest_path, "prepared exact-JAR manifest"))
+                if manifest.get("qaBackend") != args.backend:
+                    raise HarnessError(
+                        "warm backend does not match prepared runtime: "
+                        f"requested {args.backend}, prepared "
+                        f"{manifest.get('qaBackend')}"
+                    )
                 runtime_jar = require_file(
                     Path(manifest["release"]["runtimePath"]),
                     "prepared exact release JAR")
                 if sha256(runtime_jar) != manifest["release"]["sha256"]:
                     raise HarnessError(
                         "prepared exact release JAR changed before warm run")
+                verify_cold_result_for_warm(runtime, manifest)
             else:
                 manifest = prepare(args)
                 print(
@@ -1162,6 +1347,11 @@ def main() -> int:
                 cache_expectation = (
                     "cold" if args.action == "run" else "warm")
                 run_harness(args, manifest, cache_expectation)
+                if args.action == "warm":
+                    # Re-hash the original publishable artifact after the warm
+                    # client has exited; evidence is invalid if build/libs was
+                    # replaced while the prepared copy was running.
+                    verify_release_source(manifest)
                 print(
                     f"Exact release JAR {cache_expectation}-cache QA PASS:\n"
                     f"  evidence: "

@@ -1,15 +1,15 @@
 # MetalRender
 
-MetalRender is an experimental Fabric client renderer for Apple Silicon Macs.
-It mirrors selected Minecraft render data into a native Metal backend and
-falls back to Minecraft's normal renderer whenever the native path is
-unsupported or cannot be initialized.
+MetalRender is a Fabric client renderer for Apple Silicon Macs. Its stable
+profile mirrors selected Minecraft terrain data into a native Metal 3
+compatibility stream and falls back to Minecraft's normal renderer whenever
+the native path is unsupported or cannot be initialized.
 
-The `0.2.x` line targets Minecraft Java Edition 26.2 and introduces an
-experimental Metal 4 runtime scaffold. The current draw path is deliberately
-hybrid: MetalRender probes and instantiates Metal 4 command-queue and allocator
-objects when the operating system exposes them, while native draw encoding
-remains on the Metal 3 compatibility stream.
+The `0.2.x` line targets Minecraft Java Edition 26.2. The stable
+`0.2.0+mc26.2` release is deliberately hybrid: MetalRender probes and
+instantiates Metal 4 command-queue and allocator objects when the operating
+system exposes them, while all active native draw encoding remains on the
+Metal 3 compatibility stream. Actual MTL4 draw encoding is disabled.
 
 > MetalRender is not affiliated with or endorsed by Apple or Mojang.
 
@@ -17,16 +17,21 @@ remains on the Metal 3 compatibility stream.
 
 | Component | Supported configuration |
 | --- | --- |
-| MetalRender | `0.2.0-beta.2+mc26.2` |
+| MetalRender | `0.2.0+mc26.2` |
 | Minecraft | 26.2 |
 | Loader | Fabric Loader 0.19.3 or newer |
 | Fabric API | 0.156.0+26.2 or newer compatible 26.2 build |
 | Java | 25 |
 | Platform | Apple Silicon macOS |
 | Native deployment target | macOS 14.0 |
-| Metal 4 | Runtime-detected, optional hybrid path |
+| Native draw path | Metal 3 compatibility terrain stream |
+| Metal 4 | Runtime-detected queue/allocator probe only; no MTL4 draws |
 | Sodium | Optional; 0.9.1 for Minecraft 26.2 is the compatibility target |
-| Iris | Optional; 1.11.2 for Minecraft 26.2 is the compatibility target |
+| Iris | Optional; 1.11.2 compatibility target; Iris rendering remains OpenGL |
+| Iris-to-Metal translation | Experimental opt-in cache preparation; no Metal execution or FPS claim |
+| Display scope | Window resize and fullscreen are validated; true 2x Retina backing is not validated |
+| Power/external display lifecycle | Sleep/wake and display hot-plug/reconnect are not validated |
+| High-refresh presentation | Real presented 200 Hz pacing is not validated |
 | Other operating systems / Intel Macs | Safe vanilla fallback, no MetalRender acceleration |
 
 The packaged native library is arm64-only. Metal 4 is never assumed from a
@@ -120,7 +125,17 @@ Useful focused checks:
 ```bash
 ./gradlew test checkJniParity
 ./gradlew verifyReleaseJar
+./scripts/run_asan_smoke.sh
 ```
+
+The ASan helper checks the instrumented native payload, including texture
+upload/flush and 1000 Metal 4-runtime/Metal 3-draw hybrid plus 240 forced
+Metal 3 offscreen frames. It
+clone-copies and ad-hoc signs a temporary Java 25 launcher because macOS
+rejects sanitizer injection into the stock Hardened Runtime launcher. It
+always rebuilds the optimized release native payload before returning. A
+process-wide ASan Minecraft run is not a reliable gate on this system because
+the closed Apple OpenGL shader linker can fault under sanitizer injection.
 
 ## Runtime controls
 
@@ -138,12 +153,13 @@ path still uses unsafe raw OpenGL texture readback on the current macOS driver.
 
 See [COMMANDS.md](COMMANDS.md) for the complete command list.
 
-This beta is not a complete MTL4 renderer and carries no claim of stable visual
-parity or a guaranteed performance uplift. Its opt-in Iris translator prepares
-SPIR-V/MSL cache artifacts in the background but does not replace Iris'
-OpenGL compilation or draws, so it does not currently increase Iris FPS. The
-native payload and lifecycle checks complement, but do not replace, visual
-comparison on real hardware.
+Stable refers only to the conservative hybrid profile in the support matrix.
+This release is not a complete MTL4 renderer and carries no guaranteed
+performance uplift. Its opt-in Iris translator prepares SPIR-V/MSL cache
+artifacts in the background but does not compile or execute them as Metal
+pipelines and does not replace Iris' OpenGL draws. It therefore does not
+currently increase Iris FPS. Native payload and lifecycle checks complement,
+but do not replace, visual comparison on real hardware.
 
 ## Reporting bugs
 
@@ -157,8 +173,9 @@ Include:
 - a screenshot or short capture for visual corruption.
 
 Do not report a successful synthetic/native smoke test as proof of correct
-in-game rendering. A release still needs world, entity, particle, UI,
-transparency, resize, fullscreen and sleep/wake visual checks on real hardware.
+in-game rendering. The stable profile was validated separately in game.
+True 2x Retina backing, sleep/wake, external-display reconnect and real
+presented 200 Hz pacing remain outside the validated `0.2.0` support scope.
 
 ## License
 

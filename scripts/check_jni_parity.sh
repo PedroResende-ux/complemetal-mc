@@ -23,6 +23,19 @@ rg --no-filename -o 'Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridg
 comm -23 "$expected" "$actual" > "$missing"
 comm -13 "$expected" "$actual" > "$orphaned"
 
+required_release_qa_exports=(
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetGpuCommandBufferErrorCount"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetInFlightFrameTimeoutCount"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetNoIOSurfaceSlotSkipCount"
+)
+for required in "${required_release_qa_exports[@]}"; do
+  if ! grep -Fxq "$required" "$expected" ||
+     ! grep -Fxq "$required" "$actual"; then
+    echo "Missing required release-QA JNI telemetry export: $required"
+    exit 1
+  fi
+done
+
 if [[ -s "$missing" || -s "$orphaned" ]]; then
   if [[ -s "$missing" ]]; then
     echo "Missing native JNI implementations:"

@@ -2,6 +2,9 @@
 
 ## Target architecture
 
+This is a future target architecture, not part of the stable renderer contract.
+The stable `0.2.0+mc26.2` draw path remains the Metal 3 compatibility stream.
+
 The target path starts after Iris has completed all shader-pack preprocessing
 and compatibility transforms:
 
@@ -22,7 +25,8 @@ directives can be missing.
 
 ## Current implementation boundary
 
-The experimental foundation is intentionally opt-in and fail-open:
+The experimental foundation is excluded from the stable support profile and is
+intentionally opt-in and fail-open:
 
 | Layer | Status |
 | --- | --- |
@@ -45,11 +49,13 @@ contained in the background path; Iris continues with its normal renderer.
 Geometry shaders are not advertised as supported because Metal has no direct
 geometry-shader stage.
 
-The beta.2 exact-JAR validation captured all 76 Complementary Reimagined r5.8.1
-programs in its test scene. A cold run produced 152 SPIR-V and 152 MSL stage
-artifacts with zero failures; the next run reused all 76 cache entries with
-zero retranslations. This proves the translation/cache foundation for that
-workload, not Metal execution of the shader pack.
+The stable exact-JAR validation captured all 76 Complementary Reimagined
+r5.8.1 programs in its test scene under both the Metal 4 hybrid and forced
+Metal 3 profiles. Each cold run produced 152 SPIR-V and 152 MSL stage artifacts
+with zero failures; each warm run reused all 76 cache entries with zero
+retranslations. This proves the translation/cache foundation for that exact
+workload only, not arbitrary shader-pack capacity and not Metal execution of
+the shader pack.
 
 The capture/translation experiment is enabled only at JVM startup:
 
@@ -95,7 +101,7 @@ a warm cache merely avoids repeating that experimental work.
 
 Once the translated programs are actually used by the future Metal render
 graph, the MSL and device pipeline caches can reduce Metal shader/pipeline
-compilation stalls. That future benefit is not active in beta.2.
+compilation stalls. That future benefit is not active in this stable release.
 
 Steady-state FPS can improve only after the Iris passes actually execute
 through Metal. The largest likely benefit is in CPU/driver-bound scenes with

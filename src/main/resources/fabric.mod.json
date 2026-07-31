@@ -7,7 +7,7 @@
     "pebbles_boon"
   ],
   "name": "MetalRender",
-  "description": "Experimental Apple Silicon Metal renderer with a safe Minecraft fallback",
+  "description": "Conservative Apple Silicon Metal hybrid renderer with a safe Minecraft fallback",
   "environment": "client",
   "entrypoints": {
     "client": [

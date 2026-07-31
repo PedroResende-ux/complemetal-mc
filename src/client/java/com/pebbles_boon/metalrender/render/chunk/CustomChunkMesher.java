@@ -42,6 +42,7 @@ import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3f;
@@ -67,11 +68,35 @@ public class CustomChunkMesher {
     return FACE_SHADE[normalIndex];
   }
 
+  static boolean isSameFluidFamily(Fluid referenceFluid,
+      FluidState candidate) {
+    return referenceFluid != null && candidate != null &&
+        !candidate.isEmpty() &&
+        referenceFluid.isSame(candidate.getType());
+  }
+
+  static boolean isFluidSideEndpointOrderOutward(Direction direction,
+      int x0, int z0, int x1, int z1) {
+    if (direction == null || direction.getAxis() == Direction.Axis.Y) {
+      return false;
+    }
+    long edgeX = (long) x1 - x0;
+    long edgeZ = (long) z1 - z0;
+    // renderFluidSide emits top0,bottom0,bottom1,top1. The first triangle's
+    // unnormalised horizontal normal is (-edgeZ, 0, edgeX).
+    long outwardDot =
+        -edgeZ * direction.getStepX() + edgeX * direction.getStepZ();
+    return outwardDot > 0;
+  }
+
   private static final ThreadLocal<ByteBuffer> VERTEX_BUF_POOL = ThreadLocal
       .withInitial(() -> ByteBuffer.allocateDirect(VERTEX_BUF_SIZE)
           .order(ByteOrder.nativeOrder()));
   private static final ThreadLocal<ByteBuffer> WATER_BUF_POOL = ThreadLocal
       .withInitial(() -> ByteBuffer.allocateDirect(VERTEX_BUF_SIZE)
+          .order(ByteOrder.nativeOrder()));
+  private static final ThreadLocal<ByteBuffer> FACE_BUCKET_BUF_POOL =
+      ThreadLocal.withInitial(() -> ByteBuffer.allocateDirect(VERTEX_BUF_SIZE)
           .order(ByteOrder.nativeOrder()));
 
   private static final Direction[] ALL_DIRECTIONS = Direction.values();
@@ -113,7 +138,8 @@ public class CustomChunkMesher {
   private final Long2ObjectOpenHashMap<ChunkMeshData> meshCache;
   private final java.util.ArrayList<ChunkMeshData> cachedMeshSnapshot = new java.util.ArrayList<>(8192);
   private volatile int cachedSnapshotGen = Integer.MIN_VALUE;
-  private final LongOpenHashSet pendingKeys = new LongOpenHashSet();
+  private final PendingBuildClaims pendingBuildClaims =
+      new PendingBuildClaims();
   private final LongOpenHashSet dirtyKeys = new LongOpenHashSet();
   private final LongOpenHashSet emptyKeys = new LongOpenHashSet();
   private final Long2ObjectOpenHashMap<SectionSnapshot> snapshotCache = new Long2ObjectOpenHashMap<>();
@@ -125,6 +151,10 @@ public class CustomChunkMesher {
   private final java.util.concurrent.ThreadPoolExecutor backgroundPool;
 
   private final Long2LongOpenHashMap dirtyGeneration = new Long2LongOpenHashMap();
+  private final Long2LongOpenHashMap completedGeneration =
+      new Long2LongOpenHashMap();
+  private final Long2LongOpenHashMap completedEpoch =
+      new Long2LongOpenHashMap();
   private final Long2LongOpenHashMap pendingVisibleSectionNanos = new Long2LongOpenHashMap();
   private final Long2LongOpenHashMap pendingBlockUpdateNanos = new Long2LongOpenHashMap();
 
@@ -167,6 +197,8 @@ public class CustomChunkMesher {
   public CustomChunkMesher() {
     this.meshCache = new Long2ObjectOpenHashMap<>();
     this.dirtyGeneration.defaultReturnValue(0L);
+    this.completedGeneration.defaultReturnValue(Long.MIN_VALUE);
+    this.completedEpoch.defaultReturnValue(Long.MIN_VALUE);
     this.pendingVisibleSectionNanos.defaultReturnValue(0L);
     this.pendingBlockUpdateNanos.defaultReturnValue(0L);
     this.snapshotCacheGen.defaultReturnValue(Long.MIN_VALUE);
@@ -274,26 +306,27 @@ public class CustomChunkMesher {
       genAtSubmit = dirtyGeneration.get(key);
     }
     final long epochAtSubmit = buildEpoch.get();
-
-    synchronized (pendingKeys) {
-      if (!pendingKeys.add(key)) {
-        return;
-      }
+    final long buildClaim = pendingBuildClaims.claim(key);
+    if (buildClaim == PendingBuildClaims.NO_CLAIM) {
+      return;
     }
 
     int priority = interactive ? 0 : (highPriority ? 1 : 2);
     boolean submitted = submitMeshTask(priority, () -> {
       try {
-        if (isTaskCancelled(key, genAtSubmit, epochAtSubmit)) {
+        if (isTaskCancelled(
+                key, genAtSubmit, epochAtSubmit, buildClaim)) {
           return;
         }
         MeshBuildContext context = captureBuildContext(world, chunkX, chunkY, chunkZ);
-        if (isTaskCancelled(key, genAtSubmit, epochAtSubmit)) {
+        if (isTaskCancelled(
+                key, genAtSubmit, epochAtSubmit, buildClaim)) {
           return;
         }
         SectionSnapshot snapshot = captureSectionSnapshot(world, chunkX, chunkY, chunkZ,
             aggressiveApproximateLighting);
-        if (isTaskCancelled(key, genAtSubmit, epochAtSubmit)) {
+        if (isTaskCancelled(
+                key, genAtSubmit, epochAtSubmit, buildClaim)) {
           return;
         }
         if (!snapshot.valid) {
@@ -301,29 +334,25 @@ public class CustomChunkMesher {
         }
         if (snapshot.empty) {
           removeEmptyMesh(key, chunkX, chunkY, chunkZ, genAtSubmit,
-              epochAtSubmit);
+              epochAtSubmit, buildClaim);
           return;
         }
         doMeshBuild(chunkX, chunkY, chunkZ, snapshot, key, genAtSubmit,
-            epochAtSubmit, context);
+            epochAtSubmit, buildClaim, context);
       } catch (Exception e) {
         MetalLogger.error("mesher fail [%d,%d,%d]: %s", chunkX,
             chunkY, chunkZ, e.getMessage());
       } finally {
-        if (buildEpoch.get() == epochAtSubmit) {
-          synchronized (pendingKeys) {
-            pendingKeys.remove(key);
-          }
-        }
+        pendingBuildClaims.release(key, buildClaim);
       }
     }, chunkX, chunkZ);
-    if (!submitted && initialized && buildEpoch.get() == epochAtSubmit) {
-      synchronized (pendingKeys) {
-        pendingKeys.remove(key);
+    if (!submitted) {
+      if (initialized && buildEpoch.get() == epochAtSubmit) {
+        synchronized (dirtyKeys) {
+          dirtyKeys.add(key);
+        }
       }
-      synchronized (dirtyKeys) {
-        dirtyKeys.add(key);
-      }
+      pendingBuildClaims.release(key, buildClaim);
     }
   }
 
@@ -363,19 +392,84 @@ public class CustomChunkMesher {
       if (dirtyKeys.contains(key))
         return false;
     }
+    synchronized (emptyKeys) {
+      // A non-air section whose faces are fully occluded is a completed mesh
+      // result too. Treating it as missing makes the world scanner rebuild it
+      // forever until a neighbour update invalidates the key via markDirty().
+      if (emptyKeys.contains(key))
+        return true;
+    }
     synchronized (meshCache) {
       if (meshCache.containsKey(key))
         return true;
     }
-    synchronized (pendingKeys) {
-      return pendingKeys.contains(key);
-    }
+    return pendingBuildClaims.contains(key);
   }
 
   public boolean hasMeshIgnoreDirty(int cx, int cy, int cz) {
     long key = packChunkKey(cx, cy, cz);
     synchronized (meshCache) {
       return meshCache.containsKey(key);
+    }
+  }
+
+  public long getRequestedMeshRevision(int cx, int cy, int cz) {
+    long key = packChunkKey(cx, cy, cz);
+    synchronized (dirtyGeneration) {
+      return dirtyGeneration.get(key);
+    }
+  }
+
+  public long getBuildEpoch() {
+    return buildEpoch.get();
+  }
+
+  public boolean isMeshRevisionCompleteAfter(
+      int cx, int cy, int cz,
+      long previousEpoch, long previousRevision) {
+    long key = packChunkKey(cx, cy, cz);
+    long currentEpoch = buildEpoch.get();
+    long requested;
+    synchronized (dirtyGeneration) {
+      requested = dirtyGeneration.get(key);
+    }
+    if (currentEpoch <= previousEpoch
+        && requested <= previousRevision) {
+      return false;
+    }
+    synchronized (dirtyKeys) {
+      if (dirtyKeys.contains(key)) {
+        return false;
+      }
+    }
+    if (pendingBuildClaims.contains(key)) {
+      return false;
+    }
+    synchronized (completedGeneration) {
+      if (completedGeneration.get(key) < requested) {
+        return false;
+      }
+    }
+    synchronized (completedEpoch) {
+      if (completedEpoch.get(key) != currentEpoch) {
+        return false;
+      }
+    }
+    boolean present;
+    synchronized (meshCache) {
+      present = meshCache.containsKey(key);
+    }
+    if (!present) {
+      synchronized (emptyKeys) {
+        present = emptyKeys.contains(key);
+      }
+    }
+    if (!present) {
+      return false;
+    }
+    synchronized (dirtyGeneration) {
+      return buildEpoch.get() == currentEpoch
+          && dirtyGeneration.get(key) == requested;
     }
   }
 
@@ -398,24 +492,27 @@ public class CustomChunkMesher {
         && (currentFrame - (int) prevMark) <= 5
         && !recentBlockUpdate;
 
-    synchronized (emptyKeys) {
-      emptyKeys.remove(key);
-    }
-    synchronized (dirtyKeys) {
-      dirtyKeys.add(key);
-    }
-    synchronized (pendingKeys) {
-      pendingKeys.remove(key);
-    }
-    if (!canCoalesce) {
-      synchronized (dirtyGeneration) {
-        dirtyGeneration.put(key, dirtyGeneration.get(key) + 1L);
+    // Serialize invalidation with worker publication. A worker that already
+    // owns publishLock completes first and this update remains dirty; a worker
+    // that arrives later observes the invalid claim before touching caches.
+    synchronized (publishLock) {
+      pendingBuildClaims.invalidate(key);
+      synchronized (emptyKeys) {
+        emptyKeys.remove(key);
       }
-      synchronized (snapshotCache) {
-        snapshotCache.remove(key);
+      synchronized (dirtyKeys) {
+        dirtyKeys.add(key);
       }
-      synchronized (snapshotCacheGen) {
-        snapshotCacheGen.remove(key);
+      if (!canCoalesce) {
+        synchronized (dirtyGeneration) {
+          dirtyGeneration.put(key, dirtyGeneration.get(key) + 1L);
+        }
+        synchronized (snapshotCache) {
+          snapshotCache.remove(key);
+        }
+        synchronized (snapshotCacheGen) {
+          snapshotCacheGen.remove(key);
+        }
       }
     }
   }
@@ -447,9 +544,7 @@ public class CustomChunkMesher {
       synchronized (dirtyGeneration) {
         dirtyGeneration.put(key, dirtyGeneration.get(key) + 1L);
       }
-      synchronized (pendingKeys) {
-        pendingKeys.remove(key);
-      }
+      pendingBuildClaims.invalidate(key);
 
       // A published mesh may still be waiting in the registration batch.
       // Flush first, then unregister it, otherwise a later batch flush could
@@ -473,6 +568,12 @@ public class CustomChunkMesher {
       }
       synchronized (emptyKeys) {
         emptyKeys.remove(key);
+      }
+      synchronized (completedGeneration) {
+        completedGeneration.remove(key);
+      }
+      synchronized (completedEpoch) {
+        completedEpoch.remove(key);
       }
       synchronized (dirtyKeys) {
         dirtyKeys.remove(key);
@@ -499,9 +600,7 @@ public class CustomChunkMesher {
         meshCountAtomic.set(0);
         vertexCountAtomic.set(0);
       }
-      synchronized (pendingKeys) {
-        pendingKeys.clear();
-      }
+      pendingBuildClaims.clear();
       synchronized (dirtyKeys) {
         dirtyKeys.clear();
       }
@@ -516,6 +615,12 @@ public class CustomChunkMesher {
       }
       synchronized (dirtyGeneration) {
         dirtyGeneration.clear();
+      }
+      synchronized (completedGeneration) {
+        completedGeneration.clear();
+      }
+      synchronized (completedEpoch) {
+        completedEpoch.clear();
       }
       synchronized (pendingVisibleSectionNanos) {
         pendingVisibleSectionNanos.clear();
@@ -541,9 +646,7 @@ public class CustomChunkMesher {
   }
 
   public int getPendingCount() {
-    synchronized (pendingKeys) {
-      return pendingKeys.size();
-    }
+    return pendingBuildClaims.size();
   }
 
   public int getBuilderActiveCount() {
@@ -775,8 +878,10 @@ public class CustomChunkMesher {
     return backgroundPool.getActiveCount() + backgroundPool.getQueue().size();
   }
 
-  private boolean isTaskCancelled(long key, long generation, long epoch) {
-    if (buildEpoch.get() != epoch || !initialized) {
+  private boolean isTaskCancelled(long key, long generation, long epoch,
+      long buildClaim) {
+    if (buildEpoch.get() != epoch || !initialized
+        || !pendingBuildClaims.isCurrent(key, buildClaim)) {
       return true;
     }
     synchronized (dirtyGeneration) {
@@ -810,9 +915,9 @@ public class CustomChunkMesher {
   }
 
   private void removeEmptyMesh(long key, int chunkX, int chunkY, int chunkZ,
-      long generation, long epoch) {
+      long generation, long epoch, long buildClaim) {
     synchronized (publishLock) {
-      if (isTaskCancelled(key, generation, epoch)) {
+      if (isTaskCancelled(key, generation, epoch, buildClaim)) {
         return;
       }
       synchronized (meshCache) {
@@ -826,6 +931,12 @@ public class CustomChunkMesher {
       }
       synchronized (emptyKeys) {
         emptyKeys.add(key);
+      }
+      synchronized (completedGeneration) {
+        completedGeneration.put(key, generation);
+      }
+      synchronized (completedEpoch) {
+        completedEpoch.put(key, epoch);
       }
       synchronized (dirtyKeys) {
         dirtyKeys.remove(key);
@@ -867,10 +978,13 @@ public class CustomChunkMesher {
     final TextureAtlasSprite waterFlowingSprite;
     final TextureAtlasSprite lavaStillSprite;
     final TextureAtlasSprite lavaFlowingSprite;
+    final boolean waterTranslucent;
+    final boolean lavaTranslucent;
 
     MeshBuildContext(BlockStateModelSet blockModels, int buildPlayerCX, int buildPlayerCY, int buildPlayerCZ,
         TextureAtlasSprite waterStillSprite, TextureAtlasSprite waterFlowingSprite,
-        TextureAtlasSprite lavaStillSprite, TextureAtlasSprite lavaFlowingSprite) {
+        TextureAtlasSprite lavaStillSprite, TextureAtlasSprite lavaFlowingSprite,
+        boolean waterTranslucent, boolean lavaTranslucent) {
       this.blockModels = blockModels;
       this.buildPlayerCX = buildPlayerCX;
       this.buildPlayerCY = buildPlayerCY;
@@ -879,6 +993,8 @@ public class CustomChunkMesher {
       this.waterFlowingSprite = waterFlowingSprite;
       this.lavaStillSprite = lavaStillSprite;
       this.lavaFlowingSprite = lavaFlowingSprite;
+      this.waterTranslucent = waterTranslucent;
+      this.lavaTranslucent = lavaTranslucent;
     }
   }
 
@@ -890,9 +1006,24 @@ public class CustomChunkMesher {
     TextureAtlasSprite waterFlow = null;
     TextureAtlasSprite lavaStill = null;
     TextureAtlasSprite lavaFlow = null;
+    boolean waterTranslucent = true;
+    boolean lavaTranslucent = false;
     if (mc != null) {
       if (mc.getModelManager() != null) {
         blockModels = mc.getModelManager().getBlockStateModelSet();
+        var fluidModels = mc.getModelManager().getFluidStateModelSet();
+        if (fluidModels != null) {
+          var waterModel =
+              fluidModels.get(net.minecraft.world.level.material.Fluids.WATER
+                  .defaultFluidState());
+          var lavaModel =
+              fluidModels.get(net.minecraft.world.level.material.Fluids.LAVA
+                  .defaultFluidState());
+          waterTranslucent =
+              waterModel == null || waterModel.layer().translucent();
+          lavaTranslucent =
+              lavaModel != null && lavaModel.layer().translucent();
+        }
       }
       if (mc.player != null) {
         buildPCX = mc.player.chunkPosition().x();
@@ -905,7 +1036,8 @@ public class CustomChunkMesher {
       lavaFlow = getFluidSprite(mc, net.minecraft.world.level.material.Fluids.LAVA, true);
     }
     return new MeshBuildContext(blockModels, buildPCX, buildPCY, buildPCZ,
-        waterStill, waterFlow, lavaStill, lavaFlow);
+        waterStill, waterFlow, lavaStill, lavaFlow,
+        waterTranslucent, lavaTranslucent);
   }
 
   private static TextureAtlasSprite getFluidSprite(Minecraft mc, net.minecraft.world.level.material.Fluid fluid,
@@ -1044,7 +1176,10 @@ public class CustomChunkMesher {
                 } else if (!fluid.isEmpty() &&
                     (fluid.getType() == net.minecraft.world.level.material.Fluids.LAVA ||
                         fluid.getType() == net.minecraft.world.level.material.Fluids.FLOWING_LAVA)) {
-                  tint = 0xFF4500;
+                  // Vanilla's lava FluidModel has no tint source. Preserve the
+                  // atlas colors rather than multiplying them by an extra
+                  // orange tint.
+                  tint = 0xFFFFFF;
                 } else {
                   net.minecraft.client.color.block.BlockTintSource source = blockColors.getTintSource(state, 0);
                   if (source != null) {
@@ -1082,16 +1217,17 @@ public class CustomChunkMesher {
 
   private void doMeshBuild(int chunkX, int chunkY, int chunkZ,
       SectionSnapshot snapshot, long key, long generation,
-      long epoch, MeshBuildContext context) {
+      long epoch, long buildClaim, MeshBuildContext context) {
     long buildStart = System.nanoTime();
     try {
-      if (isTaskCancelled(key, generation, epoch)) {
+      if (isTaskCancelled(key, generation, epoch, buildClaim)) {
         return;
       }
 
       if (snapshot != null && snapshot.paddedBlockStates != null &&
           isSectionFullyOccluded(snapshot.paddedBlockStates)) {
-        removeEmptyMesh(key, chunkX, chunkY, chunkZ, generation, epoch);
+        removeEmptyMesh(key, chunkX, chunkY, chunkZ, generation, epoch,
+            buildClaim);
         return;
       }
 
@@ -1104,7 +1240,7 @@ public class CustomChunkMesher {
           snapshot, context, chunkX, chunkY, chunkZ);
 
       builder.build();
-      if (isTaskCancelled(key, generation, epoch)) {
+      if (isTaskCancelled(key, generation, epoch, buildClaim)) {
         return;
       }
 
@@ -1113,12 +1249,14 @@ public class CustomChunkMesher {
       int quadCount = opaqueQuadCount + waterQuadCount;
 
       if (quadCount == 0) {
-        removeEmptyMesh(key, chunkX, chunkY, chunkZ, generation, epoch);
+        removeEmptyMesh(key, chunkX, chunkY, chunkZ, generation, epoch,
+            buildClaim);
         return;
       }
 
       vertexBuffer.flip();
-      int[] facingQuadCounts = bucketQuadsByFacing(vertexBuffer, opaqueQuadCount, waterQuadCount);
+      int[] facingQuadCounts =
+          bucketQuadsByFacing(vertexBuffer, opaqueQuadCount);
 
       if (waterQuadCount > 0) {
         waterBuffer.flip();
@@ -1130,13 +1268,13 @@ public class CustomChunkMesher {
       long visibilityMask = computeVisibilityMask(snapshot.paddedBlockStates);
       int dataLen = quadCount * 4 * VERTEX_STRIDE;
 
-      if (isTaskCancelled(key, generation, epoch)) {
+      if (isTaskCancelled(key, generation, epoch, buildClaim)) {
         return;
       }
 
       int roundedSize = roundToSizeClass(dataLen);
       synchronized (publishLock) {
-        if (isTaskCancelled(key, generation, epoch)) {
+        if (isTaskCancelled(key, generation, epoch, buildClaim)) {
           return;
         }
 
@@ -1151,7 +1289,7 @@ public class CustomChunkMesher {
         long bufferHandle;
         UPLOAD_SEMAPHORE.acquireUninterruptibly();
         try {
-          if (isTaskCancelled(key, generation, epoch)) {
+          if (isTaskCancelled(key, generation, epoch, buildClaim)) {
             return;
           }
           bufferHandle = NativeBridge.nCreateBufferWithHint(
@@ -1162,7 +1300,7 @@ public class CustomChunkMesher {
             markDirty(chunkX, chunkY, chunkZ);
             return;
           }
-          if (isTaskCancelled(key, generation, epoch)) {
+          if (isTaskCancelled(key, generation, epoch, buildClaim)) {
             destroyReplacementBuffer(bufferHandle, oldHintHandle);
             return;
           }
@@ -1176,7 +1314,7 @@ public class CustomChunkMesher {
           UPLOAD_SEMAPHORE.release();
         }
 
-        if (isTaskCancelled(key, generation, epoch)) {
+        if (isTaskCancelled(key, generation, epoch, buildClaim)) {
           destroyReplacementBuffer(bufferHandle, oldHintHandle);
           return;
         }
@@ -1186,7 +1324,7 @@ public class CustomChunkMesher {
             context.buildPlayerCZ, visibilityMask, facingQuadCounts);
         ChunkMeshData old;
         synchronized (meshCache) {
-          if (isTaskCancelled(key, generation, epoch)) {
+          if (isTaskCancelled(key, generation, epoch, buildClaim)) {
             destroyReplacementBuffer(bufferHandle, oldHintHandle);
             return;
           }
@@ -1240,10 +1378,17 @@ public class CustomChunkMesher {
           NativeBridge.nDestroyBuffer(old.bufferHandle);
         }
 
+        synchronized (completedGeneration) {
+          completedGeneration.put(key, generation);
+        }
+        synchronized (completedEpoch) {
+          completedEpoch.put(key, epoch);
+        }
         meshUpdateGeneration.incrementAndGet();
         recordVisibleLatency(key);
         MetalRenderProfiler.getInstance().incrementMeshesBuilt(1);
-        if (!isTaskCancelled(key, generation, epoch)) {
+        if (!isTaskCancelled(
+                key, generation, epoch, buildClaim)) {
           synchronized (dirtyKeys) {
             dirtyKeys.remove(key);
           }
@@ -1434,6 +1579,8 @@ public class CustomChunkMesher {
       if (!isWater && !isLava) {
         return;
       }
+      boolean translucent =
+          isWater ? context.waterTranslucent : context.lavaTranslucent;
 
       BlockState above = getPaddedBlockState(lx, ly + 1, lz);
       boolean upVisible = above == null || above.getFluidState().isEmpty();
@@ -1441,22 +1588,27 @@ public class CustomChunkMesher {
       boolean downVisible = below == null || below.getFluidState().isEmpty();
 
       float[] cornerHeights = new float[4];
-      cornerHeights[0] = sampleFluidCornerHeight(lx, ly, lz, 0, 0);
-      cornerHeights[1] = sampleFluidCornerHeight(lx, ly, lz, 1, 0);
-      cornerHeights[2] = sampleFluidCornerHeight(lx, ly, lz, 1, 1);
-      cornerHeights[3] = sampleFluidCornerHeight(lx, ly, lz, 0, 1);
+      Fluid fluidType = fluid.getType();
+      cornerHeights[0] = sampleFluidCornerHeight(lx, ly, lz, 0, 0,
+          fluidType);
+      cornerHeights[1] = sampleFluidCornerHeight(lx, ly, lz, 1, 0,
+          fluidType);
+      cornerHeights[2] = sampleFluidCornerHeight(lx, ly, lz, 1, 1,
+          fluidType);
+      cornerHeights[3] = sampleFluidCornerHeight(lx, ly, lz, 0, 1,
+          fluidType);
 
       byte light = getPaddedLight(lx, ly, lz);
       int fluidColor = getBiomeTint(lx, ly, lz);
       byte r = (byte) ((fluidColor >> 16) & 0xFF);
       byte g = (byte) ((fluidColor >> 8) & 0xFF);
       byte b = (byte) (fluidColor & 0xFF);
-      byte a = isLava ? (byte) 0xFF : WATER_ALPHA;
+      byte a = translucent ? WATER_ALPHA : (byte) 0xFF;
 
       if (upVisible) {
-        float flowAngle = computeFluidFlowAngle(lx, ly, lz);
+        float flowAngle = computeFluidFlowAngle(lx, ly, lz, fluidType);
         renderFluidTop(lx, ly, lz, cornerHeights, r, g, b, a, light, flowAngle, isLava,
-            fluid.isSource());
+            fluid.isSource(), translucent);
       }
 
       for (Direction dir : ALL_DIRECTIONS) {
@@ -1467,20 +1619,17 @@ public class CustomChunkMesher {
           continue;
         if (neighbor.isSolidRender())
           continue;
-        renderFluidSide(lx, ly, lz, dir, cornerHeights, r, g, b, a, light, isLava);
+        renderFluidSide(lx, ly, lz, dir, cornerHeights, r, g, b, a, light,
+            isLava, translucent);
       }
 
       if (downVisible) {
         BlockState downState = getPaddedBlockState(lx, ly - 1, lz);
         if (downState == null || !downState.isSolidRender()) {
-          renderFluidBottom(lx, ly, lz, r, g, b, a, light, isLava);
+          renderFluidBottom(lx, ly, lz, r, g, b, a, light, isLava,
+              translucent);
         }
       }
-    }
-
-    private boolean isWaterFluid(FluidState fs) {
-      return fs.getType() == net.minecraft.world.level.material.Fluids.WATER ||
-          fs.getType() == net.minecraft.world.level.material.Fluids.FLOWING_WATER;
     }
 
     private short mapFluidU(TextureAtlasSprite sprite, float u) {
@@ -1499,31 +1648,33 @@ public class CustomChunkMesher {
       return (short) (t * 65535f);
     }
 
-    private float sampleFluidHeight(int x, int y, int z) {
+    private float sampleFluidHeight(int x, int y, int z,
+        Fluid referenceFluid) {
       BlockState state = getPaddedBlockState(x, y, z);
       if (state == null)
         return 0.0f;
       FluidState fs = state.getFluidState();
-      if (fs.isEmpty() || !isWaterFluid(fs))
+      if (!isSameFluidFamily(referenceFluid, fs))
         return 0.0f;
       BlockState above = getPaddedBlockState(x, y + 1, z);
       if (above != null) {
         FluidState aboveFs = above.getFluidState();
-        if (!aboveFs.isEmpty() && isWaterFluid(aboveFs)) {
+        if (isSameFluidFamily(referenceFluid, aboveFs)) {
           return 1.0f;
         }
       }
       return fs.getOwnHeight();
     }
 
-    private float sampleFluidCornerHeight(int lx, int ly, int lz, int dx, int dz) {
+    private float sampleFluidCornerHeight(int lx, int ly, int lz, int dx,
+        int dz, Fluid referenceFluid) {
       float sum = 0.0f;
       int count = 0;
       for (int sx = 0; sx <= 1; sx++) {
         for (int sz = 0; sz <= 1; sz++) {
           int nx = lx + dx + sx - 1;
           int nz = lz + dz + sz - 1;
-          float h = sampleFluidHeight(nx, ly, nz);
+          float h = sampleFluidHeight(nx, ly, nz, referenceFluid);
           if (h > 0.0f) {
             sum += h;
             count++;
@@ -1533,11 +1684,12 @@ public class CustomChunkMesher {
       return count > 0 ? sum / count : 0.0f;
     }
 
-    private float computeFluidFlowAngle(int lx, int ly, int lz) {
-      float hEast = sampleFluidHeight(lx + 1, ly, lz);
-      float hWest = sampleFluidHeight(lx - 1, ly, lz);
-      float hSouth = sampleFluidHeight(lx, ly, lz + 1);
-      float hNorth = sampleFluidHeight(lx, ly, lz - 1);
+    private float computeFluidFlowAngle(int lx, int ly, int lz,
+        Fluid referenceFluid) {
+      float hEast = sampleFluidHeight(lx + 1, ly, lz, referenceFluid);
+      float hWest = sampleFluidHeight(lx - 1, ly, lz, referenceFluid);
+      float hSouth = sampleFluidHeight(lx, ly, lz + 1, referenceFluid);
+      float hNorth = sampleFluidHeight(lx, ly, lz - 1, referenceFluid);
 
       float dx = hWest - hEast;
       float dz = hNorth - hSouth;
@@ -1549,7 +1701,8 @@ public class CustomChunkMesher {
     }
 
     private void renderFluidTop(int lx, int ly, int lz, float[] heights, byte r, byte g, byte b, byte a, byte light,
-        float flowAngle, boolean lava, boolean isSource) {
+        float flowAngle, boolean lava, boolean isSource,
+        boolean translucent) {
       float h0 = heights[0];
       float h1 = heights[1];
       float h2 = heights[2];
@@ -1608,16 +1761,16 @@ public class CustomChunkMesher {
       short u3 = mapFluidU(topSprite, fu3);
       short v3 = mapFluidV(topSprite, fv3);
 
-      ByteBuffer target = waterBuffer;
+      ByteBuffer target = translucent ? waterBuffer : solidBuffer;
       emitVertex(target, px0, py0, pz0, u0, v0, r, g, b, a, light, (byte) 1);
       emitVertex(target, px0, py3, pz1, u1, v1, r, g, b, a, light, (byte) 1);
       emitVertex(target, px1, py2, pz1, u2, v2, r, g, b, a, light, (byte) 1);
       emitVertex(target, px1, py1, pz0, u3, v3, r, g, b, a, light, (byte) 1);
-      waterQuadCount++;
+      incrementFluidQuadCount(translucent);
     }
 
     private void renderFluidSide(int lx, int ly, int lz, Direction dir, float[] heights, byte r, byte g, byte b, byte a,
-        byte light, boolean lava) {
+        byte light, boolean lava, boolean translucent) {
       float h0, h1;
       short x0, z0, x1, z1;
       TextureAtlasSprite sideSprite = lava ? context.lavaFlowingSprite : context.waterFlowingSprite;
@@ -1663,6 +1816,18 @@ public class CustomChunkMesher {
           return;
       }
 
+      if (!isFluidSideEndpointOrderOutward(dir, x0, z0, x1, z1)) {
+        float swapHeight = h0;
+        h0 = h1;
+        h1 = swapHeight;
+        short swapX = x0;
+        x0 = x1;
+        x1 = swapX;
+        short swapZ = z0;
+        z0 = z1;
+        z1 = swapZ;
+      }
+
       float baseY = ly + 0.875f;
       float y0 = baseY - (1.0f - h0) * 0.875f;
       float y1 = baseY - (1.0f - h1) * 0.875f;
@@ -1671,15 +1836,16 @@ public class CustomChunkMesher {
       short pyBase = (short) (ly * 256.0f);
 
       byte normal = (byte) dir.get3DDataValue();
-      ByteBuffer target = waterBuffer;
+      ByteBuffer target = translucent ? waterBuffer : solidBuffer;
       emitVertex(target, x0, py0, z0, u1, v0, r, g, b, a, light, normal);
       emitVertex(target, x0, pyBase, z0, u1, v1, r, g, b, a, light, normal);
       emitVertex(target, x1, pyBase, z1, u0, v1, r, g, b, a, light, normal);
       emitVertex(target, x1, py1, z1, u0, v0, r, g, b, a, light, normal);
-      waterQuadCount++;
+      incrementFluidQuadCount(translucent);
     }
 
-    private void renderFluidBottom(int lx, int ly, int lz, byte r, byte g, byte b, byte a, byte light, boolean lava) {
+    private void renderFluidBottom(int lx, int ly, int lz, byte r, byte g,
+        byte b, byte a, byte light, boolean lava, boolean translucent) {
       short px0 = (short) (lx * 256.0f);
       short pz0 = (short) (lz * 256.0f);
       short px1 = (short) ((lx + 1) * 256.0f);
@@ -1692,12 +1858,20 @@ public class CustomChunkMesher {
       short v0 = mapFluidV(bottomSprite, 0.0f);
       short v1 = mapFluidV(bottomSprite, 1.0f);
 
-      ByteBuffer target = waterBuffer;
+      ByteBuffer target = translucent ? waterBuffer : solidBuffer;
       emitVertex(target, px0, py, pz1, u0, v1, r, g, b, a, light, (byte) 0);
       emitVertex(target, px0, py, pz0, u0, v0, r, g, b, a, light, (byte) 0);
       emitVertex(target, px1, py, pz0, u1, v0, r, g, b, a, light, (byte) 0);
       emitVertex(target, px1, py, pz1, u1, v1, r, g, b, a, light, (byte) 0);
-      waterQuadCount++;
+      incrementFluidQuadCount(translucent);
+    }
+
+    private void incrementFluidQuadCount(boolean translucent) {
+      if (translucent) {
+        waterQuadCount++;
+      } else {
+        opaqueQuadCount++;
+      }
     }
 
     private void emitBakedQuad(BakedQuad quad, int lx, int ly, int lz,
@@ -1884,18 +2058,48 @@ public class CustomChunkMesher {
     buf.putLong(w1);
   }
 
-  private static int[] bucketQuadsByFacing(ByteBuffer vertexBuffer, int opaqueQuadCount,
-      int waterQuadCount) {
+  static int[] bucketQuadsByFacing(ByteBuffer vertexBuffer,
+      int opaqueQuadCount) {
     int[] facingQuadCounts = new int[14];
-    int totalQuads = (vertexBuffer.limit() / (4 * VERTEX_STRIDE));
-    int startQuad = Math.max(0, totalQuads - waterQuadCount);
-    for (int i = 0; i < totalQuads; i++) {
+    for (int i = 0; i < opaqueQuadCount; i++) {
       int nIdx = readNormalIndex(vertexBuffer, i);
-      if (nIdx >= 0 && nIdx < 7) {
-        facingQuadCounts[nIdx]++;
+      facingQuadCounts[normalizeFaceBucket(nIdx)]++;
+    }
+
+    int[] nextQuad = new int[7];
+    for (int bucket = 1; bucket < nextQuad.length; bucket++) {
+      nextQuad[bucket] =
+          nextQuad[bucket - 1] + facingQuadCounts[bucket - 1];
+    }
+
+    // Native drawing issues one indexed range per visible face bucket. Counts
+    // alone are insufficient: the opaque quads must occupy matching,
+    // contiguous ranges in the uploaded vertex buffer.
+    ByteBuffer bucketed = FACE_BUCKET_BUF_POOL.get();
+    bucketed.clear();
+    int quadBytes = 4 * VERTEX_STRIDE;
+    for (int sourceQuad = 0; sourceQuad < opaqueQuadCount; sourceQuad++) {
+      int bucket = normalizeFaceBucket(
+          readNormalIndex(vertexBuffer, sourceQuad));
+      int destinationQuad = nextQuad[bucket]++;
+      int sourceOffset = sourceQuad * quadBytes;
+      int destinationOffset = destinationQuad * quadBytes;
+      for (int offset = 0; offset < quadBytes; offset += Long.BYTES) {
+        bucketed.putLong(destinationOffset + offset,
+            vertexBuffer.getLong(sourceOffset + offset));
       }
     }
+    int opaqueBytes = opaqueQuadCount * quadBytes;
+    for (int offset = 0; offset < opaqueBytes; offset += Long.BYTES) {
+      vertexBuffer.putLong(offset, bucketed.getLong(offset));
+    }
+    vertexBuffer.limit(opaqueBytes);
+    vertexBuffer.position(opaqueBytes);
     return facingQuadCounts;
+  }
+
+  private static int normalizeFaceBucket(int normalIndex) {
+    return normalIndex >= 0 && normalIndex < 7 ? normalIndex : 6;
   }
 
   private static byte readNormalIndex(ByteBuffer buf, int quadIndex) {

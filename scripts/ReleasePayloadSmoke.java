@@ -1,7 +1,9 @@
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.List;
 
 public final class ReleasePayloadSmoke {
   private ReleasePayloadSmoke() {
@@ -62,7 +64,35 @@ public final class ReleasePayloadSmoke {
     }
 
     try {
-      NativeBridge.nConfigureRuntime(true, 512, 60, true);
+      NativeFaultCounters faultBaseline = nativeFaultCounters();
+      if (!faultBaseline.isZero()) {
+        throw new IllegalStateException(
+            "native fault counters were non-zero before payload smoke: "
+                + faultBaseline);
+      }
+      NativeBridge.nConfigureRuntime(true, 128, 200, true);
+
+      List<Long> arenaAllocations = new ArrayList<>();
+      for (int index = 0; index < 8; index++) {
+        long allocation = NativeBridge.nCreateBuffer(
+            handle, 16 * 1024 * 1024, 0);
+        if (allocation == 0) {
+          throw new IllegalStateException(
+              "bounded native arena stopped before its 128 MiB cap at "
+                  + index + " allocations");
+        }
+        arenaAllocations.add(allocation);
+      }
+      if (NativeBridge.nCreateBuffer(
+          handle, 16 * 1024 * 1024, 0) != 0) {
+        throw new IllegalStateException(
+            "native allocation exceeded the configured 128 MiB cap");
+      }
+      for (long allocation : arenaAllocations) {
+        NativeBridge.nDestroyBuffer(allocation);
+      }
+      NativeBridge.nFlushDeferredDeletions();
+
       long publishedBuffer = NativeBridge.nCreateBuffer(
           handle, 4096, 0);
       long replacementBuffer = NativeBridge.nCreateBufferWithHint(
@@ -103,7 +133,26 @@ public final class ReleasePayloadSmoke {
         throw new IllegalStateException(
             "valid native texture creation failed");
       }
+      if (NativeBridge.nUpdateTexture2D(
+              0, 2, 2, new byte[16])
+          || NativeBridge.nUpdateTexture2D(
+              texture, 3, 2, new byte[24])
+          || NativeBridge.nUpdateTexture2D(
+              texture, 2, 2, new byte[15])) {
+        throw new IllegalStateException(
+            "invalid native texture update was not rejected");
+      }
+      byte[] updatedPixels = new byte[16];
+      java.util.Arrays.fill(updatedPixels, (byte) 0x7F);
+      if (!NativeBridge.nUpdateTexture2D(
+          texture, 2, 2, updatedPixels)) {
+        throw new IllegalStateException(
+            "valid native texture update was not submitted");
+      }
+      NativeBridge.nFlushFrames();
       NativeBridge.nDestroyTexture2D(texture);
+
+      long pacingMillis = runFramePacingStress(handle, 1_000);
 
       String backendMode = NativeBridge.nGetBackendMode();
       if (backendMode == null || backendMode.isBlank()) {
@@ -125,18 +174,78 @@ public final class ReleasePayloadSmoke {
         throw new IllegalStateException(
             "this release must not advertise an unvalidated MTL4 draw path");
       }
+
+      NativeBridge.nConfigureRuntime(false, 128, 200, true);
+      if (NativeBridge.nIsMetal4Active()
+          || !"METAL3".equals(NativeBridge.nGetBackendMode())) {
+        throw new IllegalStateException(
+            "Metal 3 compatibility mode did not activate cleanly: "
+                + NativeBridge.nGetBackendMode());
+      }
+      long metal3PacingMillis = runFramePacingStress(handle, 240);
+
+      NativeBridge.nConfigureRuntime(true, 128, 200, true);
+      if (isMacOs26OrNewer()
+          && (!NativeBridge.nIsMetal4Active()
+              || !"METAL4_RUNTIME_VERIFIED_METAL3_RENDER".equals(
+                  NativeBridge.nGetBackendMode()))) {
+        throw new IllegalStateException(
+            "Metal 4 runtime did not recover after Metal 3 compatibility "
+                + "cycle: " + NativeBridge.nGetBackendMode());
+      }
+      NativeBridge.nFlushFrames();
+      NativeFaultCounters faultEnd = nativeFaultCounters();
+      NativeFaultCounters faultDelta = faultEnd.deltaFrom(faultBaseline);
+      if (!faultDelta.isZero()) {
+        throw new IllegalStateException(
+            "native fault counters advanced during payload smoke: "
+                + faultDelta);
+      }
       System.out.printf(
           "release-payload-smoke: loaded=%s available=true metal4Supported=%s "
-              + "metal4Active=%s metal4Draw=false backend=%s shaderBytes=%d%n",
+              + "metal4Active=%s metal4Draw=false backend=%s shaderBytes=%d "
+              + "arenaMiB=128 pacingFrames=1000 pacingMs=%d "
+              + "metal3Frames=240 metal3PacingMs=%d nativeFaultDelta=%s%n",
           loadedLibrary,
           metal4Supported,
           metal4Active,
-          backendMode,
-          magic.length);
-      NativeBridge.nFlushFrames();
+          NativeBridge.nGetBackendMode(),
+          magic.length,
+          pacingMillis,
+          metal3PacingMillis,
+          faultDelta);
     } finally {
       NativeBridge.nDestroy(handle);
     }
+  }
+
+  private static long runFramePacingStress(long handle, int frameCount) {
+    long startedAt = System.nanoTime();
+    for (int frame = 0; frame < frameCount; frame++) {
+      long frameContext = NativeBridge.nGetCurrentFrameContext(handle);
+      if (frameContext == 0) {
+        throw new IllegalStateException(
+            "native frame pacing stalled before frame "
+                + frame + " of " + frameCount);
+      }
+      NativeBridge.nEndFrame(handle);
+      NativeBridge.nWaitForRender(handle);
+      if (!NativeBridge.nIsFrameReady(handle)) {
+        throw new IllegalStateException(
+            "native frame did not complete before bounded wait at frame "
+                + frame + " of " + frameCount);
+      }
+      NativeBridge.nRecycleUnpresentedFrames(handle);
+    }
+    long elapsedMillis =
+        (System.nanoTime() - startedAt) / 1_000_000L;
+    long maximumMillis = Math.max(2_000L, frameCount * 5L);
+    if (elapsedMillis > maximumMillis) {
+      throw new IllegalStateException(
+          "native 200 Hz pacing stress exceeded "
+              + maximumMillis + " ms: " + elapsedMillis + " ms");
+    }
+    return elapsedMillis;
   }
 
   private static boolean isMacOs26OrNewer() {
@@ -149,6 +258,45 @@ public final class ReleasePayloadSmoke {
           System.getProperty("os.version", "0")).feature() >= 26;
     } catch (IllegalArgumentException ignored) {
       return false;
+    }
+  }
+
+  private static NativeFaultCounters nativeFaultCounters() {
+    return new NativeFaultCounters(
+        NativeBridge.nGetGpuCommandBufferErrorCount(),
+        NativeBridge.nGetInFlightFrameTimeoutCount(),
+        NativeBridge.nGetNoIOSurfaceSlotSkipCount());
+  }
+
+  private record NativeFaultCounters(long gpuCommandBufferErrors,
+                                     long inFlightFrameTimeouts,
+                                     long noIOSurfaceSlotSkips) {
+    private NativeFaultCounters {
+      if (gpuCommandBufferErrors < 0
+          || inFlightFrameTimeouts < 0
+          || noIOSurfaceSlotSkips < 0) {
+        throw new IllegalStateException(
+            "native fault counter overflowed signed Java range");
+      }
+    }
+
+    private boolean isZero() {
+      return gpuCommandBufferErrors == 0
+          && inFlightFrameTimeouts == 0
+          && noIOSurfaceSlotSkips == 0;
+    }
+
+    private NativeFaultCounters deltaFrom(NativeFaultCounters baseline) {
+      if (gpuCommandBufferErrors < baseline.gpuCommandBufferErrors
+          || inFlightFrameTimeouts < baseline.inFlightFrameTimeouts
+          || noIOSurfaceSlotSkips < baseline.noIOSurfaceSlotSkips) {
+        throw new IllegalStateException(
+            "native fault counters are not monotonic");
+      }
+      return new NativeFaultCounters(
+          gpuCommandBufferErrors - baseline.gpuCommandBufferErrors,
+          inFlightFrameTimeouts - baseline.inFlightFrameTimeouts,
+          noIOSurfaceSlotSkips - baseline.noIOSurfaceSlotSkips);
     }
   }
 }

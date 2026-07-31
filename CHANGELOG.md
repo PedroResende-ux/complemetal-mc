@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.0+mc26.2
+
+### Stable hybrid profile
+
+- Promote the conservative Apple Silicon hybrid configuration for Minecraft
+  Java Edition 26.2: selected terrain rendering uses the Metal 3 compatibility
+  stream and unsupported content retains Minecraft's normal renderer.
+- Keep the Metal 4 queue, allocator and completion probe enabled when the
+  runtime exposes it, while keeping actual MTL4 draw encoding disabled.
+- Retain the safe vanilla overlay, bounded native memory policy, fenced
+  IOSurface ownership and fail-open initialization/restart behavior.
+- Correct chunk face-bucket interpretation and validate the active Metal path
+  through Overworld, Nether and End transitions.
+- Correct still/flowing fluid-family height sampling, keep opaque lava in the
+  opaque terrain stream, and fix NORTH/EAST fluid-side winding under back-face
+  culling.
+- Keep the pending-section set and priority list synchronized when sorting is
+  deferred, preventing block-update rebuild queues from stalling.
+- Bound each bulk block-update recovery episode to one clean rebuild instead
+  of repeatedly clearing meshes while late section updates arrive.
+- Give every asynchronous section build a unique ownership token so a stale
+  worker cannot clear or publish over its replacement.
+- Validate resize and fullscreen transitions in both the Metal 4 hybrid and
+  forced Metal 3 profiles.
+
+### Iris boundary
+
+- Keep Iris shader-pack rendering on Iris' OpenGL path. MetalRender detaches
+  its presentation path while an Iris shader pack is active.
+- Keep final-GLSL capture and GLSL-to-SPIR-V-to-MSL translation as an opt-in
+  developer experiment. Generated MSL is cached but is not compiled into or
+  executed by a Metal render graph, so this release makes no Iris FPS claim.
+- Scope the translation evidence to the exact tested 76-program Complementary
+  Reimagined workload rather than claiming arbitrary shader-pack capacity.
+
+### Explicit exclusions
+
+- True 2x Retina framebuffer backing, macOS sleep/wake and external-display
+  hot-plug/reconnect are not validated by this release.
+- The native high-rate stress loop validates offscreen buffer recycling and
+  throughput only. It is not evidence of real presented 200 Hz frame pacing.
+
 ## 0.2.0-beta.2+mc26.2
 
 ### Iris shader foundation
@@ -11,9 +53,10 @@
   SPIRV-Cross to MSL without persisting source GLSL or program names.
 - Add content-addressed, integrity-checked SPIR-V/MSL artifacts and an
   immutable, size-bounded disk cache.
-- Keep the bounded capture queue large enough for a complete shader-pack link,
-  then delay and throttle background translation so it does not compete with
-  Iris' initial shader-pack and world-load work.
+- Keep a bounded capture queue validated against the exact tested 76-program
+  Complementary Reimagined workload, then delay and throttle background
+  translation so it does not compete with Iris' initial shader-pack and
+  world-load work. Queue overload remains fail-open and may skip captures.
 
 ### Metal pipeline preparation
 

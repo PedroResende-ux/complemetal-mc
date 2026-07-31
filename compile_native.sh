@@ -81,7 +81,24 @@ fi
 
 if [[ "${BUILD_NATIVE:-1}" != "0" ]]; then
   native_output="$native_build_dir/libmetalrender.dylib"
-  clang++ -arch arm64 -O3 -DNDEBUG -std=c++17 -dynamiclib -fblocks \
+  sanitizer_mode="${METALRENDER_NATIVE_SANITIZER:-}"
+  native_compile_flags=(-O3 -DNDEBUG)
+  if [[ -n "$sanitizer_mode" ]]; then
+    if [[ "$sanitizer_mode" != "address" ]]; then
+      echo "Unsupported native sanitizer: $sanitizer_mode" >&2
+      exit 1
+    fi
+    native_compile_flags=(
+      -O1
+      -g
+      -fno-omit-frame-pointer
+      -fsanitize=address
+    )
+    echo "Building native library with AddressSanitizer"
+  fi
+
+  xcrun --sdk macosx clang++ -arch arm64 "${native_compile_flags[@]}" \
+    -std=c++17 -dynamiclib -fblocks \
     -mmacosx-version-min="$deployment_target" \
     -Wl,-install_name,@rpath/libmetalrender.dylib \
     -isysroot "$sdk_root" \

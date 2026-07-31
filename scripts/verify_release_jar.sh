@@ -5,8 +5,17 @@ project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 jar_path="${1:-}"
 
 if [[ -z "$jar_path" ]]; then
-  jar_path="$(find "$project_dir/build/libs" -maxdepth 1 -type f -name '*.jar' \
-    ! -name '*-sources.jar' | sort | tail -n 1)"
+  mod_version="$(sed -n 's/^mod_version=//p' "$project_dir/gradle.properties" |
+    head -n 1)"
+  archives_base_name="$(
+    sed -n 's/^archives_base_name=//p' "$project_dir/gradle.properties" |
+      head -n 1
+  )"
+  if [[ -z "$mod_version" || -z "$archives_base_name" ]]; then
+    echo "Could not resolve the release JAR name from gradle.properties" >&2
+    exit 1
+  fi
+  jar_path="$project_dir/build/libs/$archives_base_name-$mod_version.jar"
 fi
 
 if [[ -z "$jar_path" || ! -f "$jar_path" ]]; then
@@ -47,6 +56,12 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 if ! file "$tmp_dir/libmetalrender.dylib" | grep -q 'Mach-O 64-bit.*arm64'; then
   echo "Packaged native library is not macOS arm64" >&2
+  exit 1
+fi
+
+if otool -L "$tmp_dir/libmetalrender.dylib" |
+   grep -Eq 'libclang_rt\.(asan|tsan|ubsan|msan)'; then
+  echo "Release JAR contains a sanitizer-instrumented native library" >&2
   exit 1
 fi
 
@@ -123,6 +138,19 @@ nm -gU "$tmp_dir/libmetalrender.dylib" |
   sort -u > "$jni_actual"
 comm -23 "$jni_expected" "$jni_actual" > "$jni_missing"
 comm -13 "$jni_expected" "$jni_actual" > "$jni_orphaned"
+
+required_release_qa_exports=(
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetGpuCommandBufferErrorCount"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetInFlightFrameTimeoutCount"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetNoIOSurfaceSlotSkipCount"
+)
+for required in "${required_release_qa_exports[@]}"; do
+  if ! grep -Fxq "$required" "$jni_expected" ||
+     ! grep -Fxq "$required" "$jni_actual"; then
+    echo "Packaged JAR is missing required release-QA JNI telemetry: $required" >&2
+    exit 1
+  fi
+done
 
 if [[ -s "$jni_missing" || -s "$jni_orphaned" ]]; then
   if [[ -s "$jni_missing" ]]; then

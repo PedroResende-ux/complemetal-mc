@@ -706,7 +706,7 @@ public class MetalRenderSettingsScreen extends Screen {
   private void buildAdvanced() {
     sec("Metal Features");
     nfo("Fast Terrain Replacement", "Disabled pending depth interop validation");
-    nfo("Entities & Particles", "Vanilla overlay (safe beta default)");
+    nfo("Entities & Particles", "Vanilla overlay (safe stable default)");
     nfo("Iris Shader Compatibility",
         IrisCompatibility.requiresShaderCompatibilityMode()
             ? "Active - Iris owns terrain"

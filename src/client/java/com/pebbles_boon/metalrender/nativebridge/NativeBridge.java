@@ -431,7 +431,7 @@ public final class NativeBridge {
 
   public static native void nDestroyTexture2D(long textureHandle);
 
-  public static native void nUpdateTexture2D(long textureHandle, int width,
+  public static native boolean nUpdateTexture2D(long textureHandle, int width,
       int height, byte[] pixelData);
 
   public static native long nGetDeviceHandle(long handle);
@@ -587,6 +587,17 @@ public final class NativeBridge {
   public static native boolean nIsMetal4DrawPathActive();
 
   public static native String nGetBackendMode();
+
+  /**
+   * Process-lifetime monotonic counters used by release QA. They deliberately
+   * do not reset when a renderer or world is recreated, so a late asynchronous
+   * native failure cannot be hidden by lifecycle cleanup.
+   */
+  public static native long nGetGpuCommandBufferErrorCount();
+
+  public static native long nGetInFlightFrameTimeoutCount();
+
+  public static native long nGetNoIOSurfaceSlotSkipCount();
 
   public static native void nDrawOITPass(long frameContext);
 

@@ -51,8 +51,14 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     String expectedSha = requiredProperty("metalrender.exactJar.expectedSha256");
     String cacheExpectation =
         requiredProperty("metalrender.exactJar.cacheExpectation");
+    String backendExpectation =
+        requiredProperty("metalrender.exactJar.backend");
     require(cacheExpectation.equals("cold") || cacheExpectation.equals("warm"),
         "invalid cache expectation: " + cacheExpectation);
+    require(backendExpectation.equals("metal4")
+            || backendExpectation.equals("metal3"),
+        "invalid backend expectation: " + backendExpectation);
+    boolean expectMetal4 = backendExpectation.equals("metal4");
     require(expectedSha.equals(sha256(exactJar)),
         "loaded release JAR SHA-256 differs from the prepared artifact");
     require(System.getProperty("java.version", "").startsWith("25."),
@@ -83,18 +89,30 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
                     .getFileName().toString()),
         "native payload cache is not versioned as "
             + expectedNativeCacheVersion + ": " + loadedNative);
-    require(NativeBridge.nSupportsMetal4(),
-        "Metal 4 is not supported on the QA device");
-    require(NativeBridge.nIsMetal4Active(),
-        "Metal 4 queue/allocator runtime is not active");
     require(!NativeBridge.nIsMetal4DrawPathActive(),
         "unvalidated native MTL4 draw encoding must remain disabled");
-    require("METAL4_RUNTIME_VERIFIED_METAL3_RENDER".equals(
-        NativeBridge.nGetBackendMode()),
-        "unexpected backend mode: " + NativeBridge.nGetBackendMode());
+    if (expectMetal4) {
+      require(NativeBridge.nSupportsMetal4(),
+          "Metal 4 is not supported on the QA device");
+      require(NativeBridge.nIsMetal4Active(),
+          "Metal 4 queue/allocator runtime is not active");
+      require("METAL4_RUNTIME_VERIFIED_METAL3_RENDER".equals(
+          NativeBridge.nGetBackendMode()),
+          "unexpected Metal 4 hybrid backend mode: "
+              + NativeBridge.nGetBackendMode());
+    } else {
+      require(!NativeBridge.nIsMetal4Active(),
+          "Metal 4 runtime remained active in the Metal 3 QA profile");
+      require("METAL3".equals(NativeBridge.nGetBackendMode()),
+          "unexpected Metal 3 backend mode: "
+              + NativeBridge.nGetBackendMode());
+    }
 
     MetalRenderConfig config = MetalRenderClient.getConfig();
     require(config != null, "MetalRender config was not loaded");
+    require(config.enableMetal4 == expectMetal4,
+        "MetalRender config did not apply backend expectation "
+            + backendExpectation);
     require(!config.enableFastTerrainReplacement,
         "fast terrain replacement must be off in release-safe defaults");
     require(!config.enableExperimentalFeatureReplacement,
@@ -103,6 +121,11 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     IrisApi iris = IrisApi.getInstance();
     require(iris.getConfig().areShadersEnabled(),
         "Iris shaders were not enabled by the isolated QA profile");
+
+    NativeFaultCounters nativeFaultBaseline = nativeFaultCounters();
+    require(nativeFaultBaseline.isZero(),
+        "native fault counters were non-zero before gameplay: "
+            + nativeFaultBaseline);
 
     Path shadersOn;
     Path shadersOff;
@@ -251,10 +274,19 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
                       == translationStatus.attempted()
                   && translationStatus.translated() == 0),
           "warm-cache run did not reuse every captured program");
+      context.runOnClient(client -> NativeBridge.nFlushFrames());
+      NativeFaultCounters nativeFaultEnd =
+          context.computeOnClient(client -> nativeFaultCounters());
+      NativeFaultCounters nativeFaultDelta =
+          nativeFaultEnd.deltaFrom(nativeFaultBaseline);
+      require(nativeFaultDelta.isZero(),
+          "native GPU/IOSurface fault counters advanced during exact-JAR QA: "
+              + nativeFaultDelta);
       writeEvidence(exactJar, expectedSha, frames, framesWithShadersOff,
           metalPresentationsWithShadersOff, shadersOn, shadersOff,
           shadersReenabled, visualMetrics, translationStatus,
-          cacheExpectation);
+          cacheExpectation, backendExpectation, nativeFaultBaseline,
+          nativeFaultEnd, nativeFaultDelta);
     }
   }
 
@@ -336,6 +368,41 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
                                     long presentationCount) {
   }
 
+  private static NativeFaultCounters nativeFaultCounters() {
+    return new NativeFaultCounters(
+        NativeBridge.nGetGpuCommandBufferErrorCount(),
+        NativeBridge.nGetInFlightFrameTimeoutCount(),
+        NativeBridge.nGetNoIOSurfaceSlotSkipCount());
+  }
+
+  private record NativeFaultCounters(long gpuCommandBufferErrors,
+                                     long inFlightFrameTimeouts,
+                                     long noIOSurfaceSlotSkips) {
+    private NativeFaultCounters {
+      require(gpuCommandBufferErrors >= 0
+              && inFlightFrameTimeouts >= 0
+              && noIOSurfaceSlotSkips >= 0,
+          "native fault counter overflowed signed Java range");
+    }
+
+    private boolean isZero() {
+      return gpuCommandBufferErrors == 0
+          && inFlightFrameTimeouts == 0
+          && noIOSurfaceSlotSkips == 0;
+    }
+
+    private NativeFaultCounters deltaFrom(NativeFaultCounters baseline) {
+      require(gpuCommandBufferErrors >= baseline.gpuCommandBufferErrors
+              && inFlightFrameTimeouts >= baseline.inFlightFrameTimeouts
+              && noIOSurfaceSlotSkips >= baseline.noIOSurfaceSlotSkips,
+          "native fault counters are not monotonic");
+      return new NativeFaultCounters(
+          gpuCommandBufferErrors - baseline.gpuCommandBufferErrors,
+          inFlightFrameTimeouts - baseline.inFlightFrameTimeouts,
+          noIOSurfaceSlotSkips - baseline.noIOSurfaceSlotSkips);
+    }
+  }
+
   private static Path exactReleaseJar() {
     try {
       URI codeSource = MetalRenderClient.class.getProtectionDomain()
@@ -359,7 +426,10 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       long metalPresentationsWithShadersOff, Path shadersOn, Path shadersOff,
       Path shadersReenabled, VisualMetrics visualMetrics,
       IrisTranslationCoordinator.Status translationStatus,
-      String cacheExpectation) {
+      String cacheExpectation, String backendExpectation,
+      NativeFaultCounters nativeFaultBaseline,
+      NativeFaultCounters nativeFaultEnd,
+      NativeFaultCounters nativeFaultDelta) {
     Path result = Path.of(requiredProperty(
         "metalrender.exactJar.driverEvidencePath")).toAbsolutePath();
     Path temporary = result.resolveSibling(result.getFileName() + ".tmp");
@@ -377,11 +447,14 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "exactJarPath": %s,
           "exactJarSha256": %s,
           "cacheExpectation": %s,
+          "backendExpectation": %s,
           "backendMode": %s,
-          "metal4Active": true,
-          "metal4DrawPathActive": false,
+          "metal4Active": %s,
+          "metal4DrawPathActive": %s,
           "sodiumLoaded": true,
           "irisLoaded": true,
+          "irisDrawBackend": "OPENGL",
+          "generatedMslExecuted": false,
           "shaderPack": %s,
           "shaderPackInitiallyLoaded": true,
           "shaderPackDisabledAndApplied": true,
@@ -399,6 +472,24 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             "captureFailures": %d,
             "queuedAtEvidence": %d,
             "pipelineStatus": "pending"
+          },
+          "nativeFaultCounters": {
+            "semantics": "process-lifetime-monotonic",
+            "baseline": {
+              "gpuCommandBufferErrors": %d,
+              "inFlightFrameTimeouts": %d,
+              "noIOSurfaceSlotSkips": %d
+            },
+            "end": {
+              "gpuCommandBufferErrors": %d,
+              "inFlightFrameTimeouts": %d,
+              "noIOSurfaceSlotSkips": %d
+            },
+            "delta": {
+              "gpuCommandBufferErrors": %d,
+              "inFlightFrameTimeouts": %d,
+              "noIOSurfaceSlotSkips": %d
+            }
           },
           "visualChecks": {
             "width": %d,
@@ -420,7 +511,10 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         quote(exactJar.toString()),
         quote(exactSha),
         quote(cacheExpectation),
+        quote(backendExpectation),
         quote(NativeBridge.nGetBackendMode()),
+        Boolean.toString(NativeBridge.nIsMetal4Active()),
+        Boolean.toString(NativeBridge.nIsMetal4DrawPathActive()),
         quote(shaderPack),
         frames,
         framesWithShadersOff,
@@ -432,6 +526,15 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         translationStatus.rejected(),
         translationStatus.captureFailures(),
         translationStatus.queued(),
+        nativeFaultBaseline.gpuCommandBufferErrors(),
+        nativeFaultBaseline.inFlightFrameTimeouts(),
+        nativeFaultBaseline.noIOSurfaceSlotSkips(),
+        nativeFaultEnd.gpuCommandBufferErrors(),
+        nativeFaultEnd.inFlightFrameTimeouts(),
+        nativeFaultEnd.noIOSurfaceSlotSkips(),
+        nativeFaultDelta.gpuCommandBufferErrors(),
+        nativeFaultDelta.inFlightFrameTimeouts(),
+        nativeFaultDelta.noIOSurfaceSlotSkips(),
         visualMetrics.width(),
         visualMetrics.height(),
         visualMetrics.minimumUniqueColors(),

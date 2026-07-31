@@ -32,6 +32,7 @@ public class MetalTextureManager {
   private ReadbackRequest atlasReadbackRequest;
   private ReadbackRequest lightmapReadbackRequest;
   private long readbackGeneration;
+  private volatile long completedAtlasRevision;
   private static final AtomicLong ATLAS_DIRTY_REVISION =
       new AtomicLong(1L);
   public static volatile boolean atlasDirty = true;
@@ -61,6 +62,10 @@ public class MetalTextureManager {
   public static void markAtlasDirty() {
     ATLAS_DIRTY_REVISION.incrementAndGet();
     atlasDirty = true;
+  }
+
+  public static long getAtlasDirtyRevision() {
+    return ATLAS_DIRTY_REVISION.get();
   }
 
   public MetalTextureManager(long deviceHandle) {
@@ -188,6 +193,14 @@ public class MetalTextureManager {
 
   public boolean isUsingFallbackBlockAtlas() {
     return usingFallbackBlockAtlas;
+  }
+
+  public boolean isAtlasReadbackPending() {
+    return atlasReadbackPending;
+  }
+
+  public long getCompletedAtlasRevision() {
+    return completedAtlasRevision;
   }
 
   public long getBlockAtlasTexture() {
@@ -321,11 +334,15 @@ public class MetalTextureManager {
         MetalLogger.info("atlas ready: %dx%d h=%d",
             width, height, newTexture);
       } else {
-        NativeBridge.nUpdateTexture2D(
-            blockAtlasTexture, width, height, atlasUploadData);
+        if (!NativeBridge.nUpdateTexture2D(
+            blockAtlasTexture, width, height, atlasUploadData)) {
+          throw new IllegalStateException(
+              "native atlas texture update was not submitted");
+        }
       }
       blockAtlasLoaded = true;
       usingFallbackBlockAtlas = false;
+      completedAtlasRevision = dirtyRevision;
       atlasDirty = ATLAS_DIRTY_REVISION.get() != dirtyRevision;
     } catch (Throwable error) {
       atlasDirty = true;
@@ -366,8 +383,11 @@ public class MetalTextureManager {
         MetalLogger.info("lightmap ready: %dx%d h=%d",
             width, height, newTexture);
       } else {
-        NativeBridge.nUpdateTexture2D(
-            lightmapTexture, width, height, lightmapUploadData);
+        if (!NativeBridge.nUpdateTexture2D(
+            lightmapTexture, width, height, lightmapUploadData)) {
+          throw new IllegalStateException(
+              "native lightmap texture update was not submitted");
+        }
       }
       lightmapLoaded = true;
       if (gameTime != Long.MIN_VALUE) {
@@ -476,6 +496,7 @@ public class MetalTextureManager {
     atlasUploadData = null;
     lightmapUploadData = null;
     atlasFramesSinceUpload = 0;
+    completedAtlasRevision = 0L;
     markAtlasDirty();
   }
 }

@@ -115,6 +115,18 @@ tasks.named("runClientGameTest", JavaExec) {
     if (sanitizerRuntime.isPresent()) {
         environment "DYLD_INSERT_LIBRARIES", sanitizerRuntime.get()
     }
+    [
+        "metalrender.enabled",
+        "metalrender.feature.metal4",
+        "metalrender.gametest.baseline",
+        "metalrender.gametest.requireRetina",
+        "metalrender.gametest.iconify"
+    ].each { propertyName ->
+        def propertyValue = System.getProperty(propertyName)
+        if (propertyValue != null) {
+            systemProperty propertyName, propertyValue
+        }
+    }
 }
 
 tasks.named("compileTestJava") {
@@ -159,6 +171,11 @@ tasks.register("buildNative", Exec) {
         include "*.h"
         include "*.mm"
     })
+    inputs.property(
+        "nativeSanitizer",
+        providers.environmentVariable("METALRENDER_NATIVE_SANITIZER")
+            .orElse("")
+    )
     outputs.file(layout.buildDirectory.file("native/libmetalrender.dylib"))
     outputs.file("src/main/resources/libmetalrender.dylib")
 
@@ -186,6 +203,9 @@ def buildReleaseNativePayload =
 
         environment "BUILD_NATIVE", "1"
         environment "BUILD_SHADERS", "1"
+        // A publishable payload must never inherit a developer's sanitizer
+        // environment and accidentally package an ASan runtime dependency.
+        environment "METALRENDER_NATIVE_SANITIZER", ""
         workingDir projectDir
         commandLine "bash", file("compile_native.sh").absolutePath
     }

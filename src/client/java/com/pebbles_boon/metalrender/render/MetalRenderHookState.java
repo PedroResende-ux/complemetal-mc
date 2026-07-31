@@ -284,7 +284,8 @@ public final class MetalRenderHookState {
     }
     MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
     return worldRenderer != null && worldRenderer.metalActive() &&
-        worldRenderer.areTexturesReady();
+        worldRenderer.areTexturesReady() &&
+        !worldRenderer.isPresentationSuppressedForRecovery();
   }
 
   private static boolean isScreenshotRequested() {

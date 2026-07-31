@@ -103,6 +103,10 @@ public class MetalWorldRenderer {
   private static final int TEXTURE_BACKOFF_RECOVER_CONSEC = 5;
   private static final int BACKED_OFF_ATLAS_SYNC_FRAME_INTERVAL = 8;
   private static final int BACKED_OFF_LIGHTMAP_SYNC_FRAME_INTERVAL = 32;
+  private static final int BULK_UPDATE_TRIGGER_COUNT = 256;
+  private static final int BULK_UPDATE_BURST_GAP_FRAMES = 2;
+  private static final int BULK_UPDATE_QUIET_FRAMES = 8;
+  private static final int BULK_UPDATE_REBUILD_WARMUP_FRAMES = 90;
   private static final int JAVA_PROFILE_EMIT_INTERVAL = 240;
   private static volatile java.lang.reflect.Field skyLightFactorField;
   private static volatile java.lang.reflect.Method skyLightProbeGetValueMethod;
@@ -116,11 +120,12 @@ public class MetalWorldRenderer {
   private final IOSurfaceBlitter ioSurfaceBlitter;
   private final Matrix4f projectionMatrix;
   private final Matrix4f modelViewMatrix;
+  private volatile long worldLifecycleEpoch;
   private boolean worldLoaded;
   private boolean renderingActive;
   private boolean nativeWorldLoaded;
   private boolean texturesReady;
-  private boolean irisCompatibilityPaused;
+  private volatile boolean irisCompatibilityPaused;
   private int frameCount;
   private int maxMeshes = DEFAULT_MAX_MESHES;
   private int maxDrawnChunksPerFrame = 65536;
@@ -161,6 +166,12 @@ public class MetalWorldRenderer {
   private boolean loggedWorldLoadWithoutRenderer;
   private long lastLoadingModeLogMs;
   private long lastQueuePressureLogMs;
+  private int blockUpdateBurstCount;
+  private int lastBlockUpdateFrame = Integer.MIN_VALUE;
+  private int bulkUpdateRebuildFrame;
+  private int bulkUpdateRecoveryCount;
+  private boolean bulkUpdateRecoveryActive;
+  private boolean bulkUpdateRebuildStarted;
 
   public MetalWorldRenderer() {
     this.frustumCuller = new FrustumCuller();
@@ -185,6 +196,7 @@ public class MetalWorldRenderer {
     if (worldLoaded && renderingActive) {
       return;
     }
+    worldLifecycleEpoch++;
     MetalRenderer renderer = MetalRenderClient.getRenderer();
     if (renderer != null && renderer.isAvailable() &&
         renderer.getHandle() != 0 && NativeBridge.isLibLoaded()) {
@@ -272,6 +284,7 @@ public class MetalWorldRenderer {
   }
 
   public void onWorldUnload() {
+    worldLifecycleEpoch++;
     worldLoaded = false;
     renderingActive = false;
     texturesReady = false;
@@ -295,6 +308,8 @@ public class MetalWorldRenderer {
     particleRenderer.shutdown();
     textureManager.destroy();
     chunkMesher.clear();
+    resetChunkBuildQueueState();
+    resetBulkUpdateRecoveryState();
     loggedChunkLoadDropNotReady = false;
     loggedBlockUpdateDropNotReady = false;
     loggedWorldLoadWithoutRenderer = false;
@@ -317,6 +332,108 @@ public class MetalWorldRenderer {
     translucencySorter.shutdown();
     terrainIndirectDraw.shutdown();
     updateLoadingModeState();
+  }
+
+  private void resetChunkBuildQueueState() {
+    pendingBuildSet.clear();
+    sortedBuildList.clear();
+    readinessCache.clear();
+    sortedListDirty = true;
+    lastSortedSize = 0;
+    framesSinceLastSort = 0;
+    lastScanPlayerCX = Integer.MIN_VALUE;
+    lastScanPlayerCZ = Integer.MIN_VALUE;
+    lastSortedPlayerCX = Integer.MIN_VALUE;
+    lastSortedPlayerCZ = Integer.MIN_VALUE;
+    lastScanRenderDist = -1;
+    scanFrameCounter = 0;
+    scanFrontierRing = 0;
+    lastFullRescanNs = 0L;
+    turnPriorityFrames = 0;
+    remainingPrioritizedBuilds = PRIORITIZED_BUILD_STREAK_LIMIT;
+  }
+
+  private void resetBulkUpdateRecoveryState() {
+    blockUpdateBurstCount = 0;
+    lastBlockUpdateFrame = Integer.MIN_VALUE;
+    bulkUpdateRebuildFrame = 0;
+    bulkUpdateRecoveryActive = false;
+    bulkUpdateRebuildStarted = false;
+  }
+
+  private void noteBlockUpdateForBulkRecovery() {
+    int frameGap = lastBlockUpdateFrame == Integer.MIN_VALUE
+        ? Integer.MAX_VALUE
+        : frameCount - lastBlockUpdateFrame;
+    if (frameGap < 0 || frameGap > BULK_UPDATE_BURST_GAP_FRAMES) {
+      blockUpdateBurstCount = 0;
+    }
+    lastBlockUpdateFrame = frameCount;
+    blockUpdateBurstCount++;
+    if (blockUpdateBurstCount < BULK_UPDATE_TRIGGER_COUNT) {
+      return;
+    }
+    if (!bulkUpdateRecoveryActive) {
+      bulkUpdateRecoveryActive = true;
+      bulkUpdateRecoveryCount++;
+      MetalLogger.warn(
+          "bulk block-update burst detected (%d); "
+              + "Metal presentation paused for a clean mesh rebuild",
+          blockUpdateBurstCount);
+    }
+  }
+
+  private void advanceBulkUpdateRecovery() {
+    if (!bulkUpdateRecoveryActive) {
+      return;
+    }
+    if (!bulkUpdateRebuildStarted) {
+      if (frameCount - lastBlockUpdateFrame < BULK_UPDATE_QUIET_FRAMES
+          || chunkMesher.getPendingCount() != 0) {
+        return;
+      }
+      chunkMesher.clearAllMeshes();
+      resetChunkBuildQueueState();
+      bulkUpdateRebuildStarted = true;
+      bulkUpdateRebuildFrame = frameCount;
+      MetalLogger.info(
+          "bulk block-update recovery: clean mesh rebuild started");
+      return;
+    }
+    if (frameCount - bulkUpdateRebuildFrame
+            < BULK_UPDATE_REBUILD_WARMUP_FRAMES
+        || frameCount - lastBlockUpdateFrame
+            < BULK_UPDATE_QUIET_FRAMES
+        || chunkMesher.getPendingCount() != 0
+        || hasPendingRecoveryCriticalBuilds()
+        || chunkMesher.getMeshCount() == 0) {
+      return;
+    }
+    bulkUpdateRecoveryActive = false;
+    bulkUpdateRebuildStarted = false;
+    blockUpdateBurstCount = 0;
+    MetalLogger.info(
+        "bulk block-update recovery complete; Metal presentation resumed");
+  }
+
+  private boolean hasPendingRecoveryCriticalBuilds() {
+    Minecraft minecraft = Minecraft.getInstance();
+    if (minecraft == null || minecraft.player == null) {
+      return true;
+    }
+    int playerChunkX = minecraft.player.chunkPosition().x();
+    int playerChunkZ = minecraft.player.chunkPosition().z();
+    it.unimi.dsi.fastutil.longs.LongIterator iterator =
+        pendingBuildSet.iterator();
+    while (iterator.hasNext()) {
+      long key = iterator.nextLong();
+      int dx = Math.abs(unpackChunkX(key) - playerChunkX);
+      int dz = Math.abs(unpackChunkZ(key) - playerChunkZ);
+      if (Math.max(dx, dz) <= IMPORTANT_REBUILD_CHUNK_RANGE) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -348,6 +465,7 @@ public class MetalWorldRenderer {
     if (renderer == null || !renderer.isAvailable())
       return;
     Minecraft mc = Minecraft.getInstance();
+    advanceBulkUpdateRecovery();
     maxMeshes = shouldPinLoadedMeshes(mc) ? PINNED_MAX_MESHES : DEFAULT_MAX_MESHES;
     int w = mc.getWindow().getWidth();
     int h = mc.getWindow().getHeight();
@@ -481,9 +599,8 @@ public class MetalWorldRenderer {
         }
       }
       chunkMesher.clearAllMeshes();
-      pendingBuildSet.clear();
-      sortedBuildList.clear();
-      sortedListDirty = true;
+      resetChunkBuildQueueState();
+      resetBulkUpdateRecoveryState();
       textureManager.destroy();
       if (NativeBridge.isLibLoaded()) {
         try {
@@ -1024,6 +1141,7 @@ public class MetalWorldRenderer {
       sortedListDirty = true;
       if (renderDistChanged) {
         pendingBuildSet.clear();
+        sortedBuildList.clear();
         scanRingsInRange(world, playerChunkX, playerChunkZ, playerSectionY, 0,
             closeRange);
         scanFrontierRing = closeRange + 1;
@@ -1153,6 +1271,11 @@ public class MetalWorldRenderer {
       removed = true;
     }
     if (removed) {
+      for (int index = sortedBuildList.size() - 1; index >= 0; index--) {
+        if (!pendingBuildSet.contains(sortedBuildList.getLong(index))) {
+          sortedBuildList.removeLong(index);
+        }
+      }
       sortedListDirty = true;
       MetalLogger.info(
           "queue_trim: keep=%d player=[%d,%d] p=%d cp=%d m=%d",
@@ -1212,8 +1335,8 @@ public class MetalWorldRenderer {
       }
       if (!chunkMesher.hasMesh(chunkX, worldY, chunkZ)) {
         chunkMesher.noteSectionAvailable(chunkX, worldY, chunkZ);
-        if (pendingBuildSet.add(packChunkKey(chunkX, worldY, chunkZ))) {
-          sortedListDirty = true;
+        if (addPendingBuildKey(
+                packChunkKey(chunkX, worldY, chunkZ))) {
           if (MetalRenderConfig.isDeepDebugActive()) {
             MetalLogger.debug(
                 "queue_add: chunk=[%d,%d,%d] dist=%d p=%d",
@@ -1325,10 +1448,10 @@ public class MetalWorldRenderer {
         lastSortedPlayerCX = playerChunkX;
         lastSortedPlayerCZ = playerChunkZ;
         framesSinceLastSort = 0;
+        sortedListDirty = false;
       } else {
         framesSinceLastSort++;
       }
-      sortedListDirty = false;
     }
     Minecraft mc = Minecraft.getInstance();
     ClientLevel world = mc != null ? mc.level : null;
@@ -1455,9 +1578,6 @@ public class MetalWorldRenderer {
         remainingPrioritizedBuilds = PRIORITIZED_BUILD_STREAK_LIMIT;
       }
 
-      pendingBuildSet.remove(candidate.key);
-      sortedBuildList.remove(candidate.index);
-
       boolean interactivePriority = highPriority &&
           candidate.chunkDist <= INTERACTIVE_PRIORITY_CHUNK_RANGE &&
           turnPriorityFrames > 0 &&
@@ -1470,6 +1590,12 @@ public class MetalWorldRenderer {
           break;
         }
       }
+      // Do not remove a candidate until it can actually be submitted. The old
+      // ordering dropped one normal section every time the per-frame
+      // background budget was exhausted, leaving transient terrain holes
+      // after large block updates (most visible in the End fixture).
+      pendingBuildSet.remove(candidate.key);
+      sortedBuildList.remove(candidate.index);
       if (interactivePriority) {
         chunkMesher.buildMeshFromWorldInteractive(
             candidate.chunkX, candidate.chunkY, candidate.chunkZ);
@@ -1661,7 +1787,15 @@ public class MetalWorldRenderer {
   }
 
   public boolean isReady() {
-    return worldLoaded && renderingActive;
+    return worldLoaded && renderingActive && !irisCompatibilityPaused;
+  }
+
+  public boolean isPresentationSuppressedForRecovery() {
+    return bulkUpdateRecoveryActive;
+  }
+
+  public int getBulkUpdateRecoveryCount() {
+    return bulkUpdateRecoveryCount;
   }
 
   public void applyFeatureConfig(MetalRenderConfig config) {
@@ -1688,14 +1822,8 @@ public class MetalWorldRenderer {
       return;
     }
     chunkMesher.clearAllMeshes();
-    pendingBuildSet.clear();
-    sortedBuildList.clear();
-    sortedListDirty = true;
-    scanFrameCounter = 0;
-    scanFrontierRing = 0;
-    lastScanPlayerCX = Integer.MIN_VALUE;
-    lastScanPlayerCZ = Integer.MIN_VALUE;
-    lastScanRenderDist = -1;
+    resetChunkBuildQueueState();
+    resetBulkUpdateRecoveryState();
     Minecraft mc = Minecraft.getInstance();
     if (mc != null && mc.player != null && mc.level != null) {
       int playerChunkX = mc.player.chunkPosition().x();
@@ -1724,6 +1852,21 @@ public class MetalWorldRenderer {
   }
 
   public void onChunkLoaded(int chunkX, int chunkZ, LevelChunk chunk) {
+    if (!RenderSystem.isOnRenderThread()) {
+      Minecraft client = Minecraft.getInstance();
+      if (client != null) {
+        long scheduledEpoch = worldLifecycleEpoch;
+        client.execute(() -> {
+          if (worldLifecycleEpoch == scheduledEpoch) {
+            onChunkLoaded(chunkX, chunkZ, chunk);
+          }
+        });
+      }
+      return;
+    }
+    if (irisCompatibilityPaused) {
+      return;
+    }
     if (!worldLoaded || !renderingActive) {
       if (!loggedChunkLoadDropNotReady) {
         loggedChunkLoadDropNotReady = true;
@@ -1776,7 +1919,7 @@ public class MetalWorldRenderer {
       refreshLoadedNeighborSection(chunkX, worldY, chunkZ - 1);
       refreshLoadedNeighborSection(chunkX, worldY, chunkZ + 1);
     }
-    MetalLogger.info(
+    MetalLogger.deepInfo(
         "chunk_load: c=[%d,%d] sec=%d air=%d d=%d imm=%s pri=%s p=%d cp=%d",
         chunkX, chunkZ, sections.length, nonAirSections, loadedChunkDistance,
         immediateBuildChunk, highPriorityChunk, pendingBuildSet.size(),
@@ -1808,8 +1951,8 @@ public class MetalWorldRenderer {
       if (!chunkMesher.hasMesh(chunkX, worldY, chunkZ) &&
           isSectionBuildReady(mc.level, chunkX, worldY, chunkZ)) {
         chunkMesher.noteSectionAvailable(chunkX, worldY, chunkZ);
-        if (pendingBuildSet.add(packChunkKey(chunkX, worldY, chunkZ))) {
-          sortedListDirty = true;
+        if (addPendingBuildKey(
+                packChunkKey(chunkX, worldY, chunkZ))) {
           queued++;
         }
       }
@@ -1917,10 +2060,19 @@ public class MetalWorldRenderer {
 
   private void enqueueSectionBuild(int chunkX, int worldY, int chunkZ) {
     if (!chunkMesher.hasMesh(chunkX, worldY, chunkZ)) {
-      if (pendingBuildSet.add(packChunkKey(chunkX, worldY, chunkZ))) {
-        sortedListDirty = true;
-      }
+      addPendingBuildKey(packChunkKey(chunkX, worldY, chunkZ));
     }
+  }
+
+  private boolean addPendingBuildKey(long key) {
+    if (!pendingBuildSet.add(key)) {
+      return false;
+    }
+    // Keep queue membership exact even when the expensive priority resort is
+    // intentionally deferred for a few frames.
+    sortedBuildList.add(key);
+    sortedListDirty = true;
+    return true;
   }
 
   private void refreshLoadedNeighborSection(int chunkX, int worldY,
@@ -1933,6 +2085,33 @@ public class MetalWorldRenderer {
   }
 
   public void scheduleSectionRebuild(int blockX, int blockY, int blockZ) {
+    scheduleSectionRebuildInternal(blockX, blockY, blockZ, true);
+  }
+
+  public void scheduleCompiledSectionRebuild(
+      int blockX, int blockY, int blockZ) {
+    scheduleSectionRebuildInternal(blockX, blockY, blockZ, false);
+  }
+
+  private void scheduleSectionRebuildInternal(
+      int blockX, int blockY, int blockZ,
+      boolean trackBulkBlockUpdate) {
+    if (!RenderSystem.isOnRenderThread()) {
+      Minecraft client = Minecraft.getInstance();
+      if (client != null) {
+        long scheduledEpoch = worldLifecycleEpoch;
+        client.execute(() -> {
+          if (worldLifecycleEpoch == scheduledEpoch) {
+            scheduleSectionRebuildInternal(
+                blockX, blockY, blockZ, trackBulkBlockUpdate);
+          }
+        });
+      }
+      return;
+    }
+    if (irisCompatibilityPaused) {
+      return;
+    }
     if (!worldLoaded || !renderingActive) {
       if (!loggedBlockUpdateDropNotReady) {
         loggedBlockUpdateDropNotReady = true;
@@ -1943,10 +2122,15 @@ public class MetalWorldRenderer {
       return;
     }
     loggedBlockUpdateDropNotReady = false;
+    if (trackBulkBlockUpdate) {
+      noteBlockUpdateForBulkRecovery();
+    }
     int cx = blockX >> 4;
     int cy = blockY >> 4;
     int cz = blockZ >> 4;
-    chunkMesher.noteBlockUpdate(cx, cy, cz);
+    if (trackBulkBlockUpdate) {
+      chunkMesher.noteBlockUpdate(cx, cy, cz);
+    }
     chunkMesher.markDirty(cx, cy, cz);
     chunkMesher.buildMeshFromWorldInteractive(cx, cy, cz);
     markDirtyAndQueue(cx - 1, cy, cz);
@@ -1955,7 +2139,7 @@ public class MetalWorldRenderer {
     markDirtyAndQueue(cx, cy + 1, cz);
     markDirtyAndQueue(cx, cy, cz - 1);
     markDirtyAndQueue(cx, cy, cz + 1);
-    MetalLogger.info(
+    MetalLogger.deepInfo(
         "block_rebuild: b=[%d,%d,%d] s=[%d,%d,%d] p=%d cp=%d m=%d",
         blockX, blockY, blockZ, cx, cy, cz, pendingBuildSet.size(),
         chunkMesher.getPendingCount(), chunkMesher.getMeshCount());
@@ -1964,9 +2148,7 @@ public class MetalWorldRenderer {
 
   private void markDirtyAndQueue(int chunkX, int sectionY, int chunkZ) {
     chunkMesher.markDirty(chunkX, sectionY, chunkZ);
-    if (pendingBuildSet.add(packChunkKey(chunkX, sectionY, chunkZ))) {
-      sortedListDirty = true;
-    }
+    addPendingBuildKey(packChunkKey(chunkX, sectionY, chunkZ));
   }
 
   public boolean isGPUDrivenEnabled() {

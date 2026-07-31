@@ -5,8 +5,17 @@ project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 jar_path="${1:-}"
 
 if [[ -z "$jar_path" ]]; then
-  jar_path="$(find "$project_dir/build/libs" -maxdepth 1 -type f \
-    -name '*.jar' ! -name '*-sources.jar' | sort | tail -n 1)"
+  mod_version="$(sed -n 's/^mod_version=//p' "$project_dir/gradle.properties" |
+    head -n 1)"
+  archives_base_name="$(
+    sed -n 's/^archives_base_name=//p' "$project_dir/gradle.properties" |
+      head -n 1
+  )"
+  if [[ -z "$mod_version" || -z "$archives_base_name" ]]; then
+    echo "Could not resolve the release JAR name from gradle.properties" >&2
+    exit 1
+  fi
+  jar_path="$project_dir/build/libs/$archives_base_name-$mod_version.jar"
 fi
 
 if [[ -z "$jar_path" || ! -f "$jar_path" ]]; then

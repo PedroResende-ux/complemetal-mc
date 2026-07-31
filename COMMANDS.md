@@ -39,9 +39,17 @@ The important fields are:
 - `Metal 4 runtime`: result of the real MTL4 command-buffer completion probe;
 - `Metal 4 draw path`: `Compatibility` is expected in the current release.
 
-`Ready` for the Metal 4 runtime is not proof of MTL4 draw encoding. For
-`0.2.0-beta.2+mc26.2`, the expected combination is runtime `Ready`, draw path
-`Compatibility`, and backend `METAL4_RUNTIME_VERIFIED_METAL3_RENDER`.
+`Ready` for the Metal 4 runtime is not proof of MTL4 draw encoding. On a
+Metal 4-capable macOS 26 runtime, the expected combination is runtime `Ready`,
+draw path `Compatibility`, and backend
+`METAL4_RUNTIME_VERIFIED_METAL3_RENDER`. On macOS 14 or another runtime that
+does not expose MTL4, `Unavailable`, draw path `Compatibility`, and
+`METAL3_FALLBACK_NO_METAL4` are the normal stable fallback.
+
+The stable label applies to this Metal 3 compatibility draw profile. When an
+Iris shader pack is active, Iris continues to render through OpenGL. The
+opt-in Iris GLSL-to-SPIR-V-to-MSL cache experiment does not execute Metal
+pipelines and does not claim an FPS improvement.
 
 ## Recovery order
 

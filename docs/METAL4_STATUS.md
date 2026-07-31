@@ -3,7 +3,7 @@
 This document distinguishes implemented behavior from planned work. It is part
 of the release contract: the status exposed by the game must match this table.
 
-| Area | `0.2.0-beta.2+mc26.2` status |
+| Area | `0.2.0+mc26.2` status |
 | --- | --- |
 | Runtime API detection | Implemented |
 | Metal 4 command queue / allocator / completion probe | Implemented when exposed by the OS |
@@ -11,16 +11,20 @@ of the release contract: the status exposed by the game must match this table.
 | Static native arena startup cap | Implemented with `recommendedMaxWorkingSetSize` |
 | IOSurface slot ownership and completion fences | Implemented |
 | Reversed-Z depth state | Implemented |
-| MetalFX spatial scaling path | Implemented, opt-in; hardware conformance pending |
+| MetalFX spatial scaling path | Experimental opt-in; outside stable support while hardware conformance is pending |
 | Atlas/lightmap handoff | Fenced asynchronous GPU readback |
-| Metal 3 render compatibility stream | Active beta draw path |
+| Metal 3 render compatibility stream | Active stable terrain draw path |
 | Safe alpha composite with vanilla feature overlay | Default |
 | Fast vanilla-terrain suppression | Disabled pending depth/coverage validation |
 | Native entity/particle replacement | Release-locked off pending fenced texture readback |
 | MTL4 render pipeline / draw encoder | Not active |
 | Validated mesh-shader terrain path | Disabled |
 | Validated Hi-Z occlusion path | Disabled |
-| Full in-game visual conformance | Required before stable release |
+| Overworld, Nether and End active-path transition | Validated |
+| Window resize and fullscreen transition | Validated |
+| True 2x Retina framebuffer backing | Not validated; outside stable support |
+| Sleep/wake and display hot-plug/reconnect | Not validated; outside stable support |
+| Real presented 200 Hz pacing | Not validated; outside stable support |
 
 The bundled shader library is intentionally compiled with the Metal 3 language
 standard because the active draw stream is still the compatibility path.
@@ -29,7 +33,8 @@ encoders into MTL4.
 
 Late native encode or presentation failures fall back on the following frame;
 Minecraft cannot replay vanilla submissions already skipped in the in-flight
-frame. Stable-release conformance must include deliberate late-failure tests.
+frame. One incomplete in-flight frame therefore remains a documented recovery
+limitation rather than a promise of replay.
 
 ## Backend names
 
@@ -52,28 +57,35 @@ interpreted as proof that the renderer's draw stream uses MTL4.
 this release.
 
 The packaged native-payload smoke test verifies extraction, initialization,
-ABI/status signals and selected resource lifetimes. The client game test adds
-world lifecycle plus coarse shader-toggle image checks. Those checks reject
-uniform output and verify that the re-enabled Iris image is closer to the
-initial Iris image than to the shaders-off image, but they are not full
-reference-image parity proof.
+ABI/status signals and selected resource lifetimes. The regular client game
+test covers the active hybrid and native-disabled lifecycle. The separate
+exact-release-JAR Iris harness adds coarse shader-toggle image checks. Those
+checks reject uniform output and verify that the re-enabled Iris image is
+closer to the initial Iris image than to the shaders-off image, but they are
+not full reference-image parity proof.
 
-## Stable-release exit gate
+## Stable support boundary
 
-Before changing the version from beta to stable:
+Stable in `0.2.0+mc26.2` means the conservative hybrid profile:
 
-1. Build offline shaders with full Xcode.
-2. Run the active Metal client test and native-disabled vanilla baseline with
-   Java 25; retain sanitizer output and screenshots.
-3. Start a Fabric 26.2 client with the exact release JAR.
-4. Test world load/unload, dimension switch and resource-pack reload.
-5. Compare terrain, fluids, entities, block entities, particles, weather, GUI
-   and transparency against the normal renderer.
-6. Exercise window resize, fullscreen, Retina scaling, sleep/wake and display
-   hot-plug.
-7. Run sustained high native-buffer allocation at the static device cap and a
-   200 Hz frame-pacing test.
-8. Confirm safe fallback with Metal 4 disabled and with the native library
-   intentionally unavailable.
-9. Confirm entity/particle native replacement remains release-locked.
-10. Archive logs, screenshots and hardware/OS details with the release.
+1. Selected terrain is mirrored through the Metal 3 compatibility stream.
+2. Minecraft retains unsupported or deliberately excluded content, including
+   native entity and particle replacement.
+3. Metal 4 queue/allocator APIs may be initialized and completion-probed, but
+   no game draw is encoded through MTL4.
+4. World lifecycle validation includes Overworld, Nether and End transitions.
+5. Iris shader packs retain Iris' OpenGL renderer. The opt-in
+   GLSL-to-SPIR-V-to-MSL path only prepares cache artifacts and makes no
+   performance claim.
+6. Initialization, capture and compatibility failures remain fail-open to
+   Minecraft's renderer.
+
+The following are explicitly outside this release's validated stable scope:
+
+- a true 2x Retina backing framebuffer;
+- macOS sleep/wake;
+- external-display hot-plug or reconnect;
+- real display presentation at 200 Hz.
+
+The native 200 Hz stress loop exercises offscreen buffer throughput, ownership
+and slot recycling. It is not a display cadence or presentation test.

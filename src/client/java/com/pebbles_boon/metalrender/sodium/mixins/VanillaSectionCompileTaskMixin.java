@@ -31,14 +31,14 @@ public abstract class VanillaSectionCompileTaskMixin {
       return;
     }
     MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
-    if (worldRenderer == null || !worldRenderer.isReady()) {
+    if (worldRenderer == null) {
       return;
     }
     BlockPos origin =
         ((SectionRenderDispatcher.RenderSection.SectionTask) (Object) this)
             .getRenderOrigin();
     if (origin != null) {
-      worldRenderer.scheduleSectionRebuild(
+      worldRenderer.scheduleCompiledSectionRebuild(
           origin.getX(), origin.getY(), origin.getZ());
     }
   }

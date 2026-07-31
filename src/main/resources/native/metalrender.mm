@@ -168,6 +168,12 @@ static constexpr uint64_t kDeferredSubmissionDelay =
 static std::atomic<uint64_t> g_submittedFrameSerial{0};
 static std::atomic<uint64_t> g_completedFrameSerial{0};
 static std::atomic<bool> g_gpuNeedsRecovery{false};
+// Process-lifetime monotonic release-QA telemetry. These counters must not be
+// reset by world/renderer lifecycle cleanup: a late asynchronous GPU failure
+// must remain observable until the client process exits.
+static std::atomic<uint64_t> g_gpuCommandBufferErrorCount{0};
+static std::atomic<uint64_t> g_inFlightFrameTimeoutCount{0};
+static std::atomic<uint64_t> g_noIOSurfaceSlotSkipCount{0};
 
 static void mark_frame_submission_completed(uint64_t serial) {
   uint64_t observed =
@@ -1079,20 +1085,55 @@ static id<MTLBinaryArchive> new_empty_pipeline_archive(NSError **outErr) {
   return archive;
 }
 
+// Must be called while g_pipelineArchiveMutex is held. A binary archive can
+// load successfully yet reject population after an OS, GPU, driver, or shader
+// change. Replace only the in-memory object first; the known-old file remains
+// untouched until a replacement has accepted at least one pipeline and is
+// serialized atomically.
+static bool replace_pipeline_archive_with_empty(const char *operation) {
+  NSError *replacementError = nil;
+  id<MTLBinaryArchive> replacement =
+      new_empty_pipeline_archive(&replacementError);
+  if (!replacement) {
+    pipeline_archive_warning(operation, replacementError);
+    return false;
+  }
+  if (g_pipelineArchive)
+    [g_pipelineArchive release];
+  g_pipelineArchive = replacement;
+  g_pipelineArchiveDirty = false;
+  return true;
+}
+
 static id<MTLRenderPipelineState>
 makePipeline(MTLRenderPipelineDescriptor *desc, NSError **outErr) {
   if (@available(macOS 11.0, *)) {
     if (g_pipelineArchive) {
       std::lock_guard<std::mutex> lock(g_pipelineArchiveMutex);
-      NSArray<id<MTLBinaryArchive>> *originalArchives = desc.binaryArchives;
+      NSArray<id<MTLBinaryArchive>> *originalArchives =
+          [desc.binaryArchives retain];
       NSError *populationError = nil;
       BOOL populated = [g_pipelineArchive
           addRenderPipelineFunctionsWithDescriptor:desc
                                              error:&populationError];
       if (!populated) {
         pipeline_archive_warning("render population failed", populationError);
-      } else {
-        g_pipelineArchiveDirty = true;
+        // Never serialize an archive after Metal has rejected population.
+        g_pipelineArchiveDirty = false;
+        if (replace_pipeline_archive_with_empty(
+                "render population recovery archive creation failed")) {
+          populationError = nil;
+          populated = [g_pipelineArchive
+              addRenderPipelineFunctionsWithDescriptor:desc
+                                                 error:&populationError];
+          if (!populated) {
+            pipeline_archive_warning(
+                "render population retry with empty archive failed",
+                populationError);
+          }
+        }
+      }
+      if (populated) {
         desc.binaryArchives = @[ g_pipelineArchive ];
       }
 
@@ -1100,6 +1141,8 @@ makePipeline(MTLRenderPipelineDescriptor *desc, NSError **outErr) {
       id<MTLRenderPipelineState> pipeline =
           [g_device newRenderPipelineStateWithDescriptor:desc
                                                    error:&creationError];
+      if (pipeline && populated)
+        g_pipelineArchiveDirty = true;
       if (!pipeline && populated) {
         // An archive can become unusable after an OS, GPU, driver, or shader
         // change. A cache hit must never prevent the pipeline from compiling.
@@ -1110,8 +1153,28 @@ makePipeline(MTLRenderPipelineDescriptor *desc, NSError **outErr) {
         creationError = nil;
         pipeline = [g_device newRenderPipelineStateWithDescriptor:desc
                                                             error:&creationError];
+        // The archive accepted population but then failed assisted creation.
+        // Quarantine it even when the uncached fallback succeeds; otherwise
+        // the known-bad object would be serialized for the next launch.
+        g_pipelineArchiveDirty = false;
+        if (pipeline &&
+            replace_pipeline_archive_with_empty(
+                "render-assisted recovery archive creation failed")) {
+          NSError *repopulationError = nil;
+          BOOL repopulated = [g_pipelineArchive
+              addRenderPipelineFunctionsWithDescriptor:desc
+                                                 error:&repopulationError];
+          if (repopulated) {
+            g_pipelineArchiveDirty = true;
+          } else {
+            pipeline_archive_warning(
+                "render-assisted recovery population failed",
+                repopulationError);
+          }
+        }
       }
       desc.binaryArchives = originalArchives;
+      [originalArchives release];
       if (outErr)
         *outErr = creationError;
       return pipeline;
@@ -1134,8 +1197,22 @@ static id<MTLComputePipelineState> makeComputePipeline(id<MTLFunction> func,
                                               error:&populationError];
       if (!populated) {
         pipeline_archive_warning("compute population failed", populationError);
-      } else {
-        g_pipelineArchiveDirty = true;
+        // Never serialize an archive after Metal has rejected population.
+        g_pipelineArchiveDirty = false;
+        if (replace_pipeline_archive_with_empty(
+                "compute population recovery archive creation failed")) {
+          populationError = nil;
+          populated = [g_pipelineArchive
+              addComputePipelineFunctionsWithDescriptor:descriptor
+                                                  error:&populationError];
+          if (!populated) {
+            pipeline_archive_warning(
+                "compute population retry with empty archive failed",
+                populationError);
+          }
+        }
+      }
+      if (populated) {
         descriptor.binaryArchives = @[ g_pipelineArchive ];
       }
 
@@ -1145,6 +1222,8 @@ static id<MTLComputePipelineState> makeComputePipeline(id<MTLFunction> func,
                                                    options:MTLPipelineOptionNone
                                                 reflection:nil
                                                      error:&creationError];
+      if (pipeline && populated)
+        g_pipelineArchiveDirty = true;
       if (!pipeline && populated) {
         pipeline_archive_warning("compute-assisted creation failed; retrying "
                                  "without the archive",
@@ -1156,6 +1235,24 @@ static id<MTLComputePipelineState> makeComputePipeline(id<MTLFunction> func,
                                                     options:MTLPipelineOptionNone
                                                  reflection:nil
                                                       error:&creationError];
+        // Keep the successful uncached pipeline, but rebuild the in-memory
+        // archive so the assisted-creation failure cannot poison future runs.
+        g_pipelineArchiveDirty = false;
+        if (pipeline &&
+            replace_pipeline_archive_with_empty(
+                "compute-assisted recovery archive creation failed")) {
+          NSError *repopulationError = nil;
+          BOOL repopulated = [g_pipelineArchive
+              addComputePipelineFunctionsWithDescriptor:descriptor
+                                                  error:&repopulationError];
+          if (repopulated) {
+            g_pipelineArchiveDirty = true;
+          } else {
+            pipeline_archive_warning(
+                "compute-assisted recovery population failed",
+                repopulationError);
+          }
+        }
       }
       [descriptor release];
       if (outErr)
@@ -2176,12 +2273,6 @@ static void wait_for_staged_texture_uploads() {
     return;
   if (uploadCommandBuffer.status < MTLCommandBufferStatusCompleted)
     [uploadCommandBuffer waitUntilCompleted];
-  if (uploadCommandBuffer.status != MTLCommandBufferStatusCompleted) {
-    NSError *error = uploadCommandBuffer.error;
-    dbg("WARN: staged texture upload failed: status=%ld error=%s\n",
-        (long)uploadCommandBuffer.status,
-        error ? [[error localizedDescription] UTF8String] : "unknown");
-  }
   [uploadCommandBuffer release];
 }
 
@@ -2195,6 +2286,11 @@ static void drain_surface_slots(bool finishOpenGL) {
     if (g_currentCmdBuffer) {
       [g_currentCmdBuffer commit];
       [g_currentCmdBuffer waitUntilCompleted];
+      if (g_currentCmdBuffer.status != MTLCommandBufferStatusCompleted) {
+        g_gpuCommandBufferErrorCount.fetch_add(
+            1, std::memory_order_relaxed);
+        g_gpuNeedsRecovery.store(true, std::memory_order_release);
+      }
       [g_currentCmdBuffer release];
       g_currentCmdBuffer = nil;
     }
@@ -4760,6 +4856,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetCurrentFrameCon
       dispatch_time_t timeout =
           dispatch_time(DISPATCH_TIME_NOW, (int64_t)waitMs * NSEC_PER_MSEC);
       if (dispatch_semaphore_wait(g_frameSemaphore, timeout) != 0) {
+        g_inFlightFrameTimeoutCount.fetch_add(1, std::memory_order_relaxed);
         static int timeoutCount = 0;
         if (++timeoutCount <= 10 || timeoutCount % 100 == 0)
           dbg("Frame skipped: in-flight GPU limit timed out (%d)\n",
@@ -4771,6 +4868,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetCurrentFrameCon
 
     int acquiredSlot = acquire_surface_slot(g_currentBufferIndex);
     if (acquiredSlot < 0) {
+      g_noIOSurfaceSlotSkipCount.fetch_add(1, std::memory_order_relaxed);
       if (semaphoreAcquired && g_frameSemaphore)
         dispatch_semaphore_signal(g_frameSemaphore);
       static int noSlotCount = 0;
@@ -5043,6 +5141,8 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEndFrame(
           bool commandSucceeded =
               cb.status == MTLCommandBufferStatusCompleted;
           if (!commandSucceeded) {
+            g_gpuCommandBufferErrorCount.fetch_add(
+                1, std::memory_order_relaxed);
             NSError *err = cb.error;
             dbg("GPU_ERROR: slot=%d status=%ld err=%s code=%ld\n",
                 completedSlot, (long)cb.status,
@@ -5506,32 +5606,33 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDestroyTexture2D(
   if (tex)
     [tex release];
 }
-extern "C" JNIEXPORT void JNICALL
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUpdateTexture2D(
     JNIEnv *env, jclass, jlong textureHandle, jint width, jint height,
     jbyteArray pixelData) {
   if (!textureHandle || !pixelData || width <= 0 || height <= 0)
-    return;
+    return JNI_FALSE;
   ensure_device();
   id<MTLTexture> tex =
       (__bridge id<MTLTexture>)(void *)(uintptr_t)textureHandle;
   if (!tex || !g_device || !g_queue ||
       tex.pixelFormat != MTLPixelFormatRGBA8Unorm ||
       (NSUInteger)width > tex.width || (NSUInteger)height > tex.height)
-    return;
+    return JNI_FALSE;
   size_t tightBytesPerRow = (size_t)width * 4;
   if (tightBytesPerRow / 4 != (size_t)width)
-    return;
+    return JNI_FALSE;
   size_t requiredBytes = tightBytesPerRow * (size_t)height;
   if ((size_t)height != 0 &&
       requiredBytes / (size_t)height != tightBytesPerRow)
-    return;
+    return JNI_FALSE;
   if ((size_t)env->GetArrayLength(pixelData) < requiredBytes)
-    return;
+    return JNI_FALSE;
 
   jbyte *data = env->GetByteArrayElements(pixelData, NULL);
   if (!data)
-    return;
+    return JNI_FALSE;
+  bool uploadSubmitted = false;
 
   // CPU-side replaceRegion on a shared texture races older in-flight frames
   // that still sample that texture. Stage the upload and commit a blit on the
@@ -5566,8 +5667,23 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUpdateTexture2D(
                    toTexture:tex
             destinationSlice:0
             destinationLevel:0
-           destinationOrigin:MTLOriginMake(0, 0, 0)];
+                   destinationOrigin:MTLOriginMake(0, 0, 0)];
         [blit endEncoding];
+        // Every upload needs its own completion check. Waiting only for the
+        // newest same-queue upload orders earlier work, but its final status
+        // cannot reveal an error from an earlier command buffer.
+        [uploadCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+          if (cb.status != MTLCommandBufferStatusCompleted) {
+            g_gpuCommandBufferErrorCount.fetch_add(
+                1, std::memory_order_relaxed);
+            g_gpuNeedsRecovery.store(true, std::memory_order_release);
+            NSError *error = cb.error;
+            dbg("WARN: staged texture upload failed: status=%ld error=%s\n",
+                (long)cb.status,
+                error ? [[error localizedDescription] UTF8String]
+                      : "unknown");
+          }
+        }];
         [uploadCommandBuffer commit];
         {
           std::lock_guard<std::mutex> lock(g_textureUploadMutex);
@@ -5576,6 +5692,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUpdateTexture2D(
           g_lastTextureUploadCommandBuffer =
               [uploadCommandBuffer retain];
         }
+        uploadSubmitted = true;
       } else {
         dbg("WARN: Could not create staged texture upload encoder\n");
       }
@@ -5587,6 +5704,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUpdateTexture2D(
         stagedLength);
   }
   env->ReleaseByteArrayElements(pixelData, data, JNI_ABORT);
+  return uploadSubmitted ? JNI_TRUE : JNI_FALSE;
 }
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetDeviceHandle(
@@ -6776,6 +6894,24 @@ extern "C" JNIEXPORT jfloat JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetGpuFrameTimeMs(
     JNIEnv *, jclass) {
   return g_lastGpuMs.load(std::memory_order_relaxed);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetGpuCommandBufferErrorCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_gpuCommandBufferErrorCount.load(std::memory_order_acquire);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetInFlightFrameTimeoutCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_inFlightFrameTimeoutCount.load(std::memory_order_acquire);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetNoIOSurfaceSlotSkipCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_noIOSurfaceSlotSkipCount.load(std::memory_order_acquire);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
