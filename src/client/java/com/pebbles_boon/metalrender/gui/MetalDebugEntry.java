@@ -10,7 +10,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.ThreadLocalRandom;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
@@ -26,22 +25,33 @@ import org.jspecify.annotations.Nullable;
 public final class MetalDebugEntry implements DebugScreenEntry {
   private static final Identifier DBG_GRP = Identifier.fromNamespaceAndPath("metalrender", "debug_group");
   private static final Identifier DBG_ID = Identifier.fromNamespaceAndPath("metalrender", "debug");
-  private static final String ACTIVE_LINE = "%sMetalRender %s rendering";
-  private static final String[] DEATH_TPL = {
-      "MetalRender was pricked to death",
-      "MetalRender Was Impaled On A Stalagmite whilst trying to escape "
-          + "[PlayerName]'s world",
-      "MetalRender fell from a high place whilst trying to escape "
-          + "[PlayerName]'s world",
-      "MetalRender Walked into a Danger Zone due to [PlayerName]",
-      "MetalRender is grinding coffee beans",
-      "MetalRender was slain by Bloffo using Fancy Stick",
-      "MetalRender drank a Concoction",
-      "bloffo slain MetalRender using fancy stick" };
 
-  private static boolean wasOn = true;
-  private static int deathIx = -1;
-  private static String deathPlyr = "Player";
+  enum Status {
+    DISABLED(ChatFormatting.GRAY),
+    INITIALIZING(ChatFormatting.YELLOW),
+    FALLBACK(ChatFormatting.RED),
+    NO_WORLD(ChatFormatting.GRAY),
+    IRIS_PAUSED(ChatFormatting.GOLD),
+    ACTIVE(ChatFormatting.BLUE);
+
+    private final ChatFormatting color;
+
+    Status(ChatFormatting color) {
+      this.color = color;
+    }
+  }
+
+  record StatusSnapshot(
+      boolean configLoaded,
+      boolean configEnabled,
+      MetalRenderClient.InitState initState,
+      @Nullable String initFailure,
+      boolean runtimeEnabled,
+      boolean worldRendererPresent,
+      boolean worldLoaded,
+      boolean irisPauseApplied,
+      boolean rendererReady) {
+  }
 
   public static void register() {
     try {
@@ -49,7 +59,7 @@ public final class MetalDebugEntry implements DebugScreenEntry {
       reg.put(DBG_ID, new MetalDebugEntry());
       reg.put(DebugScreenEntries.SYSTEM_SPECS, new SysSpecEntry());
     } catch (ReflectiveOperationException err) {
-      MetalLogger.error("easter egg fail", err);
+      MetalLogger.error("debug entry registration failed", err);
     }
   }
 
@@ -75,19 +85,79 @@ public final class MetalDebugEntry implements DebugScreenEntry {
   }
 
   private static String line() {
-    if (rendOn()) {
-      wasOn = true;
-      return ACTIVE_LINE.formatted(ChatFormatting.BLUE, dispVer());
+    StatusSnapshot current = snapshot();
+    return format(resolve(current), current, dispVer());
+  }
+
+  static Status resolve(StatusSnapshot snapshot) {
+    if (!snapshot.configLoaded()) {
+      return Status.INITIALIZING;
+    }
+    if (!snapshot.configEnabled()) {
+      return Status.DISABLED;
     }
 
-    var plyr = plyrName();
-    if (wasOn || deathIx < 0 || !plyr.equals(deathPlyr)) {
-      deathIx = ThreadLocalRandom.current().nextInt(DEATH_TPL.length);
-      deathPlyr = plyr;
+    return switch (snapshot.initState()) {
+      case NOT_TRIED, INITIALIZING -> Status.INITIALIZING;
+      case FAILED, UNSUPPORTED -> Status.FALLBACK;
+      case READY -> {
+        if (!snapshot.runtimeEnabled() || !snapshot.worldRendererPresent()) {
+          yield Status.FALLBACK;
+        }
+        if (!snapshot.worldLoaded()) {
+          yield Status.NO_WORLD;
+        }
+        if (snapshot.irisPauseApplied()) {
+          yield Status.IRIS_PAUSED;
+        }
+        yield snapshot.rendererReady() ? Status.ACTIVE : Status.FALLBACK;
+      }
+    };
+  }
+
+  static String format(Status status, StatusSnapshot snapshot,
+      String version) {
+    String detail = switch (status) {
+      case DISABLED -> "disabled in config";
+      case INITIALIZING -> "initializing";
+      case FALLBACK -> fallbackDetail(snapshot.initFailure());
+      case NO_WORLD -> "ready - no world loaded";
+      case IRIS_PAUSED -> "terrain paused - Iris/OpenGL compatibility";
+      case ACTIVE -> "rendering";
+    };
+    return "%sMetalRender %s%s%s".formatted(
+        status.color,
+        version,
+        status == Status.ACTIVE ? " " : ": ",
+        detail);
+  }
+
+  private static StatusSnapshot snapshot() {
+    var cfg = MetalRenderClient.getConfig();
+    var wr = MetalRenderClient.getWorldRenderer();
+    boolean worldLoaded = wr != null && wr.isWorldLoaded();
+    return new StatusSnapshot(
+        cfg != null,
+        cfg != null && cfg.enableMetalRendering,
+        MetalRenderClient.getInitState(),
+        MetalRenderClient.getInitFailure(),
+        MetalRenderClient.isEnabled(),
+        wr != null,
+        worldLoaded,
+        wr != null && wr.isIrisCompatibilityPaused(),
+        wr != null && wr.isReady());
+  }
+
+  private static String fallbackDetail(@Nullable String failure) {
+    if (failure == null || failure.isBlank()) {
+      return "vanilla fallback";
     }
-    wasOn = false;
-    return "%s%s".formatted(ChatFormatting.RED,
-        DEATH_TPL[deathIx].replace("[PlayerName]", plyr));
+    String normalized = failure.replaceAll("\\s+", " ").trim();
+    int maxLength = 96;
+    if (normalized.length() > maxLength) {
+      normalized = normalized.substring(0, maxLength - 3) + "...";
+    }
+    return "vanilla fallback - " + normalized;
   }
 
   private static Map<Identifier, DebugScreenEntry> registry()
@@ -107,12 +177,6 @@ public final class MetalDebugEntry implements DebugScreenEntry {
     return !v.isEmpty() && (v.charAt(0) == 'v' || v.charAt(0) == 'V')
         ? v.substring(1)
         : v;
-  }
-
-  private static String plyrName() {
-    var mc = Minecraft.getInstance();
-    return mc != null && mc.player != null ? mc.player.getName().getString()
-        : "Player";
   }
 
   private static final class SysSpecEntry implements DebugScreenEntry {

@@ -8,6 +8,7 @@ import com.pebbles_boon.metalrender.compat.IrisCompatibility;
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import com.pebbles_boon.metalrender.render.CapturedMatrices;
 import com.pebbles_boon.metalrender.render.MetalRenderHookState;
+import com.pebbles_boon.metalrender.render.MetalWorldFrameGate;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import net.minecraft.client.Camera;
@@ -50,7 +51,9 @@ public class WorldRendererBlitMixin {
         !MetalRenderClient.isEnabled()) {
       return;
     }
-    if (IrisCompatibility.requiresShaderCompatibilityMode()) {
+    boolean irisCompatibilityMode =
+        IrisCompatibility.requiresShaderCompatibilityMode();
+    if (irisCompatibilityMode) {
       MetalRenderer renderer = MetalRenderClient.getRenderer();
       if (renderer != null && renderer.getHandle() != 0) {
         NativeBridge.nRecycleUnpresentedFrames(renderer.getHandle());
@@ -58,7 +61,11 @@ public class WorldRendererBlitMixin {
       return;
     }
     MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
-    if (worldRenderer == null || !worldRenderer.metalActive()) {
+    if (worldRenderer == null ||
+        !MetalWorldFrameGate.canEncode(
+            worldRenderer.metalActive(),
+            irisCompatibilityMode,
+            worldRenderer.isIrisCompatibilityPaused())) {
       return;
     }
     try {

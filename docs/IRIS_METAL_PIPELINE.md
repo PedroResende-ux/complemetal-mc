@@ -3,7 +3,7 @@
 ## Target architecture
 
 This is a future target architecture, not part of the stable renderer contract.
-The stable `0.2.0+mc26.2` draw path remains the Metal 3 compatibility stream.
+The stable `0.2.1+mc26.2` draw path remains the Metal 3 compatibility stream.
 
 The target path starts after Iris has completed all shader-pack preprocessing
 and compatibility transforms:
@@ -49,13 +49,14 @@ contained in the background path; Iris continues with its normal renderer.
 Geometry shaders are not advertised as supported because Metal has no direct
 geometry-shader stage.
 
-The stable exact-JAR validation captured all 76 Complementary Reimagined
-r5.8.1 programs in its test scene under both the Metal 4 hybrid and forced
-Metal 3 profiles. Each cold run produced 152 SPIR-V and 152 MSL stage artifacts
-with zero failures; each warm run reused all 76 cache entries with zero
-retranslations. This proves the translation/cache foundation for that exact
-workload only, not arbitrary shader-pack capacity and not Metal execution of
-the shader pack.
+The stable `0.2.1+mc26.2` exact-JAR cold/warm validation captured all 76
+Complementary Reimagined r5.8.1 programs in both its Metal 4 hybrid and forced
+Metal 3 test profiles. Each cold run produced 152 SPIR-V and 152 MSL stage
+artifacts with zero failures; each warm run reused all 76 cache entries with
+zero retranslations. A second independent Metal 4 cold run repeated the clean
+result. This proves the translation/cache foundation for those exact workloads
+only, not arbitrary shader-pack capacity and not Metal execution of the shader
+pack.
 
 The capture/translation experiment is enabled only at JVM startup:
 

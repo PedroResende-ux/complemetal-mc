@@ -6,7 +6,7 @@ compatibility stream and falls back to Minecraft's normal renderer whenever
 the native path is unsupported or cannot be initialized.
 
 The `0.2.x` line targets Minecraft Java Edition 26.2. The stable
-`0.2.0+mc26.2` release is deliberately hybrid: MetalRender probes and
+`0.2.1+mc26.2` release is deliberately hybrid: MetalRender probes and
 instantiates Metal 4 command-queue and allocator objects when the operating
 system exposes them, while all active native draw encoding remains on the
 Metal 3 compatibility stream. Actual MTL4 draw encoding is disabled.
@@ -17,7 +17,7 @@ Metal 3 compatibility stream. Actual MTL4 draw encoding is disabled.
 
 | Component | Supported configuration |
 | --- | --- |
-| MetalRender | `0.2.0+mc26.2` |
+| MetalRender | `0.2.1+mc26.2` |
 | Minecraft | 26.2 |
 | Loader | Fabric Loader 0.19.3 or newer |
 | Fabric API | 0.156.0+26.2 or newer compatible 26.2 build |
@@ -39,6 +39,12 @@ marketing device name: MetalRender probes the runtime APIs and reports the
 result in the settings screen and `/metalrender status`.
 
 ## What changed for 26.2
+
+The `0.2.1+mc26.2` stable patch replaces the misleading random F3 status with
+deterministic active, Iris/OpenGL pause, initialization and fallback states;
+adds a valid Mod Menu icon; and blocks Metal frame encoding until both Iris'
+live compatibility state and the renderer's applied pause latch permit it.
+This patch does not change the native draw-path boundary described below.
 
 - Updated the Fabric toolchain, mappings and Java target for Minecraft 26.2.
 - Rebased renderer hooks on the 26.2 extraction/render lifecycle.
@@ -64,7 +70,10 @@ result in the settings screen and `/metalrender status`.
 
 See [Metal 4 status](docs/METAL4_STATUS.md) for the exact implementation
 boundary, [Iris to Metal pipeline](docs/IRIS_METAL_PIPELINE.md) for the shader
-translation contract, and [the changelog](CHANGELOG.md) for release details.
+translation contract, [the 0.2.1 release
+checklist](docs/RELEASE_CHECKLIST_0.2.1.md) for current artifact evidence, and
+[the changelog](CHANGELOG.md) for release details. The original
+[`0.2.0` checklist](docs/RELEASE_CHECKLIST.md) remains a historical record.
 
 ## Install
 
@@ -175,7 +184,7 @@ Include:
 Do not report a successful synthetic/native smoke test as proof of correct
 in-game rendering. The stable profile was validated separately in game.
 True 2x Retina backing, sleep/wake, external-display reconnect and real
-presented 200 Hz pacing remain outside the validated `0.2.0` support scope.
+presented 200 Hz pacing remain outside the validated `0.2.1` support scope.
 
 ## License
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1+mc26.2
+
+### Runtime clarity
+
+- Replace the random F3 death-message easter egg with deterministic renderer
+  states for active Metal terrain, Iris/OpenGL compatibility pause, disabled
+  configuration, initialization, no-world readiness and vanilla fallback.
+- Include a bounded initialization failure reason in the F3 fallback line so
+  a safe fallback is distinguishable from a crash.
+- Keep Metal frame encoding paused until Iris' applied compatibility latch is
+  released, closing a one-frame gap while shader disable/rebuild is settling.
+- Add an explicit square mod icon so Mod Menu no longer reports a broken icon.
+
 ## 0.2.0+mc26.2
 
 ### Stable hybrid profile

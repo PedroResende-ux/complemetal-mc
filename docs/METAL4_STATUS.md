@@ -3,7 +3,7 @@
 This document distinguishes implemented behavior from planned work. It is part
 of the release contract: the status exposed by the game must match this table.
 
-| Area | `0.2.0+mc26.2` status |
+| Area | `0.2.1+mc26.2` status |
 | --- | --- |
 | Runtime API detection | Implemented |
 | Metal 4 command queue / allocator / completion probe | Implemented when exposed by the OS |
@@ -17,6 +17,7 @@ of the release contract: the status exposed by the game must match this table.
 | Safe alpha composite with vanilla feature overlay | Default |
 | Fast vanilla-terrain suppression | Disabled pending depth/coverage validation |
 | Native entity/particle replacement | Release-locked off pending fenced texture readback |
+| Iris compatibility transition gate | Live Iris state and the applied renderer pause latch both block Metal frame encoding |
 | MTL4 render pipeline / draw encoder | Not active |
 | Validated mesh-shader terrain path | Disabled |
 | Validated Hi-Z occlusion path | Disabled |
@@ -66,7 +67,7 @@ not full reference-image parity proof.
 
 ## Stable support boundary
 
-Stable in `0.2.0+mc26.2` means the conservative hybrid profile:
+Stable in `0.2.1+mc26.2` means the conservative hybrid profile:
 
 1. Selected terrain is mirrored through the Metal 3 compatibility stream.
 2. Minecraft retains unsupported or deliberately excluded content, including

@@ -8,6 +8,7 @@
   ],
   "name": "MetalRender",
   "description": "Conservative Apple Silicon Metal hybrid renderer with a safe Minecraft fallback",
+  "icon": "assets/metalrender/icon.png",
   "environment": "client",
   "entrypoints": {
     "client": [
