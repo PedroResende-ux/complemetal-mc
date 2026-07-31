@@ -36,7 +36,7 @@ public final class IrisShaderCaptureQueue {
   public IrisShaderCaptureQueue(int capacity, long maxProgramChars,
       long maxQueuedChars) {
     this(capacity, maxProgramChars, maxQueuedChars,
-        IrisTranslationProfile.LWJGL_3_4_1_METAL_3);
+        IrisTranslationProfile.LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS);
   }
 
   public IrisShaderCaptureQueue(int capacity, long maxProgramChars,

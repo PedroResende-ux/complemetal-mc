@@ -782,6 +782,96 @@ def fault_counter_group_is_zero(value: Any) -> bool:
     )
 
 
+def msl_library_validation_is_safe(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return (
+        value.get("enabled") is True
+        and value.get("ready") is True
+        and value.get("complete") is True
+        and value.get("mode") == "compile-resolve-release-only"
+        and value.get("executionBoundary")
+            == "library-compile-resolve-release-only"
+        and value.get("stageCounterSemantics")
+            == "coordinator-lifetime-monotonic"
+        and value.get("nativeCounterSemantics")
+            == "process-lifetime-monotonic"
+        and value.get("liveLibrarySemantics") == "instantaneous-gauge"
+        and value.get("lastFailure") == ""
+        and type(value.get("liveLibrariesAtEvidence")) is int
+        and value.get("liveLibrariesAtEvidence") == 0
+        and "librariesCreated" not in value
+        and "functionsResolved" not in value
+        and "renderPipelinesCreated" not in value
+        and "drawsEncoded" not in value
+    )
+
+
+def iris_runtime_ownership_check_passed(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("evidenceKind")
+            == "indirect-runtime-ownership-check"
+        and value.get("assertedDrawBackend") == "OPENGL"
+        and value.get("measuredAtRuntime") is True
+        and value.get("passed") is True
+    )
+
+
+def generated_msl_static_boundary_is_explicit(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("runtimeTelemetryAvailable") is False
+        and value.get("assertedStaticBoundary")
+            == "library-compile-resolve-release-only"
+    )
+
+
+def msl_library_validation_matches_exact_workload(
+    value: Any,
+    cache_expectation: str,
+) -> bool:
+    if not msl_library_validation_is_safe(value):
+        return False
+    expected_from_translation = (
+        EXPECTED_COMPLEMENTARY_STAGES
+        if cache_expectation == "cold" else 0
+    )
+    expected_from_cache = (
+        EXPECTED_COMPLEMENTARY_STAGES
+        if cache_expectation == "warm" else 0
+    )
+    exact_counts = {
+        "programsAttempted": EXPECTED_COMPLEMENTARY_PROGRAMS,
+        "programsSucceeded": EXPECTED_COMPLEMENTARY_PROGRAMS,
+        "programsUnsupported": 0,
+        "programsFailed": 0,
+        "stagesAttempted": EXPECTED_COMPLEMENTARY_STAGES,
+        "stagesSucceeded": EXPECTED_COMPLEMENTARY_STAGES,
+        "stagesUnsupported": 0,
+        "stagesFailed": 0,
+        "stagesRejected": 0,
+        "stagesPending": 0,
+        "stagesInFlight": 0,
+        "stagesFromTranslation": expected_from_translation,
+        "stagesFromCache": expected_from_cache,
+        "nativeCompileAttempts": EXPECTED_COMPLEMENTARY_STAGES,
+        "nativeCompileSuccesses": EXPECTED_COMPLEMENTARY_STAGES,
+        "nativeCompileUnsupported": 0,
+        "nativeCompileFailures": 0,
+        "statusLiveLibraries": 0,
+    }
+    return (
+        all(type(value.get(name)) is int and value.get(name) == expected
+            for name, expected in exact_counts.items())
+        and value.get("compiledArtifactSetComplete") is True
+        and isinstance(value.get("compiledArtifactSetSha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", value["compiledArtifactSetSha256"])
+            is not None
+    )
+
+
 def driver_identity_matches_manifest(
     driver_result: Any,
     manifest: dict[str, Any],
@@ -799,10 +889,16 @@ def driver_identity_matches_manifest(
 
     native_faults = driver_result.get("nativeFaultCounters")
     iris_translation = driver_result.get("irisTranslation")
+    msl_library_validation = driver_result.get(
+        "generatedMslLibraryValidation")
+    iris_runtime_ownership = driver_result.get("irisRuntimeOwnership")
+    generated_msl_boundary = driver_result.get(
+        "generatedMslExecutionBoundary")
     if not isinstance(iris_translation, dict):
         return False
     return (
-        driver_result.get("status") == "PASS"
+        driver_result.get("schemaVersion") == 3
+        and driver_result.get("status") == "PASS"
         and actual_path == expected_path
         and driver_result.get("exactJarSha256") == release.get("sha256")
         and driver_result.get("metalrenderVersion") == release.get("version")
@@ -812,9 +908,13 @@ def driver_identity_matches_manifest(
         and type(driver_result.get("metal4Active")) is bool
         and driver_result.get("metal4Active") == (backend == "metal4")
         and driver_result.get("metal4DrawPathActive") is False
-        and driver_result.get("irisDrawBackend") == "OPENGL"
-        and driver_result.get("generatedMslExecuted") is False
+        and "irisDrawBackend" not in driver_result
+        and "generatedMslExecuted" not in driver_result
+        and iris_runtime_ownership_check_passed(iris_runtime_ownership)
+        and generated_msl_static_boundary_is_explicit(
+            generated_msl_boundary)
         and iris_translation.get("pipelineStatus") == "pending"
+        and msl_library_validation_is_safe(msl_library_validation)
         and isinstance(native_faults, dict)
         and native_faults.get("semantics")
             == "process-lifetime-monotonic"
@@ -894,6 +994,7 @@ def build_launch_command(
         f"{'true' if backend == 'metal4' else 'false'}",
         "-Dmetalrender.experimental.irisMetalPipeline=true",
         "-Dmetalrender.experimental.irisMetalTranslation=true",
+        "-Dmetalrender.experimental.irisMetalLibraryValidation=true",
         f"-Dmetalrender.experimental.irisMetalCacheRoot="
         f"{runtime / 'iris-metal-cache'}",
         "-classpath",
@@ -945,6 +1046,12 @@ def inspect_translation_cache(cache_root: Path) -> dict[str, Any]:
     ]
     spirv_files = [path for path in regular_files if path.suffix == ".spv"]
     msl_files = [path for path in regular_files if path.suffix == ".metal"]
+    generated_library_files = [
+        path for path in regular_files
+        if path.suffix == ".metallib"
+        or path.name == "metal.binarchive"
+        or path.suffix == ".mtl4archive"
+    ]
     complete_markers = [
         path for path in regular_files
         if path.name == "translation.complete"
@@ -976,6 +1083,8 @@ def inspect_translation_cache(cache_root: Path) -> dict[str, Any]:
     )
     artifact_integrity = True
     schema_2_manifests = True
+    referenced_msl_paths: set[Path] = set()
+    msl_artifact_identities: list[str] = []
     stages = (
         "vertex", "tess-control", "tess-evaluation",
         "geometry", "fragment", "compute",
@@ -991,6 +1100,10 @@ def inspect_translation_cache(cache_root: Path) -> dict[str, Any]:
         schema_2_manifests = (
             schema_2_manifests and properties.get("schema") == "2")
         entry = manifest.parent.resolve()
+        program_key = properties.get("key.sha256")
+        if not isinstance(program_key, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", program_key):
+            artifact_integrity = False
         for stage in stages:
             prefix = f"stage.{stage}"
             present = properties.get(f"{prefix}.present")
@@ -1020,6 +1133,26 @@ def inspect_translation_cache(cache_root: Path) -> dict[str, Any]:
                     and properties.get(f"{prefix}.{artifact}.sha256")
                         == sha256(path)
                 )
+                if (artifact == "msl" and path.is_file()
+                        and not path.is_symlink()
+                        and path.suffix == suffix
+                        and isinstance(program_key, str)
+                        and re.fullmatch(r"[0-9a-f]{64}", program_key)):
+                    actual_msl_sha256 = sha256(path)
+                    referenced_msl_paths.add(path)
+                    msl_artifact_identities.append(
+                        f"{program_key}/{stage}/{actual_msl_sha256}")
+    actual_msl_paths = {path.resolve() for path in msl_files}
+    unique_msl_artifact_identities = sorted(set(msl_artifact_identities))
+    msl_artifact_set_digest = hashlib.sha256()
+    for identity in unique_msl_artifact_identities:
+        msl_artifact_set_digest.update(identity.encode("ascii"))
+        msl_artifact_set_digest.update(b"\n")
+    msl_artifact_set_complete = (
+        referenced_msl_paths == actual_msl_paths
+        and len(msl_artifact_identities) == len(msl_files)
+        and len(unique_msl_artifact_identities) == len(msl_files)
+    )
     valid_markers = all(
         not path.is_symlink() and 0 < path.stat().st_size <= 4096
         for path in complete_markers
@@ -1035,11 +1168,15 @@ def inspect_translation_cache(cache_root: Path) -> dict[str, Any]:
         "manifestSchema2": bool(manifests) and schema_2_manifests,
         "artifactHashesMatchManifest":
             bool(manifests) and artifact_integrity,
+        "mslArtifactSetComplete":
+            bool(msl_files) and msl_artifact_set_complete,
         "completionMarkersBounded": valid_markers,
         "entryCountsMatch":
             len(manifests) == len(complete_markers),
         "noSymlinks": not any(path.is_symlink() for path in all_paths),
         "noRawGlslFiles": not glsl_files,
+        "noGeneratedLibraryOrPipelineArtifacts":
+            not generated_library_files,
     }
     return {
         "path": str(cache_root),
@@ -1049,6 +1186,11 @@ def inspect_translation_cache(cache_root: Path) -> dict[str, Any]:
         "completeTranslationCount": len(complete_markers),
         "spirvStageCount": len(spirv_files),
         "mslStageCount": len(msl_files),
+        "mslArtifactIdentityCount": len(unique_msl_artifact_identities),
+        "mslArtifactSetSha256": msl_artifact_set_digest.hexdigest(),
+        "generatedLibraryOrPipelineArtifacts": [
+            str(path) for path in generated_library_files
+        ],
         "rawGlslFiles": [str(path) for path in glsl_files],
     }
 
@@ -1173,6 +1315,10 @@ def run_harness(
         driver_result.get("irisTranslation", {})
         if isinstance(driver_result, dict) else {}
     )
+    msl_library_validation = (
+        driver_result.get("generatedMslLibraryValidation", {})
+        if isinstance(driver_result, dict) else {}
+    )
     attempted = iris_translation.get("attempted")
     cache_entry_count = translation_cache.get("completeTranslationCount")
     checks = {
@@ -1207,12 +1353,20 @@ def run_harness(
             and attempted
             == iris_translation.get("translated", 0)
                 + iris_translation.get("cacheHits", 0),
+        "generatedMslLibrariesValidated":
+            msl_library_validation_matches_exact_workload(
+                msl_library_validation, cache_expectation),
+        "compiledMslArtifactSetMatchesCache":
+            translation_cache.get("mslArtifactIdentityCount")
+                == EXPECTED_COMPLEMENTARY_STAGES
+            and msl_library_validation.get("compiledArtifactSetSha256")
+                == translation_cache.get("mslArtifactSetSha256"),
         "preparedManifestPresent": manifest_path.is_file(),
         "releaseSourceUnchangedAfterRun":
             release_source_matches(manifest),
     }
     run_result = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "cacheExpectation": cache_expectation,
         "qaBackend": backend,
         "status": "PASS" if all(checks.values()) else "FAIL",

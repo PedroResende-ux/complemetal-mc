@@ -14,6 +14,11 @@ import java.util.Optional;
 import java.util.Set;
 
 public final class NativeBridge {
+  public static final int IRIS_MSL_COMPILE_FAILED = -1;
+  public static final int IRIS_MSL_COMPILE_UNSUPPORTED = 0;
+  public static final int IRIS_MSL_COMPILE_COMPILED = 1;
+  public static final int IRIS_MSL_COMPILE_DEFERRED = 2;
+
   private static final String LIBRARY_BASENAME = "libmetalrender.dylib";
   private static final String SHADER_LIBRARY_BASENAME = "shaders.metallib";
   private static final String[] LIBRARY_RESOURCES = {
@@ -598,6 +603,25 @@ public final class NativeBridge {
   public static native long nGetInFlightFrameTimeoutCount();
 
   public static native long nGetNoIOSurfaceSlotSkipCount();
+
+  /**
+   * Compiles one bounded UTF-8 MSL stage into an ephemeral Metal library and
+   * validates its {@code main0} function type. No pipeline or draw is created.
+   */
+  public static native int nValidateIrisMslLibrary(byte[] mslUtf8,
+      int stageOrdinal);
+
+  public static native boolean nIsIrisMslCompilerReady();
+
+  public static native long nGetIrisMslCompileAttemptCount();
+
+  public static native long nGetIrisMslCompileSuccessCount();
+
+  public static native long nGetIrisMslCompileUnsupportedCount();
+
+  public static native long nGetIrisMslCompileFailureCount();
+
+  public static native long nGetIrisMslLiveLibraryCount();
 
   public static native void nDrawOITPass(long frameContext);
 

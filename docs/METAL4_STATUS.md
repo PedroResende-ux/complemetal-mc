@@ -32,6 +32,22 @@ standard because the active draw stream is still the compatibility path.
 Creating Metal 4 queue/allocator objects does not convert those pipelines or
 encoders into MTL4.
 
+## `0.3.0-alpha.1` Iris compiler milestone
+
+The development alpha adds a third, separately opt-in boundary after the Iris
+SPIR-V/MSL cache. On a ready Apple Silicon renderer it asks the Apple Metal
+runtime compiler to create an ephemeral executable `MTLLibrary` for each
+verified MSL stage, resolves `main0`, verifies its function type and releases
+both objects immediately. The boundary requires argument-buffer tier 2 and is
+limited to 16 MiB of MSL per stage.
+
+This validation runs in both the Metal 4 hybrid and forced Metal 3 profiles;
+it is not MTL4 draw encoding. It creates no render pipeline, persistent
+archive, command encoder or Iris draw. Exact-JAR cold/warm tests passed 152 of
+152 stages in both profiles, while visible shader-pack ownership remained with
+Iris/OpenGL. The next roadmap target is complete Iris pipeline-state capture,
+not a renderer cutover.
+
 Late native encode or presentation failures fall back on the following frame;
 Minecraft cannot replay vanilla submissions already skipped in the in-flight
 frame. One incomplete in-flight frame therefore remains a documented recovery

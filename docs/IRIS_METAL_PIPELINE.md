@@ -1,5 +1,9 @@
 # Iris to Metal pipeline
 
+The implementation order and acceptance gates are tracked in
+[`ROADMAP.md`](ROADMAP.md). The stages below must not be collapsed into a
+single unvalidated renderer switch.
+
 ## Target architecture
 
 This is a future target architecture, not part of the stable renderer contract.
@@ -36,7 +40,7 @@ intentionally opt-in and fail-open:
 | In-process SPIR-V to MSL with LWJGL SPIRV-Cross | Experimental |
 | Content-addressed SPIR-V/MSL cache | Experimental |
 | Persist original shader-pack GLSL | Prohibited |
-| Compile generated MSL into a Metal library | Pending |
+| Compile generated MSL into an ephemeral Metal library | Implemented as opt-in validation in `0.3.0-alpha.1+mc26.2` |
 | Capture Iris framebuffer, blend, depth and vertex state | Pending |
 | Reflect and bind Iris uniforms, samplers, images and buffers | Pending |
 | Reproduce the Iris shadow/composite render graph on Metal | Pending |
@@ -49,6 +53,14 @@ contained in the background path; Iris continues with its normal renderer.
 Geometry shaders are not advertised as supported because Metal has no direct
 geometry-shader stage.
 
+The Stage 2 validator accepts at most 16 MiB of verified MSL per stage. It
+requires argument-buffer tier 2, compiles an executable MSL 3.0 library with
+safe math and invariance enabled, resolves `main0` with the expected function
+type, and releases the function and library synchronously. It has no pipeline,
+archive, encoder or draw contract. A distinct deferred result protects client
+startup, renderer restart and teardown races; terminal unsupported and failed
+results remain separate and fail open to Iris.
+
 The stable `0.2.1+mc26.2` exact-JAR cold/warm validation captured all 76
 Complementary Reimagined r5.8.1 programs in both its Metal 4 hybrid and forced
 Metal 3 test profiles. Each cold run produced 152 SPIR-V and 152 MSL stage
@@ -58,17 +70,30 @@ result. This proves the translation/cache foundation for those exact workloads
 only, not arbitrary shader-pack capacity and not Metal execution of the shader
 pack.
 
+The `0.3.0-alpha.1+mc26.2` exact-JAR gate repeated that matrix and additionally
+compiled all 152 generated stages through the Apple Metal runtime compiler in
+every cold and warm run. All four runs resolved the expected functions, left
+zero live libraries, reported zero native compiler failures and produced the
+same independently reconstructed compiled-artifact digest. This proves the
+library compile/resolve/release boundary for that exact workload only. It does
+not prove pipeline creation, resource binding, draw execution or arbitrary
+shader-pack compatibility.
+
 The capture/translation experiment is enabled only at JVM startup:
 
 ```text
 -Dmetalrender.experimental.irisMetalPipeline=true
 -Dmetalrender.experimental.irisMetalTranslation=true
+-Dmetalrender.experimental.irisMetalLibraryValidation=true
 ```
 
-Both switches are required. An isolated cache root can be selected with
+The first two switches enable capture and translation. The third independently
+enables Stage 2 library validation; all three are required for the complete
+alpha milestone. An isolated cache root can be selected with
 `-Dmetalrender.experimental.irisMetalCacheRoot=/absolute/path`. These switches
-prepare translation artifacts; they do not mean that the shader pack is
-rendered by Metal.
+prepare persistent SPIR-V/MSL artifacts and validate them with ephemeral
+in-memory libraries; they do not mean that the shader pack is rendered by
+Metal. No compiled library is persisted.
 
 ## Why a translated shader is not yet a renderer
 
@@ -97,8 +122,10 @@ Metal pipeline archives are device and system specific.
 
 The current opt-in foundation does not replace Iris' normal OpenGL compilation
 or rendering, so it does not reduce Iris' current shader-pack load time and
-does not raise steady-state FPS. A cold cache adds background translation work;
-a warm cache merely avoids repeating that experimental work.
+does not raise steady-state FPS. A cold cache adds shaderc, SPIRV-Cross and
+Apple Metal compiler work. A warm cache skips shaderc/SPIRV-Cross but still
+recompiles every ephemeral `MTLLibrary`; Stage 2 therefore adds validation work
+in both cases.
 
 Once the translated programs are actually used by the future Metal render
 graph, the MSL and device pipeline caches can reduce Metal shader/pipeline

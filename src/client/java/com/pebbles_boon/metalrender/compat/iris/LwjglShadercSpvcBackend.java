@@ -14,6 +14,8 @@ import static org.lwjgl.util.shaderc.Shaderc.shaderc_tess_evaluation_shader;
 import static org.lwjgl.util.shaderc.Shaderc.shaderc_vertex_shader;
 import static org.lwjgl.util.spvc.Spvc.SPVC_BACKEND_MSL;
 import static org.lwjgl.util.spvc.Spvc.SPVC_CAPTURE_MODE_TAKE_OWNERSHIP;
+import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS;
+import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER;
 import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_MSL_PLATFORM;
 import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_MSL_VERSION;
 import static org.lwjgl.util.spvc.Spvc.SPVC_MSL_PLATFORM_MACOS;
@@ -61,7 +63,7 @@ public final class LwjglShadercSpvcBackend
 
   @Override
   public IrisTranslationProfile profile() {
-    return IrisTranslationProfile.LWJGL_3_4_1_METAL_3;
+    return IrisTranslationProfile.LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS;
   }
 
   @Override
@@ -252,6 +254,13 @@ public final class LwjglShadercSpvcBackend
           checkSpvc(Spvc.spvc_compiler_options_set_uint(options,
               SPVC_COMPILER_OPTION_MSL_VERSION, 30000), context,
               "select MSL 3.0");
+          checkSpvc(Spvc.spvc_compiler_options_set_bool(options,
+              SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, true), context,
+              "enable MSL argument buffers");
+          // SPIRV-Cross uses 0 for tier 1 and 1 for tier 2.
+          checkSpvc(Spvc.spvc_compiler_options_set_uint(options,
+              SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER, 1), context,
+              "select MSL argument-buffer tier 2");
           checkSpvc(Spvc.spvc_compiler_install_compiler_options(compiler,
               options), context, "install MSL options");
 

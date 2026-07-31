@@ -112,7 +112,8 @@ final class IrisPipelineCacheTest {
         "other", "v", null, null, null, "f");
     IrisShaderTranslation mismatched = new IrisShaderTranslation(
         IrisShaderCacheKey.from(other), "test-backend",
-        IrisTranslationProfile.LWJGL_3_4_1_METAL_3, artifacts());
+        IrisTranslationProfile.LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS,
+        artifacts());
     IrisPipelineCache cache = new IrisPipelineCache(
         new IrisPipelineCacheLayout(temporaryDirectory.resolve("cache")));
 
@@ -210,7 +211,8 @@ final class IrisPipelineCacheTest {
   private static IrisShaderTranslation translation(
       IrisFinalShaderProgram program) {
     return new IrisShaderTranslation(IrisShaderCacheKey.from(program),
-        "test-backend", IrisTranslationProfile.LWJGL_3_4_1_METAL_3,
+        "test-backend",
+        IrisTranslationProfile.LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS,
         artifacts());
   }
 

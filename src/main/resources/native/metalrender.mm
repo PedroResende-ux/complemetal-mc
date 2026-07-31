@@ -175,6 +175,63 @@ static std::atomic<uint64_t> g_gpuCommandBufferErrorCount{0};
 static std::atomic<uint64_t> g_inFlightFrameTimeoutCount{0};
 static std::atomic<uint64_t> g_noIOSurfaceSlotSkipCount{0};
 
+// Validation-only Iris MSL compiler state. The result counters are
+// process-lifetime monotonic telemetry; liveLibraryCount is a gauge and must
+// return to zero before each synchronous JNI call completes.
+static constexpr jint kIrisMslCompileFailed = -1;
+static constexpr jint kIrisMslCompileUnsupported = 0;
+static constexpr jint kIrisMslCompileCompiled = 1;
+static constexpr jint kIrisMslCompileDeferred = 2;
+static constexpr jsize kIrisMslMaximumSourceBytes =
+    16 * 1024 * 1024;
+static std::atomic<bool> g_irisMslCompilerReady{false};
+static std::mutex g_irisMslCompileMutex;
+static std::atomic<uint64_t> g_irisMslCompileAttemptCount{0};
+static std::atomic<uint64_t> g_irisMslCompileSuccessCount{0};
+static std::atomic<uint64_t> g_irisMslCompileUnsupportedCount{0};
+static std::atomic<uint64_t> g_irisMslCompileFailureCount{0};
+static std::atomic<uint64_t> g_irisMslLiveLibraryCount{0};
+
+static jint complete_iris_msl_validation(jint result, const char *reason,
+                                         NSError *error,
+                                         const char *fallbackDomain) {
+  if (result == kIrisMslCompileCompiled) {
+    g_irisMslCompileSuccessCount.fetch_add(1, std::memory_order_relaxed);
+    return result;
+  }
+  if (result == kIrisMslCompileUnsupported) {
+    g_irisMslCompileUnsupportedCount.fetch_add(1,
+                                               std::memory_order_relaxed);
+    return result;
+  }
+  if (result == kIrisMslCompileDeferred)
+    return result;
+
+  uint64_t failureNumber =
+      g_irisMslCompileFailureCount.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (failureNumber <= 8 || (failureNumber % 128) == 0) {
+    const char *domain = fallbackDomain ? fallbackDomain : "none";
+    long code = 0;
+    if (error) {
+      const char *errorDomain = [[error domain] UTF8String];
+      if (errorDomain && errorDomain[0] != '\0')
+        domain = errorDomain;
+      code = (long)[error code];
+    }
+    fprintf(stderr,
+            "[MetalRender] WARN: IRIS_MSL_VALIDATE result=FAILED "
+            "reason=%s domain=%s code=%ld\n",
+            reason ? reason : "UNKNOWN", domain, code);
+    fflush(stderr);
+  }
+  return kIrisMslCompileFailed;
+}
+
+static void set_iris_msl_compiler_ready(bool ready) {
+  std::lock_guard<std::mutex> lock(g_irisMslCompileMutex);
+  g_irisMslCompilerReady.store(ready, std::memory_order_release);
+}
+
 static void mark_frame_submission_completed(uint64_t serial) {
   uint64_t observed =
       g_completedFrameSerial.load(std::memory_order_acquire);
@@ -2689,6 +2746,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nInit(
   g_shuttingDown.store(false, std::memory_order_release);
   ensure_offscreen();
   load_shaders();
+  set_iris_msl_compiler_ready(g_device != nil);
   return (g_device != nil) ? (jlong)0x1 : (jlong)0;
 }
 extern "C" JNIEXPORT void JNICALL
@@ -2736,9 +2794,175 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDestroy(
     JNIEnv *, jclass, jlong handle) {
   (void)handle;
+  set_iris_msl_compiler_ready(false);
   g_shuttingDown.store(true, std::memory_order_release);
   g_surfaceSlotChanged.notify_all();
   drain_surface_slots(true);
+}
+
+static jint iris_msl_expected_function_type(jint stageOrdinal,
+                                            MTLFunctionType *expectedType) {
+  if (!expectedType)
+    return kIrisMslCompileFailed;
+  switch (stageOrdinal) {
+  case 0: // VERTEX
+    *expectedType = MTLFunctionTypeVertex;
+    return kIrisMslCompileCompiled;
+  case 1: // TESS_CONTROL is emitted as a Metal kernel.
+    *expectedType = MTLFunctionTypeKernel;
+    return kIrisMslCompileCompiled;
+  case 2: // TESS_EVALUATION is emitted as a Metal vertex function.
+    *expectedType = MTLFunctionTypeVertex;
+    return kIrisMslCompileCompiled;
+  case 3: // Metal has no geometry shader stage.
+    return kIrisMslCompileUnsupported;
+  case 4: // FRAGMENT
+    *expectedType = MTLFunctionTypeFragment;
+    return kIrisMslCompileCompiled;
+  case 5: // COMPUTE
+    *expectedType = MTLFunctionTypeKernel;
+    return kIrisMslCompileCompiled;
+  default:
+    return kIrisMslCompileFailed;
+  }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nValidateIrisMslLibrary(
+    JNIEnv *env, jclass, jbyteArray mslUtf8, jint stageOrdinal) {
+  @autoreleasepool {
+    std::lock_guard<std::mutex> lock(g_irisMslCompileMutex);
+    if (!g_irisMslCompilerReady.load(std::memory_order_acquire) ||
+        !g_device) {
+      // A lifecycle race is DEFERRED work, not a terminal capability result,
+      // so it has a distinct code and deliberately leaves every
+      // process-lifetime counter unchanged.
+      return kIrisMslCompileDeferred;
+    }
+
+    g_irisMslCompileAttemptCount.fetch_add(1, std::memory_order_relaxed);
+    if (!mslUtf8) {
+      return complete_iris_msl_validation(kIrisMslCompileFailed,
+                                          "NULL_SOURCE", nil, "input");
+    }
+
+    jsize sourceLength = env->GetArrayLength(mslUtf8);
+    if (sourceLength <= 0 || sourceLength > kIrisMslMaximumSourceBytes) {
+      return complete_iris_msl_validation(kIrisMslCompileFailed,
+                                          "SOURCE_SIZE", nil, "input");
+    }
+
+    MTLFunctionType expectedType = MTLFunctionTypeVisible;
+    jint stageSupport =
+        iris_msl_expected_function_type(stageOrdinal, &expectedType);
+    if (stageSupport != kIrisMslCompileCompiled) {
+      return complete_iris_msl_validation(
+          stageSupport,
+          stageSupport == kIrisMslCompileUnsupported ? "UNSUPPORTED_STAGE"
+                                                     : "INVALID_STAGE",
+          nil, "input");
+    }
+    if ([g_device argumentBuffersSupport] < MTLArgumentBuffersTier2) {
+      return complete_iris_msl_validation(kIrisMslCompileUnsupported,
+                                          "ARGUMENT_BUFFERS_TIER", nil,
+                                          "metal");
+    }
+
+    std::vector<jbyte> sourceBytes;
+    try {
+      sourceBytes.resize((size_t)sourceLength);
+    } catch (...) {
+      return complete_iris_msl_validation(kIrisMslCompileFailed,
+                                          "RESOURCE_LIMIT", nil, "native");
+    }
+    env->GetByteArrayRegion(mslUtf8, 0, sourceLength, sourceBytes.data());
+    if (env->ExceptionCheck()) {
+      return complete_iris_msl_validation(kIrisMslCompileFailed,
+                                          "JNI_COPY", nil, "jni");
+    }
+
+    NSString *source = nil;
+    MTLCompileOptions *options = nil;
+    id<MTLLibrary> library = nil;
+    id<MTLFunction> function = nil;
+    NSError *compileError = nil;
+    jint result = kIrisMslCompileFailed;
+    const char *reason = "UNKNOWN";
+    const char *fallbackDomain = "metal";
+    @try {
+      source = [[NSString alloc] initWithBytes:sourceBytes.data()
+                                       length:(NSUInteger)sourceLength
+                                     encoding:NSUTF8StringEncoding];
+      if (!source) {
+        reason = "INVALID_UTF8";
+        fallbackDomain = "input";
+      } else {
+        options = [[MTLCompileOptions alloc] init];
+        if (!options) {
+          reason = "RESOURCE_LIMIT";
+          fallbackDomain = "native";
+        } else {
+          options.languageVersion = MTLLanguageVersion3_0;
+          options.libraryType = MTLLibraryTypeExecutable;
+          options.preserveInvariance = YES;
+          if (@available(macOS 15.0, *)) {
+            options.mathMode = MTLMathModeSafe;
+          } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+          }
+
+          library = [g_device newLibraryWithSource:source
+                                            options:options
+                                              error:&compileError];
+          if (!library) {
+            reason = "METAL_COMPILE";
+          } else {
+            g_irisMslLiveLibraryCount.fetch_add(1,
+                                                std::memory_order_relaxed);
+            function = [library newFunctionWithName:@"main0"];
+            if (!function) {
+              reason = "MISSING_MAIN0";
+            } else if ([function functionType] != expectedType) {
+              reason = "FUNCTION_TYPE";
+            } else {
+              result = kIrisMslCompileCompiled;
+              reason = "COMPILED";
+            }
+          }
+        }
+      }
+    } @catch (NSException *exception) {
+      (void)exception;
+      result = kIrisMslCompileFailed;
+      reason = "OBJC_EXCEPTION";
+      fallbackDomain = "NSException";
+      compileError = nil;
+    } @finally {
+      if (function)
+        [function release];
+      if (library) {
+        [library release];
+        g_irisMslLiveLibraryCount.fetch_sub(1,
+                                            std::memory_order_relaxed);
+      }
+      if (options)
+        [options release];
+      if (source)
+        [source release];
+    }
+    return complete_iris_msl_validation(result, reason, compileError,
+                                        fallbackDomain);
+  }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nIsIrisMslCompilerReady(
+    JNIEnv *, jclass) {
+  return g_irisMslCompilerReady.load(std::memory_order_acquire) ? JNI_TRUE
+                                                                : JNI_FALSE;
 }
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetDeviceName(
@@ -6912,6 +7136,37 @@ extern "C" JNIEXPORT jlong JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetNoIOSurfaceSlotSkipCount(
     JNIEnv *, jclass) {
   return (jlong)g_noIOSurfaceSlotSkipCount.load(std::memory_order_acquire);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMslCompileAttemptCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMslCompileAttemptCount.load(std::memory_order_acquire);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMslCompileSuccessCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMslCompileSuccessCount.load(std::memory_order_acquire);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMslCompileUnsupportedCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMslCompileUnsupportedCount.load(
+      std::memory_order_acquire);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMslCompileFailureCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMslCompileFailureCount.load(std::memory_order_acquire);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMslLiveLibraryCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMslLiveLibraryCount.load(std::memory_order_acquire);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

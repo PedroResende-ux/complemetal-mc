@@ -1,4 +1,5 @@
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -22,6 +23,27 @@ public final class ReleasePayloadSmoke {
       throw new IllegalStateException(
           "packaged native backend did not become available: "
               + NativeBridge.getLoadFailure());
+    }
+    if (NativeBridge.nIsIrisMslCompilerReady()) {
+      throw new IllegalStateException(
+          "Iris MSL compiler became ready before renderer initialization");
+    }
+    IrisMslCompileCounters preInitCounters = irisMslCompileCounters();
+    byte[] preInitMsl = ("""
+        #include <metal_stdlib>
+        using namespace metal;
+        fragment float4 main0() { return float4(1.0); }
+        """).getBytes(StandardCharsets.UTF_8);
+    int preInitResult =
+        NativeBridge.nValidateIrisMslLibrary(preInitMsl, 4);
+    if (preInitResult != NativeBridge.IRIS_MSL_COMPILE_DEFERRED) {
+      throw new IllegalStateException(
+          "pre-init Iris MSL validation was not deferred: " + preInitResult);
+    }
+    if (!irisMslCompileCounters().equals(preInitCounters)
+        || NativeBridge.nGetIrisMslLiveLibraryCount() != 0) {
+      throw new IllegalStateException(
+          "pre-init Iris MSL validation changed terminal telemetry");
     }
 
     Path loadedLibrary = Path.of(NativeBridge.getLoadedPath())
@@ -62,8 +84,13 @@ public final class ReleasePayloadSmoke {
     if (handle == 0) {
       throw new IllegalStateException("native renderer initialization failed");
     }
+    if (!NativeBridge.nIsIrisMslCompilerReady()) {
+      throw new IllegalStateException(
+          "Iris MSL compiler did not become ready after initialization");
+    }
 
     try {
+      IrisMslCompileCounters irisMslDelta = runIrisMslValidationSmoke();
       NativeFaultCounters faultBaseline = nativeFaultCounters();
       if (!faultBaseline.isZero()) {
         throw new IllegalStateException(
@@ -205,7 +232,8 @@ public final class ReleasePayloadSmoke {
           "release-payload-smoke: loaded=%s available=true metal4Supported=%s "
               + "metal4Active=%s metal4Draw=false backend=%s shaderBytes=%d "
               + "arenaMiB=128 pacingFrames=1000 pacingMs=%d "
-              + "metal3Frames=240 metal3PacingMs=%d nativeFaultDelta=%s%n",
+              + "metal3Frames=240 metal3PacingMs=%d irisMslDelta=%s "
+              + "irisMslLive=0 nativeFaultDelta=%s%n",
           loadedLibrary,
           metal4Supported,
           metal4Active,
@@ -213,10 +241,83 @@ public final class ReleasePayloadSmoke {
           magic.length,
           pacingMillis,
           metal3PacingMillis,
+          irisMslDelta,
           faultDelta);
     } finally {
       NativeBridge.nDestroy(handle);
     }
+    if (NativeBridge.nIsIrisMslCompilerReady()) {
+      throw new IllegalStateException(
+          "Iris MSL compiler remained ready after renderer destruction");
+    }
+  }
+
+  private static IrisMslCompileCounters runIrisMslValidationSmoke() {
+    IrisMslCompileCounters baseline = irisMslCompileCounters();
+    if (NativeBridge.nGetIrisMslLiveLibraryCount() != 0) {
+      throw new IllegalStateException(
+          "Iris MSL validator retained a library before smoke");
+    }
+
+    byte[] vertexMsl = ("""
+        #include <metal_stdlib>
+        using namespace metal;
+        struct VertexOut {
+          float4 position [[position]];
+        };
+        vertex VertexOut main0(uint vertexId [[vertex_id]]) {
+          VertexOut out;
+          out.position = float4(float(vertexId), 0.0, 0.0, 1.0);
+          return out;
+        }
+        """).getBytes(StandardCharsets.UTF_8);
+    byte[] fragmentMsl = ("""
+        #include <metal_stdlib>
+        using namespace metal;
+        fragment float4 main0() {
+          return float4(1.0);
+        }
+        """).getBytes(StandardCharsets.UTF_8);
+    byte[] invalidMsl = "not valid Metal Shading Language"
+        .getBytes(StandardCharsets.UTF_8);
+
+    int vertexResult = NativeBridge.nValidateIrisMslLibrary(vertexMsl, 0);
+    int fragmentResult = NativeBridge.nValidateIrisMslLibrary(fragmentMsl, 4);
+    int invalidResult = NativeBridge.nValidateIrisMslLibrary(invalidMsl, 4);
+    int geometryResult = NativeBridge.nValidateIrisMslLibrary(vertexMsl, 3);
+    if (vertexResult != NativeBridge.IRIS_MSL_COMPILE_COMPILED
+        || fragmentResult != NativeBridge.IRIS_MSL_COMPILE_COMPILED) {
+      throw new IllegalStateException(
+          "valid Iris MSL stages did not compile: vertex=" + vertexResult
+              + " fragment=" + fragmentResult);
+    }
+    if (invalidResult != NativeBridge.IRIS_MSL_COMPILE_FAILED) {
+      throw new IllegalStateException(
+          "invalid Iris MSL was not classified FAILED: " + invalidResult);
+    }
+    if (geometryResult != NativeBridge.IRIS_MSL_COMPILE_UNSUPPORTED) {
+      throw new IllegalStateException(
+          "geometry MSL stage was not classified UNSUPPORTED: "
+              + geometryResult);
+    }
+
+    IrisMslCompileCounters delta = irisMslCompileCounters().deltaFrom(baseline);
+    IrisMslCompileCounters expected =
+        new IrisMslCompileCounters(4, 2, 1, 1);
+    if (!delta.equals(expected)) {
+      throw new IllegalStateException(
+          "Iris MSL validator counter delta mismatch: expected=" + expected
+              + " actual=" + delta);
+    }
+    if (NativeBridge.nGetIrisMslLiveLibraryCount() != 0) {
+      throw new IllegalStateException(
+          "Iris MSL validator retained an ephemeral library");
+    }
+    if (NativeBridge.nIsMetal4DrawPathActive()) {
+      throw new IllegalStateException(
+          "Iris MSL validation activated the unvalidated MTL4 draw path");
+    }
+    return delta;
   }
 
   private static long runFramePacingStress(long handle, int frameCount) {
@@ -266,6 +367,44 @@ public final class ReleasePayloadSmoke {
         NativeBridge.nGetGpuCommandBufferErrorCount(),
         NativeBridge.nGetInFlightFrameTimeoutCount(),
         NativeBridge.nGetNoIOSurfaceSlotSkipCount());
+  }
+
+  private static IrisMslCompileCounters irisMslCompileCounters() {
+    return new IrisMslCompileCounters(
+        NativeBridge.nGetIrisMslCompileAttemptCount(),
+        NativeBridge.nGetIrisMslCompileSuccessCount(),
+        NativeBridge.nGetIrisMslCompileUnsupportedCount(),
+        NativeBridge.nGetIrisMslCompileFailureCount());
+  }
+
+  private record IrisMslCompileCounters(long attempts, long successes,
+                                        long unsupported, long failures) {
+    private IrisMslCompileCounters {
+      if (attempts < 0 || successes < 0 || unsupported < 0 || failures < 0) {
+        throw new IllegalStateException(
+            "Iris MSL compile counter overflowed signed Java range");
+      }
+      if (successes + unsupported + failures > attempts) {
+        throw new IllegalStateException(
+            "Iris MSL terminal counters exceed attempts");
+      }
+    }
+
+    private IrisMslCompileCounters deltaFrom(
+        IrisMslCompileCounters baseline) {
+      if (attempts < baseline.attempts
+          || successes < baseline.successes
+          || unsupported < baseline.unsupported
+          || failures < baseline.failures) {
+        throw new IllegalStateException(
+            "Iris MSL compile counters are not monotonic");
+      }
+      return new IrisMslCompileCounters(
+          attempts - baseline.attempts,
+          successes - baseline.successes,
+          unsupported - baseline.unsupported,
+          failures - baseline.failures);
+    }
   }
 
   private record NativeFaultCounters(long gpuCommandBufferErrors,

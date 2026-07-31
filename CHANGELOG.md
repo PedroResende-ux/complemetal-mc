@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0-alpha.1+mc26.2
+
+### Iris Metal compiler milestone
+
+- Emit Metal argument-buffer resource declarations during SPIR-V-to-MSL
+  translation, preventing real shader-pack stages from exceeding Metal's
+  direct buffer-index limit. Runtime resource binding remains a later
+  roadmap stage.
+- Add an explicit opt-in, fail-open validation path that compiles generated MSL
+  into an ephemeral `MTLLibrary`, resolves the expected `main0` function and
+  releases the library without creating a pipeline or encoding a draw.
+- Bound compile-validation input to 16 MiB per stage, verify cached MSL again
+  before JNI, cap retained artifact identities, and fail the completion gate
+  closed when digest or live-library telemetry is incomplete.
+- Distinguish lifecycle `DEFERRED` from terminal `UNSUPPORTED`, including
+  startup, renderer restart and teardown races.
+- Keep translation, Apple Metal compiler validation, pipeline creation and
+  shader execution as separate status/evidence boundaries.
+- Extend exact-JAR QA to require all 76 captured Complementary Reimagined
+  programs and all 152 generated stages to pass the Apple Metal compiler in
+  cold and warm cache runs under both the Metal 4 hybrid and forced Metal 3
+  profiles.
+
+### Boundary
+
+- Iris still owns the visible OpenGL render graph. This milestone does not
+  execute generated MSL, replace an Iris pass or make an FPS claim.
+
 ## 0.2.1+mc26.2
 
 ### Runtime clarity

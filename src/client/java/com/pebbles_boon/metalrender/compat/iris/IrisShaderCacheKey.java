@@ -27,7 +27,8 @@ public record IrisShaderCacheKey(String sha256) {
   }
 
   public static IrisShaderCacheKey from(IrisFinalShaderProgram program) {
-    return from(program, IrisTranslationProfile.LWJGL_3_4_1_METAL_3);
+    return from(program,
+        IrisTranslationProfile.LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS);
   }
 
   public static IrisShaderCacheKey from(IrisFinalShaderProgram program,

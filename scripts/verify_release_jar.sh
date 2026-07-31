@@ -143,6 +143,13 @@ required_release_qa_exports=(
   "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetGpuCommandBufferErrorCount"
   "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetInFlightFrameTimeoutCount"
   "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetNoIOSurfaceSlotSkipCount"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nValidateIrisMslLibrary"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nIsIrisMslCompilerReady"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMslCompileAttemptCount"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMslCompileSuccessCount"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMslCompileUnsupportedCount"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMslCompileFailureCount"
+  "Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMslLiveLibraryCount"
 )
 for required in "${required_release_qa_exports[@]}"; do
   if ! grep -Fxq "$required" "$jni_expected" ||

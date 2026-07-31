@@ -626,8 +626,10 @@ public class MetalRenderClient implements ClientModInitializer {
           error.getMessage());
     }
     MetalRenderHookState.resetSession();
-    shutdownRenderer();
+    // Stop validation before nDestroy can tear down the Metal device used by
+    // an in-flight ephemeral MTLLibrary compile.
     IrisTranslationCoordinator.stop();
+    shutdownRenderer();
     AsyncCullTask.shutdown();
     instance = null;
   }

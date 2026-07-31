@@ -17,6 +17,7 @@ __pycache__/
 *.iws
 /.vscode/
 /run/
+/logs/
 *.log
 run/logs/
 /node_modules/

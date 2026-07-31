@@ -36,6 +36,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
   private static final int WORLD_TIMEOUT_TICKS = 3_600;
   private static final int SHADER_TIMEOUT_TICKS = 3_600;
   private static final long EXPECTED_COMPLEMENTARY_PROGRAMS = 76;
+  private static final long EXPECTED_COMPLEMENTARY_STAGES = 152;
 
   @Override
   public void runTest(ClientGameTestContext context) {
@@ -55,6 +56,9 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         requiredProperty("metalrender.exactJar.backend");
     require(cacheExpectation.equals("cold") || cacheExpectation.equals("warm"),
         "invalid cache expectation: " + cacheExpectation);
+    require(Boolean.getBoolean(
+            "metalrender.experimental.irisMetalLibraryValidation"),
+        "exact-JAR QA requires Iris MSL library validation opt-in");
     require(backendExpectation.equals("metal4")
             || backendExpectation.equals("metal3"),
         "invalid backend expectation: " + backendExpectation);
@@ -229,10 +233,21 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         IrisTranslationCoordinator.Status status =
             IrisTranslationCoordinator.status();
         return status.running() && status.queued() == 0
-            && status.attempted() > 0
-            && (cacheExpectation.equals("cold")
-                ? status.translated() > 0
-                : status.cacheHits() > 0);
+            && status.attempted() == EXPECTED_COMPLEMENTARY_PROGRAMS
+            && status.libraryValidationEnabled()
+            && status.libraryValidationReady()
+            && status.libraryValidationComplete()
+            && status.libraryProgramsAttempted()
+                == EXPECTED_COMPLEMENTARY_PROGRAMS
+            && status.libraryProgramsSucceeded()
+                == EXPECTED_COMPLEMENTARY_PROGRAMS
+            && status.libraryStagesAttempted()
+                == EXPECTED_COMPLEMENTARY_STAGES
+            && status.libraryStagesSucceeded()
+                == EXPECTED_COMPLEMENTARY_STAGES
+            && status.compiledArtifactSetComplete()
+            && status.libraryStagesPending() == 0
+            && status.libraryStagesInFlight() == 0;
       }, SHADER_TIMEOUT_TICKS);
       IrisTranslationCoordinator.Status translationStatus =
           context.computeOnClient(
@@ -274,6 +289,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
                       == translationStatus.attempted()
                   && translationStatus.translated() == 0),
           "warm-cache run did not reuse every captured program");
+      requireMslLibraryValidation(translationStatus, cacheExpectation);
       context.runOnClient(client -> NativeBridge.nFlushFrames());
       NativeFaultCounters nativeFaultEnd =
           context.computeOnClient(client -> nativeFaultCounters());
@@ -288,6 +304,102 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           cacheExpectation, backendExpectation, nativeFaultBaseline,
           nativeFaultEnd, nativeFaultDelta);
     }
+  }
+
+  private static void requireMslLibraryValidation(
+      IrisTranslationCoordinator.Status status, String cacheExpectation) {
+    require(status.libraryValidationEnabled(),
+        "Iris MSL library validation is not enabled");
+    require(status.libraryValidationReady(),
+        "Iris MSL library validator is not ready");
+    require(status.libraryValidationComplete(),
+        "Iris MSL library validation did not complete");
+    require(status.libraryProgramsAttempted()
+            == EXPECTED_COMPLEMENTARY_PROGRAMS,
+        "unexpected MSL library program count: expected "
+            + EXPECTED_COMPLEMENTARY_PROGRAMS + ", got "
+            + status.libraryProgramsAttempted());
+    require(status.libraryProgramsSucceeded()
+            == EXPECTED_COMPLEMENTARY_PROGRAMS,
+        "not every captured program produced validated Metal libraries: "
+            + status.libraryProgramsSucceeded());
+    require(status.libraryProgramsUnsupported() == 0,
+        "MSL library validation reported unsupported programs: "
+            + status.libraryProgramsUnsupported());
+    require(status.libraryProgramsFailed() == 0,
+        "MSL library validation reported failed programs: "
+            + status.libraryProgramsFailed());
+    require(status.libraryStagesAttempted() == EXPECTED_COMPLEMENTARY_STAGES,
+        "unexpected MSL library stage count: expected "
+            + EXPECTED_COMPLEMENTARY_STAGES + ", got "
+            + status.libraryStagesAttempted());
+    require(status.libraryStagesSucceeded() == EXPECTED_COMPLEMENTARY_STAGES,
+        "not every generated MSL stage produced a validated MTLLibrary: "
+            + status.libraryStagesSucceeded());
+    require(status.libraryStagesUnsupported() == 0,
+        "MSL library validation reported unsupported stages: "
+            + status.libraryStagesUnsupported());
+    require(status.libraryStagesFailed() == 0,
+        "MSL library validation reported failed stages: "
+            + status.libraryStagesFailed());
+    require(status.libraryStagesRejected() == 0,
+        "MSL library validation rejected stages: "
+            + status.libraryStagesRejected());
+    require(status.libraryStagesPending() == 0,
+        "MSL library validation left pending stages: "
+            + status.libraryStagesPending());
+    require(status.libraryStagesInFlight() == 0,
+        "MSL library validation left in-flight stages: "
+            + status.libraryStagesInFlight());
+    require(status.libraryStagesAttempted()
+            == status.libraryStagesSucceeded()
+                + status.libraryStagesUnsupported()
+                + status.libraryStagesFailed()
+                + status.libraryStagesPending()
+                + status.libraryStagesInFlight(),
+        "MSL library stage counters do not account for every attempt");
+    long expectedFromTranslation = cacheExpectation.equals("cold")
+        ? EXPECTED_COMPLEMENTARY_STAGES : 0;
+    long expectedFromCache = cacheExpectation.equals("warm")
+        ? EXPECTED_COMPLEMENTARY_STAGES : 0;
+    require(status.libraryStagesFromTranslation() == expectedFromTranslation,
+        cacheExpectation + " run validated an unexpected translated-stage "
+            + "count: " + status.libraryStagesFromTranslation());
+    require(status.libraryStagesFromCache() == expectedFromCache,
+        cacheExpectation + " run validated an unexpected cached-stage count: "
+            + status.libraryStagesFromCache());
+    require(status.libraryStagesFromTranslation()
+            + status.libraryStagesFromCache()
+            == status.libraryStagesAttempted(),
+        "MSL library source counters do not account for every stage");
+    require(status.libraryLiveLibraries() == 0,
+        "MSL library validation retained native libraries: "
+            + status.libraryLiveLibraries());
+    require(NativeBridge.nGetIrisMslCompileAttemptCount()
+            == EXPECTED_COMPLEMENTARY_STAGES,
+        "native MSL compile attempt count is not exact: "
+            + NativeBridge.nGetIrisMslCompileAttemptCount());
+    require(NativeBridge.nGetIrisMslCompileSuccessCount()
+            == EXPECTED_COMPLEMENTARY_STAGES,
+        "native MSL compile success count is not exact: "
+            + NativeBridge.nGetIrisMslCompileSuccessCount());
+    require(NativeBridge.nGetIrisMslCompileUnsupportedCount() == 0,
+        "native MSL compiler reported unsupported stages: "
+            + NativeBridge.nGetIrisMslCompileUnsupportedCount());
+    require(NativeBridge.nGetIrisMslCompileFailureCount() == 0,
+        "native MSL compiler reported failed stages: "
+            + NativeBridge.nGetIrisMslCompileFailureCount());
+    require(NativeBridge.nGetIrisMslLiveLibraryCount() == 0,
+        "native MSL compiler retained MTLLibrary instances: "
+            + NativeBridge.nGetIrisMslLiveLibraryCount());
+    require(status.compiledArtifactSetSha256().matches("[0-9a-f]{64}"),
+        "MSL compiled-artifact digest is invalid: "
+            + status.compiledArtifactSetSha256());
+    require(status.compiledArtifactSetComplete(),
+        "MSL compiled-artifact identity set exceeded its verified bound");
+    require(status.libraryValidationLastFailure().isEmpty(),
+        "MSL library validation retained a failure: "
+            + status.libraryValidationLastFailure());
   }
 
   private static boolean irisOwnsRenderGraph() {
@@ -440,6 +552,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         .getMetadata().getVersion().getFriendlyString();
     String json = String.format(Locale.ROOT, """
         {
+          "schemaVersion": 3,
           "status": "PASS",
           "environment": "production-fabric",
           "javaMajor": 25,
@@ -453,8 +566,16 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "metal4DrawPathActive": %s,
           "sodiumLoaded": true,
           "irisLoaded": true,
-          "irisDrawBackend": "OPENGL",
-          "generatedMslExecuted": false,
+          "irisRuntimeOwnership": {
+            "evidenceKind": "indirect-runtime-ownership-check",
+            "assertedDrawBackend": "OPENGL",
+            "measuredAtRuntime": true,
+            "passed": true
+          },
+          "generatedMslExecutionBoundary": {
+            "runtimeTelemetryAvailable": false,
+            "assertedStaticBoundary": "library-compile-resolve-release-only"
+          },
           "shaderPack": %s,
           "shaderPackInitiallyLoaded": true,
           "shaderPackDisabledAndApplied": true,
@@ -472,6 +593,38 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             "captureFailures": %d,
             "queuedAtEvidence": %d,
             "pipelineStatus": "pending"
+          },
+          "generatedMslLibraryValidation": {
+            "enabled": %s,
+            "ready": %s,
+            "complete": %s,
+            "mode": "compile-resolve-release-only",
+            "executionBoundary": "library-compile-resolve-release-only",
+            "stageCounterSemantics": "coordinator-lifetime-monotonic",
+            "nativeCounterSemantics": "process-lifetime-monotonic",
+            "liveLibrarySemantics": "instantaneous-gauge",
+            "programsAttempted": %d,
+            "programsSucceeded": %d,
+            "programsUnsupported": %d,
+            "programsFailed": %d,
+            "stagesAttempted": %d,
+            "stagesSucceeded": %d,
+            "stagesUnsupported": %d,
+            "stagesFailed": %d,
+            "stagesRejected": %d,
+            "stagesPending": %d,
+            "stagesInFlight": %d,
+            "stagesFromTranslation": %d,
+            "stagesFromCache": %d,
+            "nativeCompileAttempts": %d,
+            "nativeCompileSuccesses": %d,
+            "nativeCompileUnsupported": %d,
+            "nativeCompileFailures": %d,
+            "compiledArtifactSetSha256": %s,
+            "compiledArtifactSetComplete": %s,
+            "lastFailure": %s,
+            "statusLiveLibraries": %d,
+            "liveLibrariesAtEvidence": %d
           },
           "nativeFaultCounters": {
             "semantics": "process-lifetime-monotonic",
@@ -526,6 +679,31 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         translationStatus.rejected(),
         translationStatus.captureFailures(),
         translationStatus.queued(),
+        Boolean.toString(translationStatus.libraryValidationEnabled()),
+        Boolean.toString(translationStatus.libraryValidationReady()),
+        Boolean.toString(translationStatus.libraryValidationComplete()),
+        translationStatus.libraryProgramsAttempted(),
+        translationStatus.libraryProgramsSucceeded(),
+        translationStatus.libraryProgramsUnsupported(),
+        translationStatus.libraryProgramsFailed(),
+        translationStatus.libraryStagesAttempted(),
+        translationStatus.libraryStagesSucceeded(),
+        translationStatus.libraryStagesUnsupported(),
+        translationStatus.libraryStagesFailed(),
+        translationStatus.libraryStagesRejected(),
+        translationStatus.libraryStagesPending(),
+        translationStatus.libraryStagesInFlight(),
+        translationStatus.libraryStagesFromTranslation(),
+        translationStatus.libraryStagesFromCache(),
+        NativeBridge.nGetIrisMslCompileAttemptCount(),
+        NativeBridge.nGetIrisMslCompileSuccessCount(),
+        NativeBridge.nGetIrisMslCompileUnsupportedCount(),
+        NativeBridge.nGetIrisMslCompileFailureCount(),
+        quote(translationStatus.compiledArtifactSetSha256()),
+        Boolean.toString(translationStatus.compiledArtifactSetComplete()),
+        quote(translationStatus.libraryValidationLastFailure()),
+        translationStatus.libraryLiveLibraries(),
+        NativeBridge.nGetIrisMslLiveLibraryCount(),
         nativeFaultBaseline.gpuCommandBufferErrors(),
         nativeFaultBaseline.inFlightFrameTimeouts(),
         nativeFaultBaseline.noIOSurfaceSlotSkips(),

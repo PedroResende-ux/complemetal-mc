@@ -184,8 +184,44 @@ public final class MetalRenderCommands {
                     : irisTranslation.enabled()
                         ? "§eEnabled, worker unavailable"
                         : "§7Disabled"));
+        if (irisTranslation.libraryValidationEnabled()) {
+            msg(src, "§7Iris MSL library validation: "
+                    + (irisTranslation.libraryValidationComplete()
+                        ? "§aComplete"
+                        : irisTranslation.libraryValidationReady()
+                            ? "§eRunning"
+                            : "§eDeferred")
+                    + " §7(programs="
+                    + irisTranslation.libraryProgramsAttempted() + "/"
+                    + irisTranslation.libraryProgramsSucceeded() + "/"
+                    + irisTranslation.libraryProgramsUnsupported() + "/"
+                    + irisTranslation.libraryProgramsFailed()
+                    + ", stages="
+                    + irisTranslation.libraryStagesAttempted() + "/"
+                    + irisTranslation.libraryStagesSucceeded() + "/"
+                    + irisTranslation.libraryStagesUnsupported() + "/"
+                    + irisTranslation.libraryStagesFailed()
+                    + ", pending="
+                    + irisTranslation.libraryStagesPending()
+                    + ", inFlight="
+                    + irisTranslation.libraryStagesInFlight()
+                    + ", live="
+                    + (irisTranslation.libraryLiveLibraries() < 0
+                        ? "unavailable"
+                        : irisTranslation.libraryLiveLibraries())
+                    + ")");
+            msg(src, "§7Iris compiled artifact digest: §f"
+                    + irisTranslation.compiledArtifactSetSha256()
+                    + " §7("
+                    + (irisTranslation.compiledArtifactSetComplete()
+                        ? "complete" : "incomplete")
+                    + ")");
+        } else {
+            msg(src, "§7Iris MSL library validation: §7Disabled");
+        }
         if (irisTranslation.running()) {
-            msg(src, "§7Iris Metal execution: §ePending; Iris OpenGL active");
+            msg(src,
+                    "§7Iris Metal execution: §ePending; pipeline.status=pending; Iris OpenGL active");
         }
         msg(src, "§7Init state: §f" + MetalRenderClient.getInitState());
         if (MetalRenderClient.getInitFailure() != null) {

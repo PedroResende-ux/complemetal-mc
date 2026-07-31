@@ -1,14 +1,21 @@
 package com.pebbles_boon.metalrender.compat.iris;
 
 import com.pebbles_boon.metalrender.util.MetalLogger;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -22,6 +29,12 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class IrisTranslationCoordinator implements AutoCloseable {
   public static final String TRANSLATION_ENABLED_PROPERTY =
       "metalrender.experimental.irisMetalTranslation";
+  public static final String LIBRARY_VALIDATION_ENABLED_PROPERTY =
+      "metalrender.experimental.irisMetalLibraryValidation";
+  static final int DEFAULT_LIBRARY_VALIDATION_QUEUE_CAPACITY = 512;
+  static final int DEFAULT_COMPILED_ARTIFACT_IDENTITY_CAPACITY =
+      Math.multiplyExact(IrisPipelineCache.DEFAULT_MAX_ENTRIES,
+          IrisShaderStage.values().length);
   private static final long CLIENT_QUIET_PERIOD_NANOS =
       TimeUnit.SECONDS.toNanos(8);
 
@@ -35,6 +48,10 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   private final IrisShaderCaptureQueue captureQueue;
   private final IrisShaderTranslatorBackend backend;
   private final IrisPipelineCache cache;
+  private final IrisMslLibraryValidator libraryValidator;
+  private final boolean libraryValidationEnabled;
+  private final ArrayBlockingQueue<LibraryStageJob> libraryStageQueue;
+  private final int compiledArtifactIdentityCapacity;
   private final String cacheRoot;
   private final long quietPeriodNanos;
   private final ScheduledExecutorService executor;
@@ -46,19 +63,91 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   private final AtomicReference<String> lastFailure =
       new AtomicReference<>("");
   private final AtomicLong warningCount = new AtomicLong();
+  private final AtomicBoolean libraryValidationReady = new AtomicBoolean();
+  private final AtomicInteger libraryStagesInFlight = new AtomicInteger();
+  private final AtomicLong libraryProgramsAttempted = new AtomicLong();
+  private final AtomicLong libraryProgramsSucceeded = new AtomicLong();
+  private final AtomicLong libraryProgramsUnsupported = new AtomicLong();
+  private final AtomicLong libraryProgramsFailed = new AtomicLong();
+  private final AtomicLong libraryStagesAttempted = new AtomicLong();
+  private final AtomicLong libraryStagesSucceeded = new AtomicLong();
+  private final AtomicLong libraryStagesUnsupported = new AtomicLong();
+  private final AtomicLong libraryStagesFailed = new AtomicLong();
+  private final AtomicLong libraryStagesFromTranslation = new AtomicLong();
+  private final AtomicLong libraryStagesFromCache = new AtomicLong();
+  private final AtomicLong libraryStagesRejected = new AtomicLong();
+  private final AtomicLong libraryLiveLibraries = new AtomicLong();
+  private final AtomicReference<String> libraryValidationLastFailure =
+      new AtomicReference<>("");
+  private final AtomicLong libraryWarningCount = new AtomicLong();
+  private final ConcurrentSkipListSet<String> compiledArtifactLines =
+      new ConcurrentSkipListSet<>();
+  private final AtomicBoolean compiledArtifactSetComplete =
+      new AtomicBoolean(true);
 
   IrisTranslationCoordinator(IrisShaderCaptureQueue captureQueue,
       IrisShaderTranslatorBackend backend, IrisPipelineCache cache,
       Path cacheRoot) {
-    this(captureQueue, backend, cache, cacheRoot, 0);
+    this(captureQueue, backend, cache, cacheRoot, 0, false,
+        IrisMslLibraryValidator.deferred(),
+        DEFAULT_LIBRARY_VALIDATION_QUEUE_CAPACITY,
+        DEFAULT_COMPILED_ARTIFACT_IDENTITY_CAPACITY);
+  }
+
+  IrisTranslationCoordinator(IrisShaderCaptureQueue captureQueue,
+      IrisShaderTranslatorBackend backend, IrisPipelineCache cache,
+      Path cacheRoot, IrisMslLibraryValidator libraryValidator,
+      int libraryValidationQueueCapacity) {
+    this(captureQueue, backend, cache, cacheRoot, 0, true, libraryValidator,
+        libraryValidationQueueCapacity,
+        DEFAULT_COMPILED_ARTIFACT_IDENTITY_CAPACITY);
+  }
+
+  IrisTranslationCoordinator(IrisShaderCaptureQueue captureQueue,
+      IrisShaderTranslatorBackend backend, IrisPipelineCache cache,
+      Path cacheRoot, IrisMslLibraryValidator libraryValidator,
+      int libraryValidationQueueCapacity,
+      int compiledArtifactIdentityCapacity) {
+    this(captureQueue, backend, cache, cacheRoot, 0, true, libraryValidator,
+        libraryValidationQueueCapacity, compiledArtifactIdentityCapacity);
+  }
+
+  IrisTranslationCoordinator(IrisShaderCaptureQueue captureQueue,
+      IrisShaderTranslatorBackend backend, IrisPipelineCache cache,
+      Path cacheRoot, boolean libraryValidationEnabled,
+      IrisMslLibraryValidator libraryValidator,
+      int libraryValidationQueueCapacity) {
+    this(captureQueue, backend, cache, cacheRoot, 0,
+        libraryValidationEnabled,
+        libraryValidator, libraryValidationQueueCapacity,
+        DEFAULT_COMPILED_ARTIFACT_IDENTITY_CAPACITY);
   }
 
   private IrisTranslationCoordinator(IrisShaderCaptureQueue captureQueue,
       IrisShaderTranslatorBackend backend, IrisPipelineCache cache,
-      Path cacheRoot, long quietPeriodNanos) {
+      Path cacheRoot, long quietPeriodNanos,
+      boolean libraryValidationEnabled,
+      IrisMslLibraryValidator libraryValidator,
+      int libraryValidationQueueCapacity,
+      int compiledArtifactIdentityCapacity) {
     this.captureQueue = Objects.requireNonNull(captureQueue, "captureQueue");
     this.backend = Objects.requireNonNull(backend, "backend");
     this.cache = Objects.requireNonNull(cache, "cache");
+    this.libraryValidator = Objects.requireNonNull(
+        libraryValidator, "libraryValidator");
+    this.libraryValidationEnabled = libraryValidationEnabled;
+    if (libraryValidationQueueCapacity <= 0) {
+      throw new IllegalArgumentException(
+          "library validation queue capacity must be positive");
+    }
+    libraryStageQueue = new ArrayBlockingQueue<>(
+        libraryValidationQueueCapacity);
+    if (compiledArtifactIdentityCapacity <= 0) {
+      throw new IllegalArgumentException(
+          "compiled artifact identity capacity must be positive");
+    }
+    this.compiledArtifactIdentityCapacity =
+        compiledArtifactIdentityCapacity;
     this.cacheRoot = Objects.requireNonNull(cacheRoot, "cacheRoot")
         .toAbsolutePath().normalize().toString();
     this.quietPeriodNanos = Math.max(0, quietPeriodNanos);
@@ -94,7 +183,11 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           new IrisPipelineCacheLayout(normalized));
       IrisTranslationCoordinator coordinator =
           new IrisTranslationCoordinator(IrisShaderCapture.captureQueue(),
-              backend, cache, normalized, CLIENT_QUIET_PERIOD_NANOS);
+              backend, cache, normalized, CLIENT_QUIET_PERIOD_NANOS,
+              isLibraryValidationOptedIn(),
+              new NativeIrisMslLibraryValidator(),
+              DEFAULT_LIBRARY_VALIDATION_QUEUE_CAPACITY,
+              DEFAULT_COMPILED_ARTIFACT_IDENTITY_CAPACITY);
       ACTIVE.set(coordinator);
       coordinator.start();
       START_FAILURE.set("");
@@ -125,7 +218,11 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           IrisShaderCapture.queuedPrograms(),
           IrisShaderCapture.rejectedPrograms(),
           IrisShaderCapture.captureFailures(), 0, 0, 0, 0,
-          CONFIGURED_CACHE_ROOT.get(), START_FAILURE.get());
+          CONFIGURED_CACHE_ROOT.get(), START_FAILURE.get(),
+          isLibraryValidationOptedIn(), false,
+          0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, true, emptyCompiledArtifactSetSha256(), "");
     }
     return coordinator.snapshot();
   }
@@ -133,6 +230,11 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   private static boolean isOptedIn() {
     return IrisShaderCapture.isEnabled()
         && Boolean.getBoolean(TRANSLATION_ENABLED_PROPERTY);
+  }
+
+  static boolean isLibraryValidationOptedIn() {
+    return isOptedIn()
+        && Boolean.getBoolean(LIBRARY_VALIDATION_ENABLED_PROPERTY);
   }
 
   void start() {
@@ -148,6 +250,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       if (captureQueue.nanosSinceLastOffer() < quietPeriodNanos) {
         return;
       }
+      drainOneLibraryStage();
       for (int processed = 0; processed < 1 && running.get(); processed++) {
         Optional<IrisShaderCaptureQueue.CapturedProgram> captured =
             captureQueue.poll();
@@ -184,6 +287,9 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
 
       if (cache.lookup(program, backend.profile()).isPresent()) {
         cacheHits.incrementAndGet();
+        scheduleLibraryValidation(program,
+            IrisShaderCacheKey.from(program, backend.profile()),
+            backend.profile(), LibraryStageSource.CACHE);
         return;
       }
       IrisShaderTranslation result = backend.translate(program);
@@ -193,8 +299,12 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       IrisPipelineCache.StoreResult stored = cache.store(program, result);
       if (stored.cacheHit()) {
         cacheHits.incrementAndGet();
+        scheduleLibraryValidation(program, result.key(), result.profile(),
+            LibraryStageSource.CACHE);
       } else {
         translated.incrementAndGet();
+        scheduleLibraryValidation(program, result.key(), result.profile(),
+            LibraryStageSource.TRANSLATION);
       }
     } catch (Exception | LinkageError error) {
       recordFailure(error);
@@ -213,11 +323,207 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     }
   }
 
+  private void scheduleLibraryValidation(IrisFinalShaderProgram program,
+      IrisShaderCacheKey key, IrisTranslationProfile profile,
+      LibraryStageSource source) {
+    if (!libraryValidationEnabled) {
+      return;
+    }
+    int stageCount = 0;
+    for (IrisShaderStage stage : IrisShaderStage.values()) {
+      if (program.hasStage(stage)) {
+        stageCount++;
+      }
+    }
+    if (stageCount == 0) {
+      return;
+    }
+
+    libraryProgramsAttempted.incrementAndGet();
+    LibraryProgramState programState = new LibraryProgramState(stageCount);
+    for (IrisShaderStage stage : IrisShaderStage.values()) {
+      if (!program.hasStage(stage)) {
+        continue;
+      }
+      libraryStagesAttempted.incrementAndGet();
+      if (source == LibraryStageSource.TRANSLATION) {
+        libraryStagesFromTranslation.incrementAndGet();
+      } else {
+        libraryStagesFromCache.incrementAndGet();
+      }
+      LibraryStageJob job = new LibraryStageJob(
+          key, profile, stage, programState);
+      if (!libraryStageQueue.offer(job)) {
+        libraryStagesRejected.incrementAndGet();
+        libraryStagesFailed.incrementAndGet();
+        String failure = artifactLabel(key, stage) + ": queue-full";
+        libraryValidationLastFailure.set(failure);
+        programState.resolve(LibraryStageOutcome.FAILED);
+      }
+    }
+  }
+
+  private void drainOneLibraryStage() {
+    if (!libraryValidationEnabled || libraryStageQueue.isEmpty()) {
+      return;
+    }
+    IrisMslLibraryValidator.Readiness readiness =
+        libraryValidator.readiness();
+    boolean ready = readiness == IrisMslLibraryValidator.Readiness.READY;
+    libraryValidationReady.set(ready);
+    if (!ready) {
+      return;
+    }
+
+    LibraryStageJob job = libraryStageQueue.poll();
+    if (job == null) {
+      return;
+    }
+    libraryStagesInFlight.incrementAndGet();
+    boolean resolved = false;
+    try {
+      Optional<IrisPipelineCache.VerifiedMslStage> verified =
+          cache.readVerifiedMslStage(
+              job.key(), job.profile(), job.stage());
+      if (verified.isEmpty()) {
+        recordLibraryStageFailure(job, "cache-verification-failed");
+        resolved = true;
+        return;
+      }
+
+      IrisPipelineCache.VerifiedMslStage artifact =
+          verified.orElseThrow();
+      IrisMslLibraryValidator.Result result = libraryValidator.validate(
+          artifact.mslUtf8(), artifact.stage());
+      switch (result) {
+        case COMPILED -> {
+          libraryStagesSucceeded.incrementAndGet();
+          retainCompiledArtifactIdentity(artifact);
+          job.programState().resolve(LibraryStageOutcome.SUCCEEDED);
+          resolved = true;
+        }
+        case UNSUPPORTED -> {
+          libraryStagesUnsupported.incrementAndGet();
+          libraryValidationLastFailure.set(
+              artifactLabel(job.key(), job.stage()) + ": unsupported");
+          job.programState().resolve(LibraryStageOutcome.UNSUPPORTED);
+          resolved = true;
+        }
+        case FAILED -> {
+          recordLibraryStageFailure(job, "native-compile-failed");
+          resolved = true;
+        }
+        case DEFERRED -> {
+          libraryValidationReady.set(false);
+          if (!libraryStageQueue.offer(job)) {
+            recordLibraryStageFailure(job, "deferred-requeue-failed");
+            resolved = true;
+          }
+        }
+      }
+    } catch (Exception | LinkageError error) {
+      recordLibraryStageFailure(job,
+          "validation-" + redactedFailure(error));
+      resolved = true;
+    } finally {
+      if (!resolved && !libraryStageQueue.contains(job)) {
+        recordLibraryStageFailure(job, "validation-job-lost");
+      }
+      libraryStagesInFlight.decrementAndGet();
+      refreshLiveLibraryCount();
+    }
+  }
+
+  private void recordLibraryStageFailure(LibraryStageJob job,
+      String reason) {
+    libraryStagesFailed.incrementAndGet();
+    String failure = artifactLabel(job.key(), job.stage()) + ": " + reason;
+    libraryValidationLastFailure.set(failure);
+    job.programState().resolve(LibraryStageOutcome.FAILED);
+    long warnings = libraryWarningCount.incrementAndGet();
+    if (warnings <= 3 || warnings % 32 == 0) {
+      MetalLogger.warn(
+          "Iris MSL library validation failed open; Iris OpenGL remains active (%s, failure %d)",
+          failure, warnings);
+    }
+  }
+
+  private void refreshLiveLibraryCount() {
+    try {
+      long liveLibraries = libraryValidator.liveLibraryCount();
+      libraryLiveLibraries.set(liveLibraries < 0 ? -1 : liveLibraries);
+    } catch (RuntimeException | LinkageError unavailable) {
+      libraryLiveLibraries.set(-1);
+    }
+  }
+
+  private static String artifactLabel(IrisShaderCacheKey key,
+      IrisShaderStage stage) {
+    return key.sha256().substring(0, 12) + "/" + stage.cacheName();
+  }
+
+  private void retainCompiledArtifactIdentity(
+      IrisPipelineCache.VerifiedMslStage artifact) {
+    String identity = artifact.programKeySha256()
+        + "/" + artifact.stage().cacheName()
+        + "/" + artifact.mslSha256() + "\n";
+    synchronized (compiledArtifactLines) {
+      if (compiledArtifactLines.contains(identity)) {
+        return;
+      }
+      if (compiledArtifactLines.size()
+          >= compiledArtifactIdentityCapacity) {
+        if (compiledArtifactSetComplete.compareAndSet(true, false)) {
+          String reason = "compiled-artifact-set-capacity-exceeded";
+          libraryValidationLastFailure.set(reason);
+          MetalLogger.warn(
+              "Iris MSL compiled artifact identity set reached its hard capacity; validation remains fail-open (%s)",
+              reason);
+        }
+        return;
+      }
+      compiledArtifactLines.add(identity);
+    }
+  }
+
+  private String compiledArtifactSetSha256() {
+    MessageDigest digest = newSha256();
+    synchronized (compiledArtifactLines) {
+      for (String line : compiledArtifactLines) {
+        digest.update(line.getBytes(StandardCharsets.US_ASCII));
+      }
+    }
+    return HexFormat.of().formatHex(digest.digest());
+  }
+
+  private static String emptyCompiledArtifactSetSha256() {
+    return HexFormat.of().formatHex(newSha256().digest());
+  }
+
+  private static MessageDigest newSha256() {
+    try {
+      return MessageDigest.getInstance("SHA-256");
+    } catch (NoSuchAlgorithmException impossible) {
+      throw new IllegalStateException(
+          "JVM does not provide SHA-256", impossible);
+    }
+  }
+
   Status snapshot() {
     return new Status(true, running.get(), captureQueue.size(),
         captureQueue.rejectedPrograms(), IrisShaderCapture.captureFailures(),
         attempted.get(), translated.get(), cacheHits.get(), failed.get(),
-        cacheRoot, lastFailure.get());
+        cacheRoot, lastFailure.get(),
+        libraryValidationEnabled, libraryValidationReady.get(),
+        libraryProgramsAttempted.get(), libraryProgramsSucceeded.get(),
+        libraryProgramsUnsupported.get(), libraryProgramsFailed.get(),
+        libraryStagesAttempted.get(), libraryStagesSucceeded.get(),
+        libraryStagesUnsupported.get(), libraryStagesFailed.get(),
+        libraryStageQueue.size(), libraryStagesInFlight.get(),
+        libraryStagesFromTranslation.get(), libraryStagesFromCache.get(),
+        libraryStagesRejected.get(), libraryLiveLibraries.get(),
+        compiledArtifactSetComplete.get(), compiledArtifactSetSha256(),
+        libraryValidationLastFailure.get());
   }
 
   private static String redactedFailure(Throwable error) {
@@ -240,16 +546,121 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       Thread.currentThread().interrupt();
       lastFailure.compareAndSet("", "shutdown-interrupted");
     }
+    libraryStageQueue.clear();
+    libraryStagesInFlight.set(0);
     ACTIVE.compareAndSet(this, null);
+  }
+
+  private enum LibraryStageSource {
+    TRANSLATION,
+    CACHE
+  }
+
+  private enum LibraryStageOutcome {
+    SUCCEEDED,
+    UNSUPPORTED,
+    FAILED
+  }
+
+  private final class LibraryProgramState {
+    private final AtomicInteger remainingStages;
+    private final AtomicBoolean unsupported = new AtomicBoolean();
+    private final AtomicBoolean failed = new AtomicBoolean();
+    private final AtomicBoolean finalized = new AtomicBoolean();
+
+    private LibraryProgramState(int stageCount) {
+      remainingStages = new AtomicInteger(stageCount);
+    }
+
+    private void resolve(LibraryStageOutcome outcome) {
+      if (outcome == LibraryStageOutcome.FAILED) {
+        failed.set(true);
+      } else if (outcome == LibraryStageOutcome.UNSUPPORTED) {
+        unsupported.set(true);
+      }
+      int remaining = remainingStages.decrementAndGet();
+      if (remaining < 0) {
+        throw new IllegalStateException(
+            "library validation stage resolved more than once");
+      }
+      if (remaining != 0 || !finalized.compareAndSet(false, true)) {
+        return;
+      }
+      if (failed.get()) {
+        libraryProgramsFailed.incrementAndGet();
+      } else if (unsupported.get()) {
+        libraryProgramsUnsupported.incrementAndGet();
+      } else {
+        libraryProgramsSucceeded.incrementAndGet();
+      }
+    }
+  }
+
+  private record LibraryStageJob(IrisShaderCacheKey key,
+                                 IrisTranslationProfile profile,
+                                 IrisShaderStage stage,
+                                 LibraryProgramState programState) {
+    private LibraryStageJob {
+      Objects.requireNonNull(key, "key");
+      Objects.requireNonNull(profile, "profile");
+      Objects.requireNonNull(stage, "stage");
+      Objects.requireNonNull(programState, "programState");
+    }
   }
 
   public record Status(boolean enabled, boolean running, int queued,
                        long rejected, long captureFailures,
                        long attempted, long translated, long cacheHits,
-                       long failed, String cacheRoot, String lastFailure) {
+                       long failed, String cacheRoot, String lastFailure,
+                       boolean libraryValidationEnabled,
+                       boolean libraryValidationReady,
+                       long libraryProgramsAttempted,
+                       long libraryProgramsSucceeded,
+                       long libraryProgramsUnsupported,
+                       long libraryProgramsFailed,
+                       long libraryStagesAttempted,
+                       long libraryStagesSucceeded,
+                       long libraryStagesUnsupported,
+                       long libraryStagesFailed,
+                       int libraryStagesPending,
+                       int libraryStagesInFlight,
+                       long libraryStagesFromTranslation,
+                       long libraryStagesFromCache,
+                       long libraryStagesRejected,
+                       long libraryLiveLibraries,
+                       boolean compiledArtifactSetComplete,
+                       String compiledArtifactSetSha256,
+                       String libraryValidationLastFailure) {
     public Status {
       Objects.requireNonNull(cacheRoot, "cacheRoot");
       Objects.requireNonNull(lastFailure, "lastFailure");
+      Objects.requireNonNull(
+          compiledArtifactSetSha256, "compiledArtifactSetSha256");
+      Objects.requireNonNull(
+          libraryValidationLastFailure, "libraryValidationLastFailure");
+    }
+
+    /**
+     * Gate for advancing beyond validation-only work. It can become true only
+     * when every discovered stage compiled, every program succeeded, and the
+     * native leak guard is zero.
+     */
+    public boolean libraryValidationComplete() {
+      return libraryValidationEnabled
+          && libraryValidationReady
+          && libraryProgramsAttempted > 0
+          && libraryProgramsAttempted == libraryProgramsSucceeded
+          && libraryProgramsUnsupported == 0
+          && libraryProgramsFailed == 0
+          && libraryStagesAttempted > 0
+          && libraryStagesAttempted == libraryStagesSucceeded
+          && libraryStagesUnsupported == 0
+          && libraryStagesFailed == 0
+          && libraryStagesPending == 0
+          && libraryStagesInFlight == 0
+          && libraryStagesRejected == 0
+          && libraryLiveLibraries == 0
+          && compiledArtifactSetComplete;
     }
   }
 }

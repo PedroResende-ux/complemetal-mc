@@ -1,6 +1,7 @@
 package com.pebbles_boon.metalrender.compat.iris;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -84,6 +85,42 @@ final class IrisInProcessTranslationSmokeTest {
 
     assertStage(translation.stage(IrisShaderStage.VERTEX), "vertex");
     assertStage(translation.stage(IrisShaderStage.FRAGMENT), "fragment");
+  }
+
+  @Test
+  void packsManyPlainUniformsIntoAnArgumentBuffer() throws Exception {
+    assumeEnabled();
+    LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
+        LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
+    StringBuilder uniforms = new StringBuilder();
+    StringBuilder sum = new StringBuilder();
+    for (int index = 0; index < 40; index++) {
+      uniforms.append("uniform float u").append(index).append(";\n");
+      if (index > 0) {
+        sum.append(" + ");
+      }
+      sum.append("u").append(index);
+    }
+    IrisFinalShaderProgram program =
+        IrisFinalShaderProgram.fromGraphicsLink("uniform-pressure-smoke",
+            """
+            #version 450
+            void main() {
+              gl_Position = vec4(0.0);
+            }
+            """,
+            null, null, null,
+            "#version 450\nlayout(location = 0) out vec4 outColor;\n"
+                + uniforms
+                + "void main() { outColor = vec4("
+                + sum + "); }\n");
+
+    String msl = backend.translate(program)
+        .stage(IrisShaderStage.FRAGMENT).msl();
+
+    assertTrue(msl.contains("spvDescriptorSet"));
+    assertTrue(msl.contains("[[buffer(0)]]"));
+    assertFalse(msl.matches("(?s).*\\[\\[buffer\\((?:3[1-9]|[4-9][0-9])\\)\\]\\].*"));
   }
 
   private static void assumeEnabled() {

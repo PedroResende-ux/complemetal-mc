@@ -28,7 +28,8 @@ Metal 3 compatibility stream. Actual MTL4 draw encoding is disabled.
 | Metal 4 | Runtime-detected queue/allocator probe only; no MTL4 draws |
 | Sodium | Optional; 0.9.1 for Minecraft 26.2 is the compatibility target |
 | Iris | Optional; 1.11.2 compatibility target; Iris rendering remains OpenGL |
-| Iris-to-Metal translation | Experimental opt-in cache preparation; no Metal execution or FPS claim |
+| Iris-to-Metal in stable `0.2.1` | Experimental opt-in cache preparation; no Metal execution or FPS claim |
+| Iris compiler milestone in development `0.3.0-alpha.1` | Optional ephemeral MSL library validation; no pipeline, draw or FPS claim |
 | Display scope | Window resize and fullscreen are validated; true 2x Retina backing is not validated |
 | Power/external display lifecycle | Sleep/wake and display hot-plug/reconnect are not validated |
 | High-refresh presentation | Real presented 200 Hz pacing is not validated |
@@ -70,8 +71,10 @@ This patch does not change the native draw-path boundary described below.
 
 See [Metal 4 status](docs/METAL4_STATUS.md) for the exact implementation
 boundary, [Iris to Metal pipeline](docs/IRIS_METAL_PIPELINE.md) for the shader
-translation contract, [the 0.2.1 release
-checklist](docs/RELEASE_CHECKLIST_0.2.1.md) for current artifact evidence, and
+translation contract, [the ordered Iris-to-Metal roadmap](docs/ROADMAP.md) for
+the remaining gates, [the 0.3.0 alpha Stage 2
+checklist](docs/RELEASE_CHECKLIST_0.3.0-alpha.1.md), [the 0.2.1 release
+checklist](docs/RELEASE_CHECKLIST_0.2.1.md) for stable artifact evidence, and
 [the changelog](CHANGELOG.md) for release details. The original
 [`0.2.0` checklist](docs/RELEASE_CHECKLIST.md) remains a historical record.
 
@@ -160,15 +163,26 @@ configuration; explicit JVM properties can opt into those development paths.
 Native entity/particle replacement is release-locked off because that legacy
 path still uses unsafe raw OpenGL texture readback on the current macOS driver.
 
+The development Stage 2 Iris compiler validation requires all three JVM
+properties below. It is intended for isolated QA profiles, not the supported
+stable install:
+
+```text
+-Dmetalrender.experimental.irisMetalPipeline=true
+-Dmetalrender.experimental.irisMetalTranslation=true
+-Dmetalrender.experimental.irisMetalLibraryValidation=true
+```
+
 See [COMMANDS.md](COMMANDS.md) for the complete command list.
 
 Stable refers only to the conservative hybrid profile in the support matrix.
 This release is not a complete MTL4 renderer and carries no guaranteed
-performance uplift. Its opt-in Iris translator prepares SPIR-V/MSL cache
-artifacts in the background but does not compile or execute them as Metal
-pipelines and does not replace Iris' OpenGL draws. It therefore does not
-currently increase Iris FPS. Native payload and lifecycle checks complement,
-but do not replace, visual comparison on real hardware.
+performance uplift. Stable `0.2.1` only prepares SPIR-V/MSL cache artifacts.
+Development `0.3.0-alpha.1` can additionally compile and release ephemeral
+Metal libraries, but still creates no Iris Metal pipeline and does not replace
+Iris' OpenGL draws. Neither boundary currently increases Iris FPS. Native
+payload and lifecycle checks complement, but do not replace, visual comparison
+on real hardware.
 
 ## Reporting bugs
 

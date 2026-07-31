@@ -2,6 +2,9 @@ package com.pebbles_boon.metalrender.compat.iris;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -13,8 +16,10 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -25,6 +30,8 @@ public final class IrisPipelineCache {
   private static final int MANIFEST_SCHEMA = 2;
   private static final long MAX_STAGE_ARTIFACT_BYTES =
       64L * 1024L * 1024L;
+  static final long MAX_LIBRARY_VALIDATION_MSL_BYTES =
+      16L * 1024L * 1024L;
   private static final long MAX_MANIFEST_BYTES = 64L * 1024L;
   private static final long MAX_COMPLETE_MARKER_BYTES = 4096L;
   public static final int DEFAULT_MAX_ENTRIES = 512;
@@ -60,6 +67,78 @@ public final class IrisPipelineCache {
     return isComplete(program, profile, paths)
         ? Optional.of(paths)
         : Optional.empty();
+  }
+
+  /**
+   * Reads one generated MSL stage only after revalidating its content-address,
+   * completion marker, manifest path, byte count, digest, file type, size
+   * bound, and UTF-8 syntax marker.
+   *
+   * <p>The caller needs only the derived cache key and profile; final GLSL is
+   * therefore not retained by the deferred Metal validation queue.</p>
+   */
+  public synchronized Optional<VerifiedMslStage> readVerifiedMslStage(
+      IrisShaderCacheKey key, IrisTranslationProfile profile,
+      IrisShaderStage stage) throws IOException {
+    Objects.requireNonNull(key, "key");
+    Objects.requireNonNull(profile, "profile");
+    Objects.requireNonNull(stage, "stage");
+
+    IrisPipelineCacheLayout.CachePaths paths = layout.paths(key);
+    if (!validCompleteMarker(key, profile, paths)) {
+      return Optional.empty();
+    }
+    Optional<Map<String, String>> manifestResult =
+        readStrictManifest(paths.manifest());
+    if (manifestResult.isEmpty()) {
+      return Optional.empty();
+    }
+    Map<String, String> manifest = manifestResult.orElseThrow();
+    if (!"metalrender-iris-pipeline-cache".equals(manifest.get("format"))
+        || !Integer.toString(MANIFEST_SCHEMA).equals(manifest.get("schema"))
+        || !key.sha256().equals(manifest.get("key.sha256"))
+        || !profile.sha256().equals(
+            manifest.get("translation.profile.sha256"))
+        || !profile.canonicalValue().equals(
+            manifest.get("translation.profile"))
+        || !"complete".equals(manifest.get("translation.status"))
+        || !"pending".equals(manifest.get("pipeline.status"))
+        || !"false".equals(
+            manifest.get("source.original_glsl_persisted"))) {
+      return Optional.empty();
+    }
+
+    String prefix = "stage." + stage.cacheName();
+    Path mslPath = paths.msl(stage);
+    String expectedRelative = slash(paths.directory().relativize(mslPath));
+    if (!"true".equals(manifest.get(prefix + ".present"))
+        || !expectedRelative.equals(manifest.get(prefix + ".msl"))) {
+      return Optional.empty();
+    }
+    long declaredBytes = parseBoundedSize(
+        manifest.get(prefix + ".msl.bytes"));
+    String declaredDigest = manifest.get(prefix + ".msl.sha256");
+    if (declaredBytes <= 0
+        || declaredBytes > MAX_LIBRARY_VALIDATION_MSL_BYTES
+        || declaredDigest == null
+        || !declaredDigest.matches("[0-9a-f]{64}")) {
+      return Optional.empty();
+    }
+
+    Optional<byte[]> content = readBoundedRegularFile(
+        mslPath, MAX_LIBRARY_VALIDATION_MSL_BYTES);
+    if (content.isEmpty()) {
+      return Optional.empty();
+    }
+    byte[] mslUtf8 = content.orElseThrow();
+    String actualDigest = sha256(mslUtf8);
+    if (mslUtf8.length != declaredBytes
+        || !actualDigest.equals(declaredDigest)
+        || !validMsl(mslUtf8)) {
+      return Optional.empty();
+    }
+    return Optional.of(new VerifiedMslStage(
+        key.sha256(), stage, mslUtf8, actualDigest));
   }
 
   /**
@@ -219,21 +298,24 @@ public final class IrisPipelineCache {
   private static boolean validCompleteMarker(IrisFinalShaderProgram program,
       IrisTranslationProfile profile,
       IrisPipelineCacheLayout.CachePaths paths) throws IOException {
-    Path marker = paths.translationComplete();
-    if (!Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS)) {
-      return false;
-    }
-    long size = Files.size(marker);
-    if (size <= 0 || size > MAX_COMPLETE_MARKER_BYTES) {
+    return validCompleteMarker(
+        IrisShaderCacheKey.from(program, profile), profile, paths);
+  }
+
+  private static boolean validCompleteMarker(IrisShaderCacheKey key,
+      IrisTranslationProfile profile,
+      IrisPipelineCacheLayout.CachePaths paths) throws IOException {
+    Optional<byte[]> marker = readBoundedRegularFile(
+        paths.translationComplete(), MAX_COMPLETE_MARKER_BYTES);
+    if (marker.isEmpty()) {
       return false;
     }
     String expectedMarker = "translation.status=complete\n"
         + "pipeline.status=pending\n"
-        + "key.sha256=" + IrisShaderCacheKey.from(program, profile).sha256()
-        + "\n"
+        + "key.sha256=" + key.sha256() + "\n"
         + "profile.sha256=" + profile.sha256() + "\n";
-    return expectedMarker.equals(Files.readString(marker,
-        StandardCharsets.US_ASCII));
+    return expectedMarker.equals(new String(
+        marker.orElseThrow(), StandardCharsets.US_ASCII));
   }
 
   private static boolean validManifest(IrisFinalShaderProgram program,
@@ -374,6 +456,96 @@ public final class IrisPipelineCache {
         && !mslPrefix.contains("#version");
   }
 
+  private static boolean validMsl(byte[] content) {
+    String msl;
+    try {
+      msl = StandardCharsets.UTF_8.newDecoder()
+          .onMalformedInput(CodingErrorAction.REPORT)
+          .onUnmappableCharacter(CodingErrorAction.REPORT)
+          .decode(ByteBuffer.wrap(content)).toString();
+    } catch (CharacterCodingException malformed) {
+      return false;
+    }
+    int prefixLength = Math.min(msl.length(), 8192);
+    String prefix = msl.substring(0, prefixLength);
+    return !prefix.isBlank()
+        && prefix.contains("metal_stdlib")
+        && !prefix.contains("#version")
+        && msl.indexOf('\0') < 0;
+  }
+
+  private static Optional<Map<String, String>> readStrictManifest(Path path)
+      throws IOException {
+    Optional<byte[]> content = readBoundedRegularFile(
+        path, MAX_MANIFEST_BYTES);
+    if (content.isEmpty()) {
+      return Optional.empty();
+    }
+    String manifest;
+    try {
+      manifest = StandardCharsets.UTF_8.newDecoder()
+          .onMalformedInput(CodingErrorAction.REPORT)
+          .onUnmappableCharacter(CodingErrorAction.REPORT)
+          .decode(ByteBuffer.wrap(content.orElseThrow())).toString();
+    } catch (CharacterCodingException malformed) {
+      return Optional.empty();
+    }
+    if (manifest.indexOf('\r') >= 0) {
+      return Optional.empty();
+    }
+    Map<String, String> properties = new HashMap<>();
+    for (String line : manifest.split("\n", -1)) {
+      if (line.isEmpty()) {
+        continue;
+      }
+      int separator = line.indexOf('=');
+      if (separator <= 0) {
+        return Optional.empty();
+      }
+      String name = line.substring(0, separator);
+      String value = line.substring(separator + 1);
+      if (!name.matches("[a-z0-9_.-]+")
+          || properties.putIfAbsent(name, value) != null) {
+        return Optional.empty();
+      }
+    }
+    return Optional.of(Map.copyOf(properties));
+  }
+
+  private static long parseBoundedSize(String value) {
+    if (value == null || !value.matches("[1-9][0-9]{0,8}")) {
+      return -1;
+    }
+    try {
+      long size = Long.parseLong(value);
+      return size <= MAX_STAGE_ARTIFACT_BYTES ? size : -1;
+    } catch (NumberFormatException invalid) {
+      return -1;
+    }
+  }
+
+  private static Optional<byte[]> readBoundedRegularFile(Path path,
+      long maximumBytes) throws IOException {
+    if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+      return Optional.empty();
+    }
+    long size = Files.size(path);
+    if (size <= 0 || size > maximumBytes || size >= Integer.MAX_VALUE) {
+      return Optional.empty();
+    }
+    byte[] content;
+    try (InputStream input = Files.newInputStream(
+        path, LinkOption.NOFOLLOW_LINKS)) {
+      content = input.readNBytes((int) size + 1);
+    }
+    if (content.length != size
+        || !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
+        || Files.size(path) != size) {
+      return Optional.empty();
+    }
+    return Optional.of(content);
+  }
+
   private void enforceBounds(Path protectedEntry) throws IOException {
     Path namespace = layout.root().resolve(
         IrisPipelineCacheLayout.CACHE_NAMESPACE);
@@ -463,6 +635,39 @@ public final class IrisPipelineCache {
                             boolean cacheHit) {
     public StoreResult {
       Objects.requireNonNull(paths, "paths");
+    }
+  }
+
+  /** Immutable validated bytes passed across the native compile boundary. */
+  public static final class VerifiedMslStage {
+    private final String programKeySha256;
+    private final IrisShaderStage stage;
+    private final byte[] mslUtf8;
+    private final String mslSha256;
+
+    private VerifiedMslStage(String programKeySha256, IrisShaderStage stage,
+        byte[] mslUtf8, String mslSha256) {
+      this.programKeySha256 = Objects.requireNonNull(
+          programKeySha256, "programKeySha256");
+      this.stage = Objects.requireNonNull(stage, "stage");
+      this.mslUtf8 = Objects.requireNonNull(mslUtf8, "mslUtf8").clone();
+      this.mslSha256 = Objects.requireNonNull(mslSha256, "mslSha256");
+    }
+
+    public String programKeySha256() {
+      return programKeySha256;
+    }
+
+    public IrisShaderStage stage() {
+      return stage;
+    }
+
+    public byte[] mslUtf8() {
+      return mslUtf8.clone();
+    }
+
+    public String mslSha256() {
+      return mslSha256;
     }
   }
 
