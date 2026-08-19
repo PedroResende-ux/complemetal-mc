@@ -76,6 +76,22 @@ identities and zero incomplete runtime binding variants. Generated MSL still
 does not create a pipeline or encode a draw; render-graph capture is the next
 gate.
 
+## Stage 5 Iris render-graph milestone
+
+The development branch now turns each sampled Iris frame into a bounded,
+content-addressed execution plan. It represents shadow, geometry, deferred,
+composite and final phases; framebuffer and texture dependencies; barriers;
+blits, copies and mip generation; and history ping-pong. Transient OpenGL
+object names are canonicalized out of graph identity, while draw nodes retain
+their shader, complete pipeline-state and resource-layout keys.
+
+The exact packaged JAR passed Metal 4 and forced Metal 3 cold/warm runs. Each
+run built 16 graphs with 9 bounded identities, all mandatory phases, 51
+barriers, 92 transfers, at least 228 ping-pong observations and zero
+unsupported or failed graph builds. This milestone does not create a Metal
+pipeline, encode a command or replace an Iris draw; the execution boundary is
+reported explicitly as false.
+
 Late native encode or presentation failures fall back on the following frame;
 Minecraft cannot replay vanilla submissions already skipped in the in-flight
 frame. One incomplete in-flight frame therefore remains a documented recovery

@@ -879,6 +879,54 @@ def resource_reflection_is_complete(value: Any) -> bool:
     )
 
 
+def render_graph_is_complete(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required_phases = {"SHADOW", "GEOMETRY", "COMPOSITE", "FINAL"}
+    phases = set(str(value.get("phaseSummary", "")).split(","))
+    return (
+        value.get("complete") is True
+        and type(value.get("framesStarted")) is int
+        and value.get("framesStarted", 0) > 0
+        and type(value.get("framesCompleted")) is int
+        and value.get("framesCompleted", 0) > 0
+        and value.get("framesRejected") == 0
+        and value.get("framesPending") == 0
+        and value.get("captureFrozen") is True
+        and value.get("graphsAttempted") == value.get("framesCompleted")
+        and value.get("graphsSucceeded") == value.get("graphsAttempted")
+        and value.get("graphsUnsupported") == 0
+        and value.get("graphsFailed") == 0
+        and type(value.get("resourcesRepresented")) is int
+        and value.get("resourcesRepresented", 0) > 0
+        and type(value.get("nodesRepresented")) is int
+        and value.get("nodesRepresented", 0) > 0
+        and type(value.get("edgesRepresented")) is int
+        and value.get("edgesRepresented", 0) > 0
+        and type(value.get("barriersRepresented")) is int
+        and value.get("barriersRepresented", 0) > 0
+        and type(value.get("transfersRepresented")) is int
+        and value.get("transfersRepresented", 0) > 0
+        and type(value.get("pingPongResourcesRepresented")) is int
+        and value.get("pingPongResourcesRepresented", 0) > 0
+        and required_phases.issubset(phases)
+        and type(value.get("graphIdentityCount")) is int
+        and value.get("graphIdentityCount", 0) > 0
+        and value.get("graphSetComplete") is True
+        and isinstance(value.get("graphSetSha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["graphSetSha256"])
+            is not None
+        and value.get("unsupportedReasonCount") == 0
+        and value.get("unsupportedReasonSetComplete") is True
+        and isinstance(value.get("unsupportedReasonSetSha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", value["unsupportedReasonSetSha256"]
+        ) is not None
+        and value.get("lastFailure") == ""
+        and value.get("generatedMslExecuted") is False
+    )
+
+
 def iris_runtime_ownership_check_passed(value: Any) -> bool:
     return (
         isinstance(value, dict)
@@ -966,13 +1014,14 @@ def driver_identity_matches_manifest(
     pipeline_state_capture = driver_result.get(
         "irisPipelineStateCapture")
     resource_reflection = driver_result.get("irisResourceReflection")
+    render_graph = driver_result.get("irisRenderGraph")
     iris_runtime_ownership = driver_result.get("irisRuntimeOwnership")
     generated_msl_boundary = driver_result.get(
         "generatedMslExecutionBoundary")
     if not isinstance(iris_translation, dict):
         return False
     return (
-        driver_result.get("schemaVersion") == 5
+        driver_result.get("schemaVersion") == 6
         and driver_result.get("status") == "PASS"
         and actual_path == expected_path
         and driver_result.get("exactJarSha256") == release.get("sha256")
@@ -995,6 +1044,7 @@ def driver_identity_matches_manifest(
         ]
         and pipeline_state_capture_is_complete(pipeline_state_capture)
         and resource_reflection_is_complete(resource_reflection)
+        and render_graph_is_complete(render_graph)
         and msl_library_validation_is_safe(msl_library_validation)
         and isinstance(native_faults, dict)
         and native_faults.get("semantics")

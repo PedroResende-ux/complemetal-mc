@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Iris render-graph milestone
+
+- Capture bounded, content-addressed Iris frame graphs spanning shadow,
+  geometry, deferred, composite and final phases without using transient
+  OpenGL names as graph identity.
+- Represent framebuffer and texture dependencies, memory barriers, blits,
+  copies, mip generation and history ping-pong while tying draw nodes to the
+  complete shader, pipeline-state and resource-layout keys.
+- Pass packaged-JAR Metal 4 and forced Metal 3 cold/warm validation with 16
+  successful graphs per run, all mandatory coverage, 51 barriers, 92
+  transfers and zero unsupported or failed graph builds.
+- Keep generated-MSL execution explicitly false: Iris/OpenGL still owns every
+  visible shader-pack draw and no FPS claim is made.
+
 ### Iris resource-binding milestone
 
 - Retain optimized SPIR-V resource names as non-semantic ABI metadata and

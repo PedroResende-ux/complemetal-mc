@@ -250,6 +250,22 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           + earlyPipelineStatus.pipelineIncompleteVariants()
           + ", lastFailure="
           + earlyPipelineStatus.pipelineStateLastFailure());
+      IrisTranslationCoordinator.RenderGraphStatus earlyGraphStatus =
+          context.computeOnClient(
+              client -> IrisTranslationCoordinator.renderGraphStatus());
+      System.out.println("[MetalRender exact-JAR early graph] frames="
+          + earlyGraphStatus.framesCompleted() + "/"
+          + earlyGraphStatus.framesStarted() + ", pending="
+          + earlyGraphStatus.framesPending() + ", graphs="
+          + earlyGraphStatus.graphsSucceeded() + "/"
+          + earlyGraphStatus.graphsAttempted() + ", unsupported="
+          + earlyGraphStatus.graphsUnsupported() + ", failed="
+          + earlyGraphStatus.graphsFailed() + ", barriers="
+          + earlyGraphStatus.barriersRepresented() + ", transfers="
+          + earlyGraphStatus.transfersRepresented() + ", pingPong="
+          + earlyGraphStatus.pingPongResourcesRepresented() + ", phases="
+          + earlyGraphStatus.phaseSummary() + ", lastFailure="
+          + earlyGraphStatus.lastFailure());
       context.waitFor(client -> {
         IrisTranslationCoordinator.Status status =
             IrisTranslationCoordinator.status();
@@ -259,7 +275,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             && status.libraryValidationComplete()
             && status.compiledArtifactSetComplete()
             && status.libraryStagesPending() == 0
-            && status.libraryStagesInFlight() == 0;
+            && status.libraryStagesInFlight() == 0
+            && IrisTranslationCoordinator.renderGraphStatus().complete();
       }, SHADER_TIMEOUT_TICKS);
       context.waitTicks(100);
       IrisTranslationCoordinator.Status translationStatus =
@@ -304,6 +321,10 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "warm-cache run did not reuse every captured program");
       requireMslLibraryValidation(translationStatus, cacheExpectation);
       requireResourceReflection(translationStatus);
+      IrisTranslationCoordinator.RenderGraphStatus renderGraphStatus =
+          context.computeOnClient(
+              client -> IrisTranslationCoordinator.renderGraphStatus());
+      requireRenderGraph(renderGraphStatus);
       System.out.println("[MetalRender exact-JAR] programs="
           + translationStatus.attempted() + ", stages="
           + translationStatus.libraryStagesAttempted()
@@ -332,6 +353,11 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           + translationStatus.resourceBindingVariantsIncomplete()
           + ", bindingReasons="
           + translationStatus.resourceBindingIncompleteReasonSummary()
+          + ", graph=" + renderGraphStatus.graphsSucceeded() + "/"
+          + renderGraphStatus.graphsAttempted()
+          + ", graphNodes=" + renderGraphStatus.nodesRepresented()
+          + ", graphEdges=" + renderGraphStatus.edgesRepresented()
+          + ", graphPhases=" + renderGraphStatus.phaseSummary()
           + ", pipelineLastFailure="
           + translationStatus.pipelineStateLastFailure());
       requirePipelineStateCapture(translationStatus);
@@ -347,7 +373,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       writeEvidence(exactJar, expectedSha, frames, framesWithShadersOff,
           metalPresentationsWithShadersOff, shadersOn, shadersOff,
           shadersReenabled, visualMetrics, translationStatus,
-          cacheExpectation, backendExpectation, nativeFaultBaseline,
+          renderGraphStatus, cacheExpectation, backendExpectation,
+          nativeFaultBaseline,
           nativeFaultEnd, nativeFaultDelta);
     }
   }
@@ -460,6 +487,23 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         "no reflected Iris resource was matched to a runtime binding");
     require(status.resourceBindingIncompleteReasonSetComplete(),
         "resource binding reason set exceeded its verified bound");
+  }
+
+  private static void requireRenderGraph(
+      IrisTranslationCoordinator.RenderGraphStatus status) {
+    require(status.complete(),
+        "Iris render graph did not complete: " + status.lastFailure());
+    require(status.framesRejected() == 0,
+        "Iris render graph rejected frames: " + status.framesRejected());
+    require(status.graphsUnsupported() == 0,
+        "Iris render graph contains unsupported frames: "
+            + status.graphsUnsupported());
+    require(status.graphsFailed() == 0,
+        "Iris render graph processing failed: " + status.graphsFailed());
+    require(status.graphIdentityCount() > 0,
+        "Iris render graph produced no content identity");
+    require(status.graphSetSha256().matches("[0-9a-f]{64}"),
+        "Iris render graph digest is invalid");
   }
 
   private static void requireMslLibraryValidation(
@@ -694,6 +738,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       long metalPresentationsWithShadersOff, Path shadersOn, Path shadersOff,
       Path shadersReenabled, VisualMetrics visualMetrics,
       IrisTranslationCoordinator.Status translationStatus,
+      IrisTranslationCoordinator.RenderGraphStatus renderGraphStatus,
       String cacheExpectation, String backendExpectation,
       NativeFaultCounters nativeFaultBaseline,
       NativeFaultCounters nativeFaultEnd,
@@ -706,9 +751,57 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     String version = FabricLoader.getInstance()
         .getModContainer("metalrender").orElseThrow()
         .getMetadata().getVersion().getFriendlyString();
+    String renderGraphJson = String.format(Locale.ROOT, """
+        {
+          "complete": %s,
+          "framesStarted": %d,
+          "framesCompleted": %d,
+          "framesRejected": %d,
+          "framesPending": %d,
+          "captureFrozen": %s,
+          "graphsAttempted": %d,
+          "graphsSucceeded": %d,
+          "graphsUnsupported": %d,
+          "graphsFailed": %d,
+          "resourcesRepresented": %d,
+          "nodesRepresented": %d,
+          "edgesRepresented": %d,
+          "barriersRepresented": %d,
+          "transfersRepresented": %d,
+          "pingPongResourcesRepresented": %d,
+          "phaseSummary": %s,
+          "graphIdentityCount": %d,
+          "graphSetComplete": %s,
+          "graphSetSha256": %s,
+          "unsupportedReasonCount": %d,
+          "unsupportedReasonSetComplete": %s,
+          "unsupportedReasonSetSha256": %s,
+          "lastFailure": %s,
+          "generatedMslExecuted": false
+        }
+        """,
+        Boolean.toString(renderGraphStatus.complete()),
+        renderGraphStatus.framesStarted(), renderGraphStatus.framesCompleted(),
+        renderGraphStatus.framesRejected(), renderGraphStatus.framesPending(),
+        Boolean.toString(renderGraphStatus.captureFrozen()),
+        renderGraphStatus.graphsAttempted(), renderGraphStatus.graphsSucceeded(),
+        renderGraphStatus.graphsUnsupported(), renderGraphStatus.graphsFailed(),
+        renderGraphStatus.resourcesRepresented(),
+        renderGraphStatus.nodesRepresented(), renderGraphStatus.edgesRepresented(),
+        renderGraphStatus.barriersRepresented(),
+        renderGraphStatus.transfersRepresented(),
+        renderGraphStatus.pingPongResourcesRepresented(),
+        quote(renderGraphStatus.phaseSummary()),
+        renderGraphStatus.graphIdentityCount(),
+        Boolean.toString(renderGraphStatus.graphSetComplete()),
+        quote(renderGraphStatus.graphSetSha256()),
+        renderGraphStatus.unsupportedReasonCount(),
+        Boolean.toString(renderGraphStatus.unsupportedReasonSetComplete()),
+        quote(renderGraphStatus.unsupportedReasonSetSha256()),
+        quote(renderGraphStatus.lastFailure()));
     String json = String.format(Locale.ROOT, """
         {
-          "schemaVersion": 5,
+          "schemaVersion": 6,
           "status": "PASS",
           "environment": "production-fabric",
           "javaMajor": 25,
@@ -803,6 +896,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             "bindingIncompleteReasonSummary": %s,
             "runtimeBindingsCaptured": true
           },
+          "irisRenderGraph": %s,
           "generatedMslLibraryValidation": {
             "enabled": %s,
             "ready": %s,
@@ -930,6 +1024,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             translationStatus.resourceBindingIncompleteReasonSetComplete()),
         quote(translationStatus.resourceBindingIncompleteReasonSetSha256()),
         quote(translationStatus.resourceBindingIncompleteReasonSummary()),
+        renderGraphJson,
         Boolean.toString(translationStatus.libraryValidationEnabled()),
         Boolean.toString(translationStatus.libraryValidationReady()),
         Boolean.toString(translationStatus.libraryValidationComplete()),

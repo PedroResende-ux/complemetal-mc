@@ -8,6 +8,7 @@
   "client": [
     "IrisDhGenericRenderProgramMixin",
     "IrisDhLodRenderProgramMixin",
+    "IrisFinalPassGraphMixin",
     "IrisFrameBufferCacheMixin",
     "IrisGlCommandEncoderMixin",
     "IrisGlProgramResourceMixin",
@@ -17,8 +18,10 @@
     "IrisPartialShaderAccessor",
     "IrisProgramBuilderAccessor",
     "IrisProgramBuilderMixin",
+    "IrisRenderingPipelineGraphMixin",
     "IrisRenderSystemMixin",
     "IrisShaderCreatorMixin",
+    "IrisShadowRendererGraphMixin",
     "IrisSodiumGlDrawContextMixin"
   ],
   "injectors": {

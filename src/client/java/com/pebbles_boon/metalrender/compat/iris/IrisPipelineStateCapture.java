@@ -92,7 +92,7 @@ public final class IrisPipelineStateCapture {
       return;
     }
     drawsObserved.incrementAndGet();
-    offer(registration.orElseThrow(), tracker.snapshotDraw(primitiveMode));
+    capture(registration.orElseThrow(), tracker.snapshotDraw(primitiveMode));
   }
 
   public void dispatch() {
@@ -103,11 +103,22 @@ public final class IrisPipelineStateCapture {
       return;
     }
     dispatchesObserved.incrementAndGet();
-    offer(registration.orElseThrow(), tracker.snapshotDispatch());
+    capture(registration.orElseThrow(), tracker.snapshotDispatch());
   }
 
-  private void offer(IrisProgramIdentityRegistry.Registration registration,
+  private void capture(
+      IrisProgramIdentityRegistry.Registration registration,
       IrisGlStateSnapshot snapshot) {
+    PendingState pending = new PendingState(registration, snapshot,
+        resourceBindings.snapshot());
+    IrisRenderGraphCapture.global().draw(pending);
+    offer(pending);
+  }
+
+  private void offer(PendingState pending) {
+    IrisProgramIdentityRegistry.Registration registration =
+        pending.registration();
+    IrisGlStateSnapshot snapshot = pending.snapshot();
     StateSignature signature = new StateSignature(registration.generation(),
         snapshot.operation(), snapshot.program(), snapshot.drawFramebuffer(),
         snapshot.drawBuffers(), snapshot.colorTargets(),
@@ -134,8 +145,7 @@ public final class IrisPipelineStateCapture {
     if (!snapshot.complete()) {
       incompleteVariants.incrementAndGet();
     }
-    queue.offer(new PendingState(registration, snapshot,
-        resourceBindings.snapshot()));
+    queue.offer(pending);
     variantsAccepted.incrementAndGet();
   }
 

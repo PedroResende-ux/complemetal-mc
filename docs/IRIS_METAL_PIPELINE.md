@@ -43,7 +43,7 @@ intentionally opt-in and fail-open:
 | Compile generated MSL into an ephemeral Metal library | Implemented as opt-in validation in `0.3.0-alpha.1+mc26.2` |
 | Capture Iris framebuffer, blend, depth and vertex state | Implemented and exact-JAR validated |
 | Reflect and bind Iris uniforms, samplers, images and buffers | Implemented and exact-JAR validated |
-| Reproduce the Iris shadow/composite render graph on Metal | Pending |
+| Reproduce the Iris shadow/composite render graph on Metal | Implemented as a validated execution plan; no Metal draws |
 | Create and load device-specific MTL4 pipeline archives | Pending |
 | Execute Iris shader-pack draws through Metal | Pending |
 
@@ -67,6 +67,17 @@ runtime resource sets in Metal 4 cold/warm and forced Metal 3 cold/warm runs,
 with zero incomplete variants. This proves resource capture for that exact
 workload; it still does not create a Metal pipeline, reproduce pass ordering
 or execute generated MSL.
+
+Stage 5 records complete Iris frames into a bounded render graph whose node
+identity is independent of transient OpenGL object names. The graph covers
+shadow, geometry, deferred, composite and final phases, framebuffer/texture
+dependencies, barriers, blits, copies, mip generation and history ping-pong.
+Draw nodes are tied to the shader, pipeline-state and resource-layout content
+keys produced by stages 1-4. The final Metal 4 and forced Metal 3 cold/warm
+exact-JAR matrix built 16 graphs per run with all required coverage and zero
+unsupported or failed graphs. This is still a plan only: the execution flag is
+explicitly false, Iris/OpenGL owns the visible frame, and no Metal pipeline or
+draw is created.
 
 The Stage 2 validator accepts at most 16 MiB of verified MSL per stage. It
 requires argument-buffer tier 2, compiles an executable MSL 3.0 library with

@@ -4,6 +4,7 @@ import com.pebbles_boon.metalrender.compat.iris.IrisGlFormat;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingTracker;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlStateTracker;
 import com.pebbles_boon.metalrender.compat.iris.IrisPipelineStateCapture;
+import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture;
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 import org.joml.Vector3i;
@@ -28,6 +29,45 @@ public abstract class IrisRenderSystemMixin {
 
   private static IrisGlResourceBindingTracker metalrender$resources() {
     return IrisGlResourceBindingTracker.global();
+  }
+
+  @Inject(method = "memoryBarrier", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$memoryBarrier(int barriers,
+      CallbackInfo ci) {
+    IrisRenderGraphCapture.global().memoryBarrier(barriers);
+  }
+
+  @Inject(method = "blitFramebuffer", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$blitFramebuffer(int source, int destination,
+      int sourceX, int sourceY, int sourceWidth, int sourceHeight,
+      int destinationX, int destinationY, int destinationWidth,
+      int destinationHeight, int mask, int filter, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().blitFramebuffer(source, destination);
+  }
+
+  @Inject(method = "copyTexImage2D", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$copyTexImage2D(int target, int level,
+      int internalFormat, int x, int y, int width, int height, int border,
+      CallbackInfo ci) {
+    IrisRenderGraphCapture.global().copyBoundTexture();
+  }
+
+  @Inject(method = "copyTexSubImage2D", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$copyTexSubImage2D(int destination,
+      int target, int level, int destinationX, int destinationY, int sourceX,
+      int sourceY, int width, int height, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().copyTexture(destination);
+  }
+
+  @Inject(method = "generateMipmaps", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$generateMipmaps(int texture, int target,
+      CallbackInfo ci) {
+    IrisRenderGraphCapture.global().generateMipmaps(texture);
   }
 
   @Inject(method = "createFramebuffer", at = @At("RETURN"),

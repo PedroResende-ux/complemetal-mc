@@ -222,6 +222,11 @@ public final class IrisGlResourceBindingTracker {
         .sampler = sampler;
   }
 
+  public synchronized TextureUnitBinding activeTextureBinding() {
+    MutableTextureUnit binding = textureUnits.get(activeTextureUnit);
+    return binding == null ? null : binding.snapshot();
+  }
+
   public synchronized void texBuffer(int target, int internalFormat,
                                      int buffer) {
     MutableTextureUnit unit = textureUnits.get(activeTextureUnit);

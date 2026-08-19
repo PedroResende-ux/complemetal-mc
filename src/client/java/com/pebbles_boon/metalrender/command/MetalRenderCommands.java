@@ -266,6 +266,19 @@ public final class MetalRenderCommands {
                 + irisTranslation.resourceLayoutSetSha256() + " §7("
                 + (irisTranslation.resourceLayoutSetComplete()
                     ? "complete" : "incomplete") + ")");
+        IrisTranslationCoordinator.RenderGraphStatus graph =
+                IrisTranslationCoordinator.renderGraphStatus();
+        msg(src, "§7Iris render graph: "
+                + (graph.complete() ? "§aComplete" : "§eCollecting/fallback")
+                + " §7(graphs=" + graph.graphsSucceeded() + "/"
+                + graph.graphsAttempted() + ", nodes="
+                + graph.nodesRepresented() + ", edges="
+                + graph.edgesRepresented() + ", barriers="
+                + graph.barriersRepresented() + ", transfers="
+                + graph.transfersRepresented() + ", pingPong="
+                + graph.pingPongResourcesRepresented() + ")");
+        msg(src, "§7Iris render-graph phases: §f" + graph.phaseSummary()
+                + " §7(digest=" + graph.graphSetSha256() + ")");
         msg(src, "§7Iris pipeline-state unsupported reasons: §f"
                 + (irisTranslation.pipelineStateUnsupportedReasonSummary()
                     .isEmpty()

@@ -220,6 +220,22 @@ public final class IrisGlStateTracker {
     return resourceEvictions;
   }
 
+  /** Returns the generation-qualified live texture name for graph capture. */
+  public synchronized Optional<ResourceHandle> textureHandle(int name) {
+    TextureEntry texture = textures.get(name);
+    return texture == null ? Optional.empty() : Optional.of(texture.handle);
+  }
+
+  /** Returns the generation-qualified framebuffer, including framebuffer 0. */
+  public synchronized Optional<ResourceHandle> framebufferHandle(int name) {
+    if (name == 0) {
+      return Optional.of(defaultFramebuffer.handle);
+    }
+    FramebufferEntry framebuffer = framebuffers.get(name);
+    return framebuffer == null
+        ? Optional.empty() : Optional.of(framebuffer.handle);
+  }
+
   public synchronized ResourceHandle registerProgram(int name) {
     requirePositiveName(name, "program");
     ResourceHandle handle = newHandle(ResourceKind.PROGRAM, name);

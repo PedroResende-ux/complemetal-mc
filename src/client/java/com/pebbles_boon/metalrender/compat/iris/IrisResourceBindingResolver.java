@@ -71,8 +71,16 @@ public final class IrisResourceBindingResolver {
     int unit = (int) value.rawBits()[0];
     IrisGlResourceBindingSnapshot.TextureUnitBinding binding =
         snapshot.textureUnits().get(unit);
-    if (binding == null || binding.texture() <= 0) {
+    if (binding == null) {
       return detail("sampled-texture-missing", name) + ":unit-" + unit;
+    }
+    /*
+     * A tracked texture name zero is an explicit OpenGL binding, not missing
+     * capture. Sampling it uses GL's incomplete/default-texture fallback.
+     * The Metal executor must bind its canonical zero-texture equivalent.
+     */
+    if (binding.texture() == 0) {
+      return null;
     }
     if (isBufferTexture(resource)) {
       IrisGlResourceBindingSnapshot.TextureBufferBinding textureBuffer =

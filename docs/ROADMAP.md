@@ -11,7 +11,7 @@ through the validation stages, and every experimental failure stays fail-open.
 | 2 | Apple Metal compiler validation | Complete in `0.3.0-alpha.1+mc26.2` | Every generated stage creates an ephemeral `MTLLibrary`, resolves `main0` with the expected function type, then releases it; 152/152 and zero failures |
 | 3 | Capture complete Iris pipeline state | Complete | Vertex layout, attachment formats, blend/depth/stencil/cull/topology and specialization state are captured and content-keyed |
 | 4 | Reflect and bind resources | Complete | Uniforms, samplers, textures, images, UBOs and SSBOs have deterministic argument-buffer layouts and parity tests |
-| 5 | Reproduce the Iris render graph | Pending | Shadow, geometry, composite and final pass routing, history ping-pong and barriers are represented without Metal output replacing Iris |
+| 5 | Reproduce the Iris render graph | Complete | Shadow, geometry, composite and final pass routing, history ping-pong and barriers are represented without Metal output replacing Iris |
 | 6 | Build the MTL4 pipeline/compiler cache | Pending | Device/OS/compiler-keyed pipelines load cold and warm, recover from stale archives and create no draw on failure |
 | 7 | Shadow execution and visual parity | Pending | Metal renders offscreen beside Iris; automated image comparisons pass before any OpenGL draw is suppressed |
 | 8 | Selective Metal cutover | Pending | One validated pass at a time replaces Iris, with immediate per-frame OpenGL fallback and lifecycle recovery |
@@ -71,13 +71,26 @@ identities with digest
 Every observed pipeline variant completed runtime binding resolution with
 zero missing resources and a complete empty failure-reason set.
 
-Stage 5 is now the active target: represent pass ordering, framebuffer
-routing, history ping-pong and synchronization without allowing generated MSL
-to own a visible draw.
+## Delivered Stage 5 boundary
 
-The persistent pipeline cache belongs to stage 6 because its key must include
+Stage 5 captures the live Iris frame as a bounded, content-addressed render
+graph. It represents shadow, geometry, deferred, composite and final phases;
+framebuffer and texture dependencies; memory barriers; blits, copies and
+mipmap generation; and history ping-pong without using transient OpenGL names
+as graph identity. Draw nodes reference the complete shader, pipeline-state
+and resource-layout keys delivered by stages 1-4.
+
+Complementary Reimagined r5.8.1 passed cold and warm exact-JAR runs in both
+the Metal 4 hybrid and forced Metal 3 profiles. Each run built 16 graphs with
+9 bounded graph identities, all mandatory phases, 51 barriers, 92 transfers
+and at least 228 ping-pong resource observations. Every graph completed with
+zero unsupported or failed builds. The generated-MSL execution signal
+remained false and Iris/OpenGL retained every visible draw.
+
+Stage 6 is now the active target. The persistent pipeline cache key must include
 the complete state captured in stages 3-5 plus GPU identity, OS build and Metal
-compiler version. Creating it earlier would cache guessed, unusable pipelines.
+compiler version; creating it earlier would have cached guessed, unusable
+pipelines.
 
 ## Release rule
 

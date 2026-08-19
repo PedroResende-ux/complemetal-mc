@@ -78,6 +78,31 @@ final class IrisResourceBindingResolverTest {
         incomplete.reason());
   }
 
+  @Test
+  void acceptsAnExplicitOpenGlZeroTextureForMetalFallbackBinding() {
+    IrisGlResourceBindingSnapshot snapshot =
+        new IrisGlResourceBindingSnapshot(7,
+            Map.of("plain", 10, "sampled", 11, "image", 12),
+            Map.of(10, UniformValue.defaultZero(), 11, integer(2),
+                12, integer(1)),
+            Map.of("ubo", 3), Map.of(3, 4),
+            Map.of(2, new TextureUnitBinding(0x0DE1, 0, 0)), Map.of(),
+            Map.of(1, new ImageUnitBinding(51, 0, true, 0,
+                0x88BA, 0x8058)),
+            Map.of(
+                new IndexedBufferBinding(
+                    IrisGlResourceBindingTracker.GL_UNIFORM_BUFFER, 4),
+                BufferBinding.range(60, 256, 1024),
+                new IndexedBufferBinding(
+                    IrisGlResourceBindingTracker.GL_SHADER_STORAGE_BUFFER,
+                    5), BufferBinding.base(61)));
+
+    IrisResourceBindingResolver.Complete complete = assertInstanceOf(
+        IrisResourceBindingResolver.Complete.class,
+        IrisResourceBindingResolver.resolve(completeLayout(), snapshot));
+    assertEquals(5, complete.matchedResources());
+  }
+
   private static UniformValue integer(int value) {
     return new UniformValue(UniformValueKind.SIGNED_INT, 1, 1,
         new long[] {Integer.toUnsignedLong(value)});

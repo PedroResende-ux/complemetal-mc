@@ -38,6 +38,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           IrisShaderStage.values().length);
   static final int DEFAULT_PIPELINE_STATE_IDENTITY_CAPACITY = 65_536;
   static final int DEFAULT_PIPELINE_STATE_UNSUPPORTED_REASON_CAPACITY = 32;
+  static final int DEFAULT_RENDER_GRAPH_IDENTITY_CAPACITY = 4_096;
   private static final long CLIENT_QUIET_PERIOD_NANOS =
       TimeUnit.SECONDS.toNanos(8);
 
@@ -54,6 +55,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   private final IrisPipelineStateCapture pipelineStateCapture;
   private final IrisPipelineStateCache pipelineStateCache;
   private final IrisSpecializationStateReader specializationStateReader;
+  private final IrisRenderGraphCapture renderGraphCapture;
+  private final IrisRenderGraphBuilder renderGraphBuilder;
   private final IrisProgramResourceLayoutReader resourceLayoutReader;
   private final IrisMslLibraryValidator libraryValidator;
   private final boolean libraryValidationEnabled;
@@ -131,6 +134,26 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   private final AtomicLong resourceBindingsMatched = new AtomicLong();
   private final BoundedReasonSet resourceBindingIncompleteReasons =
       new BoundedReasonSet(DEFAULT_PIPELINE_STATE_UNSUPPORTED_REASON_CAPACITY);
+  private final AtomicLong renderGraphsAttempted = new AtomicLong();
+  private final AtomicLong renderGraphsSucceeded = new AtomicLong();
+  private final AtomicLong renderGraphsUnsupported = new AtomicLong();
+  private final AtomicLong renderGraphsFailed = new AtomicLong();
+  private final AtomicLong renderGraphResources = new AtomicLong();
+  private final AtomicLong renderGraphNodes = new AtomicLong();
+  private final AtomicLong renderGraphEdges = new AtomicLong();
+  private final AtomicLong renderGraphBarriers = new AtomicLong();
+  private final AtomicLong renderGraphTransfers = new AtomicLong();
+  private final AtomicLong renderGraphPingPongResources = new AtomicLong();
+  private final ConcurrentSkipListSet<String> renderGraphIdentityLines =
+      new ConcurrentSkipListSet<>();
+  private final ConcurrentSkipListSet<String> renderGraphPhases =
+      new ConcurrentSkipListSet<>();
+  private final AtomicBoolean renderGraphSetComplete =
+      new AtomicBoolean(true);
+  private final BoundedReasonSet renderGraphUnsupportedReasons =
+      new BoundedReasonSet(DEFAULT_PIPELINE_STATE_UNSUPPORTED_REASON_CAPACITY);
+  private final AtomicReference<String> renderGraphLastFailure =
+      new AtomicReference<>("");
 
   IrisTranslationCoordinator(IrisShaderCaptureQueue captureQueue,
       IrisShaderTranslatorBackend backend, IrisPipelineCache cache,
@@ -184,6 +207,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     pipelineStateCache = new IrisPipelineStateCache(cacheRoot);
     specializationStateReader = new IrisSpecializationStateReader(cache,
         backend.profile());
+    renderGraphCapture = IrisRenderGraphCapture.global();
+    renderGraphBuilder = new IrisRenderGraphBuilder(specializationStateReader);
     resourceLayoutReader = new IrisProgramResourceLayoutReader(cache,
         backend.profile());
     this.libraryValidator = Objects.requireNonNull(
@@ -294,6 +319,20 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     return coordinator.snapshot();
   }
 
+  public static RenderGraphStatus renderGraphStatus() {
+    IrisTranslationCoordinator coordinator = ACTIVE.get();
+    if (coordinator == null) {
+      IrisRenderGraphCapture capture = IrisRenderGraphCapture.global();
+      return new RenderGraphStatus(capture.framesStarted(),
+          capture.framesCompleted(), capture.framesRejected(),
+          capture.queued(), capture.frozen(), 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, "", 0, true,
+          emptyPipelineStateSetSha256(), 0, true,
+          emptyPipelineStateSetSha256(), "");
+    }
+    return coordinator.snapshotRenderGraph();
+  }
+
   private static boolean isOptedIn() {
     return IrisShaderCapture.isEnabled()
         && Boolean.getBoolean(TRANSLATION_ENABLED_PROPERTY);
@@ -325,6 +364,12 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           for (int stateBatch = 0; stateBatch < 16 && running.get();
                stateBatch++) {
             if (!drainOnePipelineState()) {
+              break;
+            }
+          }
+          for (int graphBatch = 0; graphBatch < 4 && running.get();
+               graphBatch++) {
+            if (!drainOneRenderGraph()) {
               break;
             }
           }
@@ -485,6 +530,62 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       pipelineStateLastFailure.set(redactedFailure(error));
     }
     return true;
+  }
+
+  private boolean drainOneRenderGraph() {
+    Optional<IrisRenderGraphCapture.PendingFrame> pending =
+        renderGraphCapture.poll();
+    if (pending.isEmpty()) {
+      return false;
+    }
+    renderGraphsAttempted.incrementAndGet();
+    try {
+      IrisRenderGraphBuilder.Result result =
+          renderGraphBuilder.build(pending.orElseThrow());
+      if (result instanceof IrisRenderGraphBuilder.Unsupported unsupported) {
+        renderGraphsUnsupported.incrementAndGet();
+        renderGraphUnsupportedReasons.add(unsupported.reason());
+        renderGraphLastFailure.set(unsupported.reason());
+        return true;
+      }
+      IrisRenderGraph graph =
+          ((IrisRenderGraphBuilder.Complete) result).graph();
+      String identity = graph.key().sha256() + '\n';
+      if (renderGraphIdentityLines.size()
+          >= DEFAULT_RENDER_GRAPH_IDENTITY_CAPACITY
+          && !renderGraphIdentityLines.contains(identity)) {
+        renderGraphSetComplete.set(false);
+        renderGraphsFailed.incrementAndGet();
+        renderGraphLastFailure.set("render-graph-identity-capacity-exceeded");
+        return true;
+      }
+      renderGraphIdentityLines.add(identity);
+      graph.phases().forEach(phase -> renderGraphPhases.add(phase.name()));
+      renderGraphResources.addAndGet(graph.resources().size());
+      renderGraphNodes.addAndGet(graph.nodes().size());
+      renderGraphEdges.addAndGet(graph.edges().size());
+      renderGraphBarriers.addAndGet(graph.barrierCount());
+      renderGraphTransfers.addAndGet(graph.transferCount());
+      renderGraphPingPongResources.addAndGet(graph.pingPongResourceCount());
+      renderGraphsSucceeded.incrementAndGet();
+      if (hasRequiredRenderGraphCoverage()) {
+        renderGraphCapture.freeze();
+      }
+    } catch (Exception | LinkageError error) {
+      renderGraphsFailed.incrementAndGet();
+      renderGraphLastFailure.set(redactedFailure(error));
+    }
+    return true;
+  }
+
+  private boolean hasRequiredRenderGraphCoverage() {
+    return renderGraphPhases.contains(IrisRenderGraph.Phase.SHADOW.name())
+        && renderGraphPhases.contains(IrisRenderGraph.Phase.GEOMETRY.name())
+        && renderGraphPhases.contains(IrisRenderGraph.Phase.COMPOSITE.name())
+        && renderGraphPhases.contains(IrisRenderGraph.Phase.FINAL.name())
+        && renderGraphBarriers.get() > 0
+        && renderGraphTransfers.get() > 0
+        && renderGraphPingPongResources.get() > 0;
   }
 
   private void resolveResourceBindings(
@@ -815,6 +916,32 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         resourceBindingIncompleteReasons.summary());
   }
 
+  private RenderGraphStatus snapshotRenderGraph() {
+    return new RenderGraphStatus(renderGraphCapture.framesStarted(),
+        renderGraphCapture.framesCompleted(),
+        renderGraphCapture.framesRejected(), renderGraphCapture.queued(),
+        renderGraphCapture.frozen(), renderGraphsAttempted.get(),
+        renderGraphsSucceeded.get(), renderGraphsUnsupported.get(),
+        renderGraphsFailed.get(), renderGraphResources.get(),
+        renderGraphNodes.get(), renderGraphEdges.get(),
+        renderGraphBarriers.get(), renderGraphTransfers.get(),
+        renderGraphPingPongResources.get(),
+        String.join(",", renderGraphPhases),
+        renderGraphIdentityLines.size(), renderGraphSetComplete.get(),
+        renderGraphSetSha256(), renderGraphUnsupportedReasons.size(),
+        renderGraphUnsupportedReasons.complete(),
+        renderGraphUnsupportedReasons.sha256(),
+        renderGraphLastFailure.get());
+  }
+
+  private String renderGraphSetSha256() {
+    MessageDigest digest = newSha256();
+    for (String line : renderGraphIdentityLines) {
+      digest.update(line.getBytes(StandardCharsets.US_ASCII));
+    }
+    return HexFormat.of().formatHex(digest.digest());
+  }
+
   private String resourceLayoutSetSha256() {
     MessageDigest digest = newSha256();
     for (String line : resourceLayoutIdentityLines) {
@@ -1045,6 +1172,61 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           && resourceBindingVariantsIncomplete == 0
           && resourceBindingsMatched > 0
           && resourceBindingIncompleteReasonSetComplete;
+    }
+  }
+
+  public record RenderGraphStatus(long framesStarted, long framesCompleted,
+                                  long framesRejected, int framesPending,
+                                  boolean captureFrozen,
+                                  long graphsAttempted,
+                                  long graphsSucceeded,
+                                  long graphsUnsupported,
+                                  long graphsFailed,
+                                  long resourcesRepresented,
+                                  long nodesRepresented,
+                                  long edgesRepresented,
+                                  long barriersRepresented,
+                                  long transfersRepresented,
+                                  long pingPongResourcesRepresented,
+                                  String phaseSummary,
+                                  int graphIdentityCount,
+                                  boolean graphSetComplete,
+                                  String graphSetSha256,
+                                  int unsupportedReasonCount,
+                                  boolean unsupportedReasonSetComplete,
+                                  String unsupportedReasonSetSha256,
+                                  String lastFailure) {
+    public RenderGraphStatus {
+      Objects.requireNonNull(phaseSummary, "phaseSummary");
+      Objects.requireNonNull(graphSetSha256, "graphSetSha256");
+      Objects.requireNonNull(unsupportedReasonSetSha256,
+          "unsupportedReasonSetSha256");
+      Objects.requireNonNull(lastFailure, "lastFailure");
+    }
+
+    public boolean complete() {
+      return framesStarted > 0
+          && framesCompleted > 0
+          && framesRejected == 0
+          && framesPending == 0
+          && captureFrozen
+          && graphsAttempted == framesCompleted
+          && graphsAttempted == graphsSucceeded
+          && graphsUnsupported == 0
+          && graphsFailed == 0
+          && resourcesRepresented > 0
+          && nodesRepresented > 0
+          && edgesRepresented > 0
+          && barriersRepresented > 0
+          && transfersRepresented > 0
+          && pingPongResourcesRepresented > 0
+          && phaseSummary.contains(IrisRenderGraph.Phase.SHADOW.name())
+          && phaseSummary.contains(IrisRenderGraph.Phase.GEOMETRY.name())
+          && phaseSummary.contains(IrisRenderGraph.Phase.COMPOSITE.name())
+          && phaseSummary.contains(IrisRenderGraph.Phase.FINAL.name())
+          && graphIdentityCount > 0
+          && graphSetComplete
+          && unsupportedReasonSetComplete;
     }
   }
 

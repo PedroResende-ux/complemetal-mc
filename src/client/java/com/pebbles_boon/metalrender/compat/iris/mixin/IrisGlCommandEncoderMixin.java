@@ -29,21 +29,21 @@ public abstract class IrisGlCommandEncoderMixin {
   }
 
   @Redirect(method = "trySetup", at = @At(value = "INVOKE",
-      target = "Lorg/lwjgl/opengl/GL33C;glBindTexture:(II)V"), require = 0)
+      target = "Lorg/lwjgl/opengl/GL33C;glBindTexture(II)V"), require = 0)
   private void metalrender$bindTexture(int target, int texture) {
     GL33C.glBindTexture(target, texture);
     IrisGlResourceBindingTracker.global().bindTexture(target, texture);
   }
 
   @Redirect(method = "trySetup", at = @At(value = "INVOKE",
-      target = "Lorg/lwjgl/opengl/GL33C;glBindSampler:(II)V"), require = 0)
+      target = "Lorg/lwjgl/opengl/GL33C;glBindSampler(II)V"), require = 0)
   private void metalrender$bindSampler(int unit, int sampler) {
     GL33C.glBindSampler(unit, sampler);
     IrisGlResourceBindingTracker.global().bindSamplerToUnit(unit, sampler);
   }
 
   @Redirect(method = "trySetup", at = @At(value = "INVOKE",
-      target = "Lorg/lwjgl/opengl/GL33C;glTexBuffer:(III)V"), require = 0)
+      target = "Lorg/lwjgl/opengl/GL33C;glTexBuffer(III)V"), require = 0)
   private void metalrender$texBuffer(int target, int internalFormat,
       int buffer) {
     GL33C.glTexBuffer(target, internalFormat, buffer);
