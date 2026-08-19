@@ -6,6 +6,17 @@
   "compatibilityLevel": "JAVA_25",
   "mixins": [],
   "client": [
+    "IrisDhGenericRenderProgramMixin",
+    "IrisDhLodRenderProgramMixin",
+    "IrisFrameBufferCacheMixin",
+    "IrisGlCommandEncoderMixin",
+    "IrisGlRenderPassMixin",
+    "IrisGlStateManagerMixin",
+    "IrisGlTextureMixin",
+    "IrisPartialShaderAccessor",
+    "IrisProgramBuilderAccessor",
+    "IrisProgramBuilderMixin",
+    "IrisRenderSystemMixin",
     "IrisShaderCreatorMixin"
   ],
   "injectors": {

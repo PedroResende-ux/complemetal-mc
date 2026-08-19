@@ -49,7 +49,33 @@ public final class IrisFinalShaderProgram {
   }
 
   /**
-   * Complete six-stage factory for future compute capture points and tests.
+   * Captures the exact final graphics sources accepted by Iris 26.2
+   * {@code ProgramBuilder.begin}.
+   */
+  public static IrisFinalShaderProgram fromProgramBuilderGraphics(
+      String programName, String vertex, String geometry, String fragment) {
+    EnumMap<IrisShaderStage, String> sources =
+        new EnumMap<>(IrisShaderStage.class);
+    putIfPresent(sources, IrisShaderStage.VERTEX, vertex);
+    putIfPresent(sources, IrisShaderStage.GEOMETRY, geometry);
+    putIfPresent(sources, IrisShaderStage.FRAGMENT, fragment);
+    return new IrisFinalShaderProgram(programName, sources);
+  }
+
+  /**
+   * Captures the exact final compute source accepted by Iris 26.2
+   * {@code ProgramBuilder.beginCompute}.
+   */
+  public static IrisFinalShaderProgram fromProgramBuilderCompute(
+      String programName, String compute) {
+    EnumMap<IrisShaderStage, String> sources =
+        new EnumMap<>(IrisShaderStage.class);
+    putIfPresent(sources, IrisShaderStage.COMPUTE, compute);
+    return new IrisFinalShaderProgram(programName, sources);
+  }
+
+  /**
+   * Complete six-stage factory for model and translation tests.
    */
   public static IrisFinalShaderProgram of(String programName, String vertex,
       String tessControl, String tessEvaluation, String geometry,

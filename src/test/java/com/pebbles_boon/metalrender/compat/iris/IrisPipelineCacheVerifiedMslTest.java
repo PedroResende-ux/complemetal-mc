@@ -62,6 +62,27 @@ final class IrisPipelineCacheVerifiedMslTest {
   }
 
   @Test
+  void verifiedSpirvReadReturnsClonedContentAndRejectsTampering()
+      throws Exception {
+    IrisFinalShaderProgram program = program();
+    IrisShaderTranslation translation = translation(program);
+    IrisPipelineCache cache = cache("verified-spirv");
+    IrisPipelineCache.StoreResult stored = cache.store(program, translation);
+    IrisPipelineCache.VerifiedSpirvStage verified =
+        cache.readVerifiedSpirvStage(translation.key(), PROFILE,
+            IrisShaderStage.VERTEX).orElseThrow();
+    assertArrayEquals(SPIRV, verified.spirv());
+    assertEquals(rawSha256(SPIRV), verified.spirvSha256());
+    byte[] callerCopy = verified.spirv();
+    callerCopy[0] = 0;
+    assertArrayEquals(SPIRV, verified.spirv());
+
+    Files.write(stored.paths().spirv(IrisShaderStage.VERTEX), callerCopy);
+    assertTrue(cache.readVerifiedSpirvStage(translation.key(), PROFILE,
+        IrisShaderStage.VERTEX).isEmpty());
+  }
+
+  @Test
   void verifiedReadRejectsContentManifestAndBoundTampering()
       throws Exception {
     IrisFinalShaderProgram program = program();

@@ -142,6 +142,73 @@ public final class IrisPipelineCache {
   }
 
   /**
+   * Reads one SPIR-V stage only after the same content-address and manifest
+   * verification used by the translation cache. Stage 3/4 reflection never
+   * consumes an unchecked cache file.
+   */
+  public synchronized Optional<VerifiedSpirvStage> readVerifiedSpirvStage(
+      IrisShaderCacheKey key, IrisTranslationProfile profile,
+      IrisShaderStage stage) throws IOException {
+    Objects.requireNonNull(key, "key");
+    Objects.requireNonNull(profile, "profile");
+    Objects.requireNonNull(stage, "stage");
+    IrisPipelineCacheLayout.CachePaths paths = layout.paths(key);
+    if (!validCompleteMarker(key, profile, paths)) {
+      return Optional.empty();
+    }
+    Optional<Map<String, String>> manifestResult =
+        readStrictManifest(paths.manifest());
+    if (manifestResult.isEmpty()) {
+      return Optional.empty();
+    }
+    Map<String, String> manifest = manifestResult.orElseThrow();
+    if (!"metalrender-iris-pipeline-cache".equals(manifest.get("format"))
+        || !Integer.toString(MANIFEST_SCHEMA).equals(manifest.get("schema"))
+        || !key.sha256().equals(manifest.get("key.sha256"))
+        || !profile.sha256().equals(
+            manifest.get("translation.profile.sha256"))
+        || !profile.canonicalValue().equals(
+            manifest.get("translation.profile"))
+        || !"complete".equals(manifest.get("translation.status"))
+        || !"pending".equals(manifest.get("pipeline.status"))
+        || !"false".equals(
+            manifest.get("source.original_glsl_persisted"))) {
+      return Optional.empty();
+    }
+    String prefix = "stage." + stage.cacheName();
+    Path spirvPath = paths.spirv(stage);
+    String expectedRelative = slash(paths.directory().relativize(spirvPath));
+    if (!"true".equals(manifest.get(prefix + ".present"))
+        || !expectedRelative.equals(manifest.get(prefix + ".spirv"))) {
+      return Optional.empty();
+    }
+    long declaredBytes = parseBoundedSize(
+        manifest.get(prefix + ".spirv.bytes"));
+    String declaredDigest = manifest.get(prefix + ".spirv.sha256");
+    if (declaredBytes < 5L * Integer.BYTES
+        || declaredBytes > MAX_STAGE_ARTIFACT_BYTES
+        || declaredBytes % Integer.BYTES != 0
+        || declaredDigest == null
+        || !declaredDigest.matches("[0-9a-f]{64}")) {
+      return Optional.empty();
+    }
+    Optional<byte[]> content = readBoundedRegularFile(
+        spirvPath, MAX_STAGE_ARTIFACT_BYTES);
+    if (content.isEmpty()) {
+      return Optional.empty();
+    }
+    byte[] spirv = content.orElseThrow();
+    String actualDigest = sha256(spirv);
+    if (spirv.length != declaredBytes
+        || !actualDigest.equals(declaredDigest)
+        || !validSpirvBytes(spirv)) {
+      return Optional.empty();
+    }
+    return Optional.of(new VerifiedSpirvStage(
+        key.sha256(), stage, spirv, actualDigest));
+  }
+
+  /**
    * Immutable content-addressed store. A valid hit is never rewritten.
    * {@code translation.complete} is written last.
    */
@@ -435,6 +502,16 @@ public final class IrisPipelineCache {
         && (magic[3] & 0xff) == 0x07;
   }
 
+  private static boolean validSpirvBytes(byte[] content) {
+    return content.length >= 5 * Integer.BYTES
+        && content.length <= MAX_STAGE_ARTIFACT_BYTES
+        && content.length % Integer.BYTES == 0
+        && (content[0] & 0xff) == 0x03
+        && (content[1] & 0xff) == 0x02
+        && (content[2] & 0xff) == 0x23
+        && (content[3] & 0xff) == 0x07;
+  }
+
   private static boolean validMsl(Path path) throws IOException {
     if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
       return false;
@@ -668,6 +745,40 @@ public final class IrisPipelineCache {
 
     public String mslSha256() {
       return mslSha256;
+    }
+  }
+
+  /** Immutable validated SPIR-V bytes passed to reflection scanners. */
+  public static final class VerifiedSpirvStage {
+    private final String programKeySha256;
+    private final IrisShaderStage stage;
+    private final byte[] spirv;
+    private final String spirvSha256;
+
+    private VerifiedSpirvStage(String programKeySha256,
+        IrisShaderStage stage, byte[] spirv, String spirvSha256) {
+      this.programKeySha256 = Objects.requireNonNull(
+          programKeySha256, "programKeySha256");
+      this.stage = Objects.requireNonNull(stage, "stage");
+      this.spirv = Objects.requireNonNull(spirv, "spirv").clone();
+      this.spirvSha256 = Objects.requireNonNull(
+          spirvSha256, "spirvSha256");
+    }
+
+    public String programKeySha256() {
+      return programKeySha256;
+    }
+
+    public IrisShaderStage stage() {
+      return stage;
+    }
+
+    public byte[] spirv() {
+      return spirv.clone();
+    }
+
+    public String spirvSha256() {
+      return spirvSha256;
     }
   }
 

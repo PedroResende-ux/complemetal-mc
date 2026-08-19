@@ -25,6 +25,8 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.IntBuffer;
 import java.util.EnumMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -45,6 +47,8 @@ public final class LwjglShadercSpvcBackend
   private static final String SHADERC_CLASS =
       "org.lwjgl.util.shaderc.Shaderc";
   private static final String SPVC_CLASS = "org.lwjgl.util.spvc.Spvc";
+  private static final Pattern GLSL_VERSION = Pattern.compile(
+      "(?m)^(\\s*#\\s*version\\s+)(\\d+)([^\\r\\n]*)");
 
   private final ExecutionPolicy executionPolicy;
 
@@ -180,7 +184,7 @@ public final class LwjglShadercSpvcBackend
     ByteBuffer encodedEntryPoint = null;
     long result;
     try {
-      encodedSource = MemoryUtil.memUTF8(source, false);
+      encodedSource = MemoryUtil.memUTF8(normalizeForShaderc(source), false);
       encodedFileName =
           MemoryUtil.memUTF8(stage.cacheName() + ".glsl", true);
       encodedEntryPoint = MemoryUtil.memUTF8("main", true);
@@ -213,6 +217,29 @@ public final class LwjglShadercSpvcBackend
     } finally {
       Shaderc.shaderc_result_release(result);
     }
+  }
+
+  /**
+   * OpenGL-targeted SPIR-V requires desktop GLSL 330 or newer. Iris' own
+   * center-depth helper is valid GLSL 150, so shaderc receives a version-floor
+   * adaptation while the cache key remains bound to Iris' exact final source.
+   */
+  static String normalizeForShaderc(String source) {
+    Matcher matcher = GLSL_VERSION.matcher(source);
+    if (!matcher.find()) {
+      return source;
+    }
+    int version;
+    try {
+      version = Integer.parseInt(matcher.group(2));
+    } catch (NumberFormatException malformed) {
+      return source;
+    }
+    if (version >= 330) {
+      return source;
+    }
+    return source.substring(0, matcher.start(2)) + "330"
+        + source.substring(matcher.end(2));
   }
 
   private static String compileMsl(IrisShaderStage stage, byte[] spirv)

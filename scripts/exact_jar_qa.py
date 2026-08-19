@@ -18,6 +18,7 @@ import platform
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -35,8 +36,8 @@ FABRIC_LOADER_VERSION = "0.19.3"
 REQUIRED_IRIS_VERSION = "1.11.2+mc26.2"
 REQUIRED_SODIUM_VERSION = "0.9.1+mc26.2"
 DEFAULT_SHADER_PACK = "ComplementaryReimagined_r5.8.1.zip"
-EXPECTED_COMPLEMENTARY_PROGRAMS = 76
-EXPECTED_COMPLEMENTARY_STAGES = 152
+EXPECTED_COMPLEMENTARY_PROGRAMS = 231
+EXPECTED_COMPLEMENTARY_STAGES = 462
 SUPPORTED_BACKENDS = ("metal4", "metal3")
 QA_MOD_ID = "metalrender-exact-jar-qa"
 FORBIDDEN_RUNTIME_DIAGNOSTICS = (
@@ -807,6 +808,39 @@ def msl_library_validation_is_safe(value: Any) -> bool:
     )
 
 
+def pipeline_state_capture_is_complete(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return (
+        value.get("complete") is True
+        and type(value.get("drawsObserved")) is int
+        and value.get("drawsObserved", 0) > 0
+        and type(value.get("dispatchesObserved")) is int
+        and value.get("dispatchesObserved", -1) >= 0
+        and type(value.get("variantsAccepted")) is int
+        and value.get("variantsAccepted", 0) > 0
+        and value.get("variantsRejected") == 0
+        and value.get("incompleteVariants") == 0
+        and value.get("statesPending") == 0
+        and value.get("statesAttempted") == value.get("variantsAccepted")
+        and value.get("statesSucceeded") == value.get("statesAttempted")
+        and value.get("statesUnsupported") == 0
+        and value.get("statesFailed") == 0
+        and type(value.get("executionBlocked")) is int
+        and 0 <= value.get("executionBlocked", -1)
+        <= value.get("statesSucceeded", -1)
+        and type(value.get("stateIdentityCount")) is int
+        and value.get("stateIdentityCount", 0) > 0
+        and isinstance(value.get("stateSetSha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["stateSetSha256"])
+            is not None
+        and value.get("stateSetComplete") is True
+        and value.get("lastFailure") == ""
+        and value.get("pipelineStatus") == "pending"
+        and value.get("irisOpenGlActive") is True
+    )
+
+
 def iris_runtime_ownership_check_passed(value: Any) -> bool:
     return (
         isinstance(value, dict)
@@ -891,13 +925,15 @@ def driver_identity_matches_manifest(
     iris_translation = driver_result.get("irisTranslation")
     msl_library_validation = driver_result.get(
         "generatedMslLibraryValidation")
+    pipeline_state_capture = driver_result.get(
+        "irisPipelineStateCapture")
     iris_runtime_ownership = driver_result.get("irisRuntimeOwnership")
     generated_msl_boundary = driver_result.get(
         "generatedMslExecutionBoundary")
     if not isinstance(iris_translation, dict):
         return False
     return (
-        driver_result.get("schemaVersion") == 3
+        driver_result.get("schemaVersion") == 4
         and driver_result.get("status") == "PASS"
         and actual_path == expected_path
         and driver_result.get("exactJarSha256") == release.get("sha256")
@@ -914,6 +950,11 @@ def driver_identity_matches_manifest(
         and generated_msl_static_boundary_is_explicit(
             generated_msl_boundary)
         and iris_translation.get("pipelineStatus") == "pending"
+        and driver_result.get("dimensionRoute") == [
+            "minecraft:overworld", "minecraft:the_nether",
+            "minecraft:the_end", "minecraft:overworld",
+        ]
+        and pipeline_state_capture_is_complete(pipeline_state_capture)
         and msl_library_validation_is_safe(msl_library_validation)
         and isinstance(native_faults, dict)
         and native_faults.get("semantics")
@@ -1059,6 +1100,9 @@ def inspect_translation_cache(cache_root: Path) -> dict[str, Any]:
     manifests = [
         path for path in regular_files if path.name == "manifest.properties"
     ]
+    state_manifests = [
+        path for path in regular_files if path.name == "state.properties"
+    ]
     valid_spirv = all(
         path.stat().st_size >= 20
         and path.stat().st_size % 4 == 0
@@ -1157,6 +1201,64 @@ def inspect_translation_cache(cache_root: Path) -> dict[str, Any]:
         not path.is_symlink() and 0 < path.stat().st_size <= 4096
         for path in complete_markers
     )
+    pipeline_state_integrity = True
+    pipeline_state_identities: list[str] = []
+    state_domain = b"metalrender.iris.pipeline-state.v1"
+    for metadata in state_manifests:
+        properties: dict[str, str] = {}
+        for line in metadata.read_text(
+                encoding="ascii", errors="strict").splitlines():
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            properties[key] = value
+        state_path = metadata.parent / "state.bin"
+        pipeline_key = properties.get("pipeline.key.sha256", "")
+        shader_key = properties.get("shader.key.sha256", "")
+        canonical_sha = properties.get("state.canonical.sha256", "")
+        valid = (
+            properties.get("format")
+                == "metalrender-iris-pipeline-state"
+            and properties.get("schema") == "1"
+            and properties.get("state.canonical") == "state.bin"
+            and properties.get("specialization.scanned") == "true"
+            and properties.get("pipeline.status") == "pending"
+            and properties.get("source.original_glsl_persisted") == "false"
+            and re.fullmatch(r"[0-9a-f]{64}", pipeline_key) is not None
+            and re.fullmatch(r"[0-9a-f]{64}", shader_key) is not None
+            and re.fullmatch(r"[0-9a-f]{64}", canonical_sha) is not None
+            and metadata.parent.name == pipeline_key
+            and state_path.is_file()
+            and not state_path.is_symlink()
+        )
+        if valid:
+            canonical = state_path.read_bytes()
+            reconstructed = hashlib.sha256(
+                struct.pack(">q", len(state_domain))
+                + state_domain
+                + struct.pack(">q", len(canonical))
+                + canonical
+            ).hexdigest()
+            valid = (
+                len(canonical) > 0
+                and properties.get("state.canonical.bytes")
+                    == str(len(canonical))
+                and hashlib.sha256(canonical).hexdigest() == canonical_sha
+                and reconstructed == pipeline_key
+                and len(canonical) >= 72
+                and struct.unpack(">q", canonical[:8])[0] == 64
+                and canonical[8:72].decode("ascii") == shader_key
+            )
+        pipeline_state_integrity = pipeline_state_integrity and valid
+        if valid:
+            pipeline_state_identities.append(
+                f"{pipeline_key}|{shader_key}|{canonical_sha}")
+    unique_pipeline_state_identities = sorted(
+        set(pipeline_state_identities))
+    pipeline_state_set_digest = hashlib.sha256()
+    for identity in unique_pipeline_state_identities:
+        pipeline_state_set_digest.update(identity.encode("ascii"))
+        pipeline_state_set_digest.update(b"\n")
     checks = {
         "cacheRootExists": cache_root.is_dir(),
         "hasCompleteTranslation": bool(complete_markers),
@@ -1171,6 +1273,13 @@ def inspect_translation_cache(cache_root: Path) -> dict[str, Any]:
         "mslArtifactSetComplete":
             bool(msl_files) and msl_artifact_set_complete,
         "completionMarkersBounded": valid_markers,
+        "hasPipelineStates": bool(state_manifests),
+        "pipelineStateIntegrity": bool(state_manifests)
+            and pipeline_state_integrity,
+        "pipelineStateIdentitySetComplete":
+            len(pipeline_state_identities) == len(state_manifests)
+            and len(unique_pipeline_state_identities)
+                == len(state_manifests),
         "entryCountsMatch":
             len(manifests) == len(complete_markers),
         "noSymlinks": not any(path.is_symlink() for path in all_paths),
@@ -1188,6 +1297,10 @@ def inspect_translation_cache(cache_root: Path) -> dict[str, Any]:
         "mslStageCount": len(msl_files),
         "mslArtifactIdentityCount": len(unique_msl_artifact_identities),
         "mslArtifactSetSha256": msl_artifact_set_digest.hexdigest(),
+        "pipelineStateCount": len(state_manifests),
+        "pipelineStateIdentityCount":
+            len(unique_pipeline_state_identities),
+        "pipelineStateSetSha256": pipeline_state_set_digest.hexdigest(),
         "generatedLibraryOrPipelineArtifacts": [
             str(path) for path in generated_library_files
         ],
@@ -1319,6 +1432,10 @@ def run_harness(
         driver_result.get("generatedMslLibraryValidation", {})
         if isinstance(driver_result, dict) else {}
     )
+    pipeline_state_capture = (
+        driver_result.get("irisPipelineStateCapture", {})
+        if isinstance(driver_result, dict) else {}
+    )
     attempted = iris_translation.get("attempted")
     cache_entry_count = translation_cache.get("completeTranslationCount")
     checks = {
@@ -1361,6 +1478,23 @@ def run_harness(
                 == EXPECTED_COMPLEMENTARY_STAGES
             and msl_library_validation.get("compiledArtifactSetSha256")
                 == translation_cache.get("mslArtifactSetSha256"),
+        "pipelineStateCaptureCompleted":
+            pipeline_state_capture_is_complete(pipeline_state_capture),
+        "pipelineStateSetMatchesCache":
+            (
+                translation_cache.get("pipelineStateIdentityCount")
+                    == pipeline_state_capture.get("stateIdentityCount")
+                and translation_cache.get("pipelineStateSetSha256")
+                    == pipeline_state_capture.get("stateSetSha256")
+                if cache_expectation == "cold"
+                else isinstance(
+                    translation_cache.get("pipelineStateIdentityCount"),
+                    int)
+                and isinstance(
+                    pipeline_state_capture.get("stateIdentityCount"), int)
+                and translation_cache.get("pipelineStateIdentityCount", 0)
+                    >= pipeline_state_capture.get("stateIdentityCount", 0)
+            ),
         "preparedManifestPresent": manifest_path.is_file(),
         "releaseSourceUnchangedAfterRun":
             release_source_matches(manifest),

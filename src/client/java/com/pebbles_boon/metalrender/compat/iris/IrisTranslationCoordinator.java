@@ -35,6 +35,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   static final int DEFAULT_COMPILED_ARTIFACT_IDENTITY_CAPACITY =
       Math.multiplyExact(IrisPipelineCache.DEFAULT_MAX_ENTRIES,
           IrisShaderStage.values().length);
+  static final int DEFAULT_PIPELINE_STATE_IDENTITY_CAPACITY = 65_536;
+  static final int DEFAULT_PIPELINE_STATE_UNSUPPORTED_REASON_CAPACITY = 32;
   private static final long CLIENT_QUIET_PERIOD_NANOS =
       TimeUnit.SECONDS.toNanos(8);
 
@@ -48,6 +50,9 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   private final IrisShaderCaptureQueue captureQueue;
   private final IrisShaderTranslatorBackend backend;
   private final IrisPipelineCache cache;
+  private final IrisPipelineStateCapture pipelineStateCapture;
+  private final IrisPipelineStateCache pipelineStateCache;
+  private final IrisSpecializationStateReader specializationStateReader;
   private final IrisMslLibraryValidator libraryValidator;
   private final boolean libraryValidationEnabled;
   private final ArrayBlockingQueue<LibraryStageJob> libraryStageQueue;
@@ -83,6 +88,21 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   private final ConcurrentSkipListSet<String> compiledArtifactLines =
       new ConcurrentSkipListSet<>();
   private final AtomicBoolean compiledArtifactSetComplete =
+      new AtomicBoolean(true);
+  private final AtomicLong pipelineStatesAttempted = new AtomicLong();
+  private final AtomicLong pipelineStatesSucceeded = new AtomicLong();
+  private final AtomicLong pipelineStateCacheHits = new AtomicLong();
+  private final AtomicLong pipelineStatesUnsupported = new AtomicLong();
+  private final AtomicLong pipelineStatesFailed = new AtomicLong();
+  private final AtomicLong pipelineStatesExecutionBlocked = new AtomicLong();
+  private final AtomicReference<String> pipelineStateLastFailure =
+      new AtomicReference<>("");
+  private final BoundedReasonSet pipelineStateUnsupportedReasons =
+      new BoundedReasonSet(
+          DEFAULT_PIPELINE_STATE_UNSUPPORTED_REASON_CAPACITY);
+  private final ConcurrentSkipListSet<String> pipelineStateIdentityLines =
+      new ConcurrentSkipListSet<>();
+  private final AtomicBoolean pipelineStateSetComplete =
       new AtomicBoolean(true);
 
   IrisTranslationCoordinator(IrisShaderCaptureQueue captureQueue,
@@ -133,6 +153,10 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     this.captureQueue = Objects.requireNonNull(captureQueue, "captureQueue");
     this.backend = Objects.requireNonNull(backend, "backend");
     this.cache = Objects.requireNonNull(cache, "cache");
+    pipelineStateCapture = IrisPipelineStateCapture.global();
+    pipelineStateCache = new IrisPipelineStateCache(cacheRoot);
+    specializationStateReader = new IrisSpecializationStateReader(cache,
+        backend.profile());
     this.libraryValidator = Objects.requireNonNull(
         libraryValidator, "libraryValidator");
     this.libraryValidationEnabled = libraryValidationEnabled;
@@ -177,6 +201,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     }
 
     try {
+      IrisPipelineStateCapture.global().initializeOpenGlDefaults();
       LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
           LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
       IrisPipelineCache cache = new IrisPipelineCache(
@@ -222,7 +247,17 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           isLibraryValidationOptedIn(), false,
           0, 0, 0, 0,
           0, 0, 0, 0, 0, 0,
-          0, 0, 0, 0, true, emptyCompiledArtifactSetSha256(), "");
+          0, 0, 0, 0, true, emptyCompiledArtifactSetSha256(), "",
+          IrisPipelineStateCapture.global().drawsObserved(),
+          IrisPipelineStateCapture.global().dispatchesObserved(),
+          IrisPipelineStateCapture.global().variantsAccepted(),
+          IrisPipelineStateCapture.global().variantsRejected(),
+          IrisPipelineStateCapture.global().incompleteVariants(),
+          IrisPipelineStateCapture.global().queued(),
+          0, 0, 0, 0,
+          0, true, emptyPipelineStateSetSha256(), "",
+          0, 0, 0, true,
+          emptyPipelineStateSetSha256(), "");
     }
     return coordinator.snapshot();
   }
@@ -255,6 +290,12 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         Optional<IrisShaderCaptureQueue.CapturedProgram> captured =
             captureQueue.poll();
         if (captured.isEmpty()) {
+          for (int stateBatch = 0; stateBatch < 16 && running.get();
+               stateBatch++) {
+            if (!drainOnePipelineState()) {
+              break;
+            }
+          }
           return;
         }
         process(captured.orElseThrow());
@@ -270,6 +311,12 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   }
 
   private void process(IrisShaderCaptureQueue.CapturedProgram captured) {
+    captured.registration().ifPresent(registration ->
+        IrisProgramIdentityRegistry.global().resolve(registration,
+            captured.key(), captured.program().sources().keySet()));
+    if (captured.duplicate()) {
+      return;
+    }
     attempted.incrementAndGet();
     IrisFinalShaderProgram program = captured.program();
     try {
@@ -307,13 +354,89 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
             LibraryStageSource.TRANSLATION);
       }
     } catch (Exception | LinkageError error) {
-      recordFailure(error);
+      recordFailure(error, program);
     }
+  }
+
+  private boolean drainOnePipelineState() {
+    Optional<IrisPipelineStateCapture.PendingState> pending =
+        pipelineStateCapture.poll();
+    if (pending.isEmpty()) {
+      return false;
+    }
+    pipelineStatesAttempted.incrementAndGet();
+    IrisPipelineStateCapture.PendingState captured = pending.orElseThrow();
+    try {
+      Optional<IrisProgramIdentityRegistry.ResolvedProgram> resolved =
+          captured.registration().resolved();
+      if (resolved.isEmpty()) {
+        recordPipelineStateUnsupported("program-identity-unresolved");
+        return true;
+      }
+      IrisProgramIdentityRegistry.ResolvedProgram program =
+          resolved.orElseThrow();
+      IrisSpecializationStateReader.Result specialization =
+          specializationStateReader.read(program);
+      if (specialization instanceof IrisSpecializationStateReader.Unsupported
+          unsupported) {
+        recordPipelineStateUnsupported(
+            "specialization-" + unsupported.reason());
+        return true;
+      }
+      IrisSpecializationStateReader.Complete constants =
+          (IrisSpecializationStateReader.Complete) specialization;
+      IrisPipelineStateMapper.Result mapped = IrisPipelineStateMapper.map(
+          captured.snapshot(), program, constants.constants());
+      if (mapped instanceof IrisPipelineStateMapper.Unsupported unsupported) {
+        recordPipelineStateUnsupported(unsupported.reason());
+        return true;
+      }
+      IrisPipelineStateMapper.Complete complete =
+          (IrisPipelineStateMapper.Complete) mapped;
+      IrisPipelineStateCache.StoreResult stored = pipelineStateCache.store(
+          program.shaderKey(), complete.state());
+      pipelineStatesSucceeded.incrementAndGet();
+      if (stored.cacheHit()) {
+        pipelineStateCacheHits.incrementAndGet();
+      }
+      if (!complete.metalExecutionSupported()) {
+        pipelineStatesExecutionBlocked.incrementAndGet();
+      }
+      retainPipelineStateIdentity(stored.verified());
+    } catch (Exception | LinkageError error) {
+      pipelineStatesFailed.incrementAndGet();
+      pipelineStateLastFailure.set(redactedFailure(error));
+    }
+    return true;
+  }
+
+  private void recordPipelineStateUnsupported(String reason) {
+    pipelineStatesUnsupported.incrementAndGet();
+    pipelineStateLastFailure.set(reason);
+    pipelineStateUnsupportedReasons.add(reason);
   }
 
   private void recordFailure(Throwable error) {
     failed.incrementAndGet();
     String redacted = redactedFailure(error);
+    lastFailure.set(redacted);
+    long warnings = warningCount.incrementAndGet();
+    if (warnings <= 3 || warnings % 32 == 0) {
+      MetalLogger.warn(
+          "Iris Metal background translation failed open; Iris OpenGL remains active (%s, failure %d)",
+          redacted, warnings);
+    }
+  }
+
+  private void recordFailure(Throwable error,
+      IrisFinalShaderProgram program) {
+    failed.incrementAndGet();
+    String name = program.programName().replaceAll(
+        "[^A-Za-z0-9._:/-]", "_");
+    if (name.length() > 80) {
+      name = name.substring(0, 80);
+    }
+    String redacted = "program=" + name + ":" + redactedFailure(error);
     lastFailure.set(redacted);
     long warnings = warningCount.incrementAndGet();
     if (warnings <= 3 || warnings % 32 == 0) {
@@ -496,6 +619,38 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     return HexFormat.of().formatHex(digest.digest());
   }
 
+  private void retainPipelineStateIdentity(
+      IrisPipelineStateCache.VerifiedState state) {
+    String identity = state.identityLine();
+    synchronized (pipelineStateIdentityLines) {
+      if (pipelineStateIdentityLines.contains(identity)) {
+        return;
+      }
+      if (pipelineStateIdentityLines.size()
+          >= DEFAULT_PIPELINE_STATE_IDENTITY_CAPACITY) {
+        pipelineStateSetComplete.set(false);
+        pipelineStateLastFailure.compareAndSet("",
+            "pipeline-state-identity-capacity-exceeded");
+        return;
+      }
+      pipelineStateIdentityLines.add(identity);
+    }
+  }
+
+  private String pipelineStateSetSha256() {
+    MessageDigest digest = newSha256();
+    synchronized (pipelineStateIdentityLines) {
+      for (String line : pipelineStateIdentityLines) {
+        digest.update(line.getBytes(StandardCharsets.US_ASCII));
+      }
+    }
+    return HexFormat.of().formatHex(digest.digest());
+  }
+
+  private static String emptyPipelineStateSetSha256() {
+    return HexFormat.of().formatHex(newSha256().digest());
+  }
+
   private static String emptyCompiledArtifactSetSha256() {
     return HexFormat.of().formatHex(newSha256().digest());
   }
@@ -523,7 +678,23 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         libraryStagesFromTranslation.get(), libraryStagesFromCache.get(),
         libraryStagesRejected.get(), libraryLiveLibraries.get(),
         compiledArtifactSetComplete.get(), compiledArtifactSetSha256(),
-        libraryValidationLastFailure.get());
+        libraryValidationLastFailure.get(),
+        pipelineStateCapture.drawsObserved(),
+        pipelineStateCapture.dispatchesObserved(),
+        pipelineStateCapture.variantsAccepted(),
+        pipelineStateCapture.variantsRejected(),
+        pipelineStateCapture.incompleteVariants(),
+        pipelineStateCapture.queued(),
+        pipelineStatesAttempted.get(), pipelineStatesSucceeded.get(),
+        pipelineStateCacheHits.get(), pipelineStatesUnsupported.get(),
+        pipelineStateUnsupportedReasons.size(),
+        pipelineStateUnsupportedReasons.complete(),
+        pipelineStateUnsupportedReasons.sha256(),
+        pipelineStateUnsupportedReasons.summary(),
+        pipelineStatesFailed.get(), pipelineStatesExecutionBlocked.get(),
+        pipelineStateIdentityLines.size(),
+        pipelineStateSetComplete.get(), pipelineStateSetSha256(),
+        pipelineStateLastFailure.get());
   }
 
   private static String redactedFailure(Throwable error) {
@@ -630,7 +801,27 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
                        long libraryLiveLibraries,
                        boolean compiledArtifactSetComplete,
                        String compiledArtifactSetSha256,
-                       String libraryValidationLastFailure) {
+                       String libraryValidationLastFailure,
+                       long pipelineDrawsObserved,
+                       long pipelineDispatchesObserved,
+                       long pipelineVariantsAccepted,
+                       long pipelineVariantsRejected,
+                       long pipelineIncompleteVariants,
+                       int pipelineStatesPending,
+                       long pipelineStatesAttempted,
+                       long pipelineStatesSucceeded,
+                       long pipelineStateCacheHits,
+                       long pipelineStatesUnsupported,
+                       int pipelineStateUnsupportedReasonCount,
+                       boolean pipelineStateUnsupportedReasonSetComplete,
+                       String pipelineStateUnsupportedReasonSetSha256,
+                       String pipelineStateUnsupportedReasonSummary,
+                       long pipelineStatesFailed,
+                       long pipelineStatesExecutionBlocked,
+                       int pipelineStateIdentityCount,
+                       boolean pipelineStateSetComplete,
+                       String pipelineStateSetSha256,
+                       String pipelineStateLastFailure) {
     public Status {
       Objects.requireNonNull(cacheRoot, "cacheRoot");
       Objects.requireNonNull(lastFailure, "lastFailure");
@@ -638,6 +829,14 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           compiledArtifactSetSha256, "compiledArtifactSetSha256");
       Objects.requireNonNull(
           libraryValidationLastFailure, "libraryValidationLastFailure");
+      Objects.requireNonNull(pipelineStateSetSha256,
+          "pipelineStateSetSha256");
+      Objects.requireNonNull(pipelineStateLastFailure,
+          "pipelineStateLastFailure");
+      Objects.requireNonNull(pipelineStateUnsupportedReasonSetSha256,
+          "pipelineStateUnsupportedReasonSetSha256");
+      Objects.requireNonNull(pipelineStateUnsupportedReasonSummary,
+          "pipelineStateUnsupportedReasonSummary");
     }
 
     /**
@@ -661,6 +860,98 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           && libraryStagesRejected == 0
           && libraryLiveLibraries == 0
           && compiledArtifactSetComplete;
+    }
+
+    /** Gate proving that every observed Iris operation has a cacheable key. */
+    public boolean pipelineStateCaptureComplete() {
+      return pipelineVariantsAccepted > 0
+          && pipelineVariantsRejected == 0
+          && pipelineIncompleteVariants == 0
+          && pipelineStatesPending == 0
+          && pipelineStatesAttempted == pipelineVariantsAccepted
+          && pipelineStatesAttempted == pipelineStatesSucceeded
+          && pipelineStatesUnsupported == 0
+          && pipelineStatesFailed == 0
+          && pipelineStateSetComplete;
+    }
+  }
+
+  /**
+   * A deterministic bounded view of distinct fail-open reasons.
+   *
+   * <p>If the capacity is exceeded, the lexicographically smallest values are
+   * retained. This makes the summary and digest independent of observation
+   * order while the completeness bit prevents a truncated set from being
+   * mistaken for the full diagnostic.</p>
+   */
+  static final class BoundedReasonSet {
+    private static final int MAX_REASON_LENGTH = 96;
+
+    private final int capacity;
+    private final ConcurrentSkipListSet<String> reasons =
+        new ConcurrentSkipListSet<>();
+    private boolean complete = true;
+
+    BoundedReasonSet(int capacity) {
+      if (capacity <= 0) {
+        throw new IllegalArgumentException("capacity must be positive");
+      }
+      this.capacity = capacity;
+    }
+
+    void add(String reason) {
+      String normalized = normalizeReason(reason);
+      synchronized (reasons) {
+        if (!reasons.add(normalized)) {
+          return;
+        }
+        if (reasons.size() > capacity) {
+          reasons.pollLast();
+          complete = false;
+        }
+      }
+    }
+
+    int size() {
+      synchronized (reasons) {
+        return reasons.size();
+      }
+    }
+
+    boolean complete() {
+      synchronized (reasons) {
+        return complete;
+      }
+    }
+
+    String summary() {
+      synchronized (reasons) {
+        return String.join(",", reasons);
+      }
+    }
+
+    String sha256() {
+      MessageDigest digest = newSha256();
+      synchronized (reasons) {
+        for (String reason : reasons) {
+          digest.update(reason.getBytes(StandardCharsets.US_ASCII));
+          digest.update((byte) '\n');
+        }
+      }
+      return HexFormat.of().formatHex(digest.digest());
+    }
+
+    private static String normalizeReason(String reason) {
+      Objects.requireNonNull(reason, "reason");
+      String normalized = reason.trim().replaceAll(
+          "[^A-Za-z0-9._:/-]", "_");
+      if (normalized.isEmpty()) {
+        normalized = "unknown";
+      }
+      if (normalized.length() > MAX_REASON_LENGTH) {
+        normalized = normalized.substring(0, MAX_REASON_LENGTH);
+      }
+      return normalized;
     }
   }
 }

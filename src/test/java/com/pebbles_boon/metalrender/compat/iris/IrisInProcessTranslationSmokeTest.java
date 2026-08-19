@@ -123,6 +123,47 @@ final class IrisInProcessTranslationSmokeTest {
     assertFalse(msl.matches("(?s).*\\[\\[buffer\\((?:3[1-9]|[4-9][0-9])\\)\\]\\].*"));
   }
 
+  @Test
+  void translatesExactIrisCenterDepthProgram() throws Exception {
+    assumeEnabled();
+    LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
+        LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
+    IrisFinalShaderProgram program =
+        IrisFinalShaderProgram.fromProgramBuilderGraphics(
+            "centerDepthSmooth",
+            """
+            #version 150 core
+            in vec3 iris_Position;
+            uniform mat4 projection;
+            void main() {
+              gl_Position = projection * vec4(iris_Position, 1.0);
+            }
+            """,
+            null,
+            """
+            #version 150 core
+            uniform sampler2D depth;
+            uniform sampler2D altDepth;
+            uniform float lastFrameTime;
+            uniform float decay;
+            out float iris_fragColor;
+            void main() {
+              float currentDepth = texture(depth, vec2(0.5)).r;
+              float decay2 = 1.0 - exp(-decay * lastFrameTime);
+              float oldDepth = texture(altDepth, vec2(0.5)).r;
+              if (isnan(oldDepth)) {
+                oldDepth = currentDepth;
+              }
+              iris_fragColor = mix(oldDepth, currentDepth, decay2);
+            }
+            """);
+
+    IrisShaderTranslation translation = backend.translate(program);
+
+    assertStage(translation.stage(IrisShaderStage.VERTEX), "vertex");
+    assertStage(translation.stage(IrisShaderStage.FRAGMENT), "fragment");
+  }
+
   private static void assumeEnabled() {
     Assumptions.assumeTrue(Boolean.getBoolean(ENABLED_PROPERTY)
             || "1".equals(System.getenv(ENABLED_ENVIRONMENT)),

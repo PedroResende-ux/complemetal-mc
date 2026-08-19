@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Iris pipeline-state milestone
+
+- Capture generation-safe Iris program, framebuffer and texture identities,
+  final vertex layouts, attachment formats, MRT blend/color-mask state,
+  depth/stencil/raster/multisample state, primitive topology and SPIR-V
+  specialization constants without replacing Iris' OpenGL draws.
+- Persist integrity-checked, content-addressed pipeline-state manifests while
+  keeping generated Metal execution explicitly pending and fail-open.
+- Model OpenGL line loops and triangle fans as complete states with explicit
+  index-expansion blockers for the later selective-cutover stage.
+- Extend exact-JAR QA through Overworld, Nether, End and back to Overworld,
+  plus Iris off/on reloads. Complementary Reimagined r5.8.1 passed Metal 4
+  and forced Metal 3 cold/warm runs with 231 programs, 462 stages, 185 mapped
+  variants, 90 per-run state identities, and zero incomplete, unsupported or
+  failed mappings.
+
+### Boundary
+
+- Iris still owns every visible shader-pack draw. Twelve observed topology
+  variants remain deliberately execution-blocked until index expansion is
+  implemented and validated. No FPS claim is made at this stage.
+
 ## 0.3.0-alpha.1+mc26.2
 
 ### Iris Metal compiler milestone

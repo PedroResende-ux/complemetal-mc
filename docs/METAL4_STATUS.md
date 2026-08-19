@@ -48,6 +48,19 @@ archive, command encoder or Iris draw. Exact-JAR cold/warm tests passed 152 of
 Iris/OpenGL. The next roadmap target is complete Iris pipeline-state capture,
 not a renderer cutover.
 
+## Stage 3 Iris pipeline-state milestone
+
+The development branch now captures and content-keys the complete pipeline
+state observed for registered Iris programs. The exact-JAR acceptance route
+passed Metal 4 and forced Metal 3 cold/warm runs with 231 programs, 462
+Apple-compiled MSL stages, 185 mapped variants and zero incomplete,
+unsupported or failed state mappings. The final four runs produced the same
+90-entry per-run state digest.
+
+This remains metadata capture, not MTL4 draw encoding. Twelve observed
+line-loop or triangle-fan variants carry explicit index-expansion blockers and
+continue through Iris/OpenGL. Resource binding is the next ordered gate.
+
 Late native encode or presentation failures fall back on the following frame;
 Minecraft cannot replay vanilla submissions already skipped in the in-flight
 frame. One incomplete in-flight frame therefore remains a documented recovery

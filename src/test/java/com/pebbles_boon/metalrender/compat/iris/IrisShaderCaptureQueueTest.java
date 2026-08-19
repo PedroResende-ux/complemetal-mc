@@ -26,7 +26,14 @@ final class IrisShaderCaptureQueueTest {
     assertEquals(3, queue.size());
     assertEquals(1, queue.rejectedPrograms());
 
-    assertEquals("first", queue.poll().orElseThrow().program().programName());
+    IrisShaderCaptureQueue.CapturedProgram firstCapture =
+        queue.poll().orElseThrow();
+    assertEquals("first", firstCapture.program().programName());
+    assertFalse(firstCapture.duplicate());
+    IrisShaderCaptureQueue.CapturedProgram duplicate =
+        queue.poll().orElseThrow();
+    assertEquals("first", duplicate.program().programName());
+    assertTrue(duplicate.duplicate());
     assertEquals("second", queue.poll().orElseThrow().program().programName());
     assertFalse(queue.poll().isPresent());
     assertEquals(IrisShaderCaptureQueue.Disposition.ACCEPTED,

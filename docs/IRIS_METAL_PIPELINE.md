@@ -41,7 +41,7 @@ intentionally opt-in and fail-open:
 | Content-addressed SPIR-V/MSL cache | Experimental |
 | Persist original shader-pack GLSL | Prohibited |
 | Compile generated MSL into an ephemeral Metal library | Implemented as opt-in validation in `0.3.0-alpha.1+mc26.2` |
-| Capture Iris framebuffer, blend, depth and vertex state | Pending |
+| Capture Iris framebuffer, blend, depth and vertex state | Implemented and exact-JAR validated |
 | Reflect and bind Iris uniforms, samplers, images and buffers | Pending |
 | Reproduce the Iris shadow/composite render graph on Metal | Pending |
 | Create and load device-specific MTL4 pipeline archives | Pending |

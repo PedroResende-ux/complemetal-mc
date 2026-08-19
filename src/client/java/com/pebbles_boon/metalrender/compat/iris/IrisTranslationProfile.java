@@ -13,8 +13,9 @@ public record IrisTranslationProfile(String canonicalValue) {
   public static final IrisTranslationProfile
       LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS =
       new IrisTranslationProfile(
-          "metalrender-translator=3;lwjgl=3.4.1;shaderc-source=glsl;"
+          "metalrender-translator=4;lwjgl=3.4.1;shaderc-source=glsl;"
               + "shaderc-env=opengl4.5;spirv=1.0;"
+              + "glsl-version-floor=330;"
               + "optimization=performance;auto-bind-uniforms=true;"
               + "auto-map-locations=true;entry=main;spvc=3.4.1;"
               + "msl-platform=macos;msl=3.0;argument-buffers=true;"

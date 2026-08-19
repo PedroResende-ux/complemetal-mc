@@ -219,6 +219,42 @@ public final class MetalRenderCommands {
         } else {
             msg(src, "§7Iris MSL library validation: §7Disabled");
         }
+        msg(src, "§7Iris pipeline-state capture: "
+                + (irisTranslation.pipelineStateCaptureComplete()
+                    ? "§aComplete" : "§eCollecting/fallback")
+                + " §7(draws=" + irisTranslation.pipelineDrawsObserved()
+                + ", dispatches="
+                + irisTranslation.pipelineDispatchesObserved()
+                + ", variants="
+                + irisTranslation.pipelineVariantsAccepted()
+                + ", mapped="
+                + irisTranslation.pipelineStatesSucceeded()
+                + ", unsupported="
+                + irisTranslation.pipelineStatesUnsupported()
+                + ", incomplete="
+                + irisTranslation.pipelineIncompleteVariants()
+                + ", pending="
+                + irisTranslation.pipelineStatesPending() + ")");
+        msg(src, "§7Iris pipeline-state digest: §f"
+                + irisTranslation.pipelineStateSetSha256() + " §7("
+                + (irisTranslation.pipelineStateSetComplete()
+                    ? "complete" : "incomplete") + ")");
+        msg(src, "§7Iris pipeline-state unsupported reasons: §f"
+                + (irisTranslation.pipelineStateUnsupportedReasonSummary()
+                    .isEmpty()
+                    ? "none"
+                    : irisTranslation
+                        .pipelineStateUnsupportedReasonSummary())
+                + " §7(count="
+                + irisTranslation.pipelineStateUnsupportedReasonCount()
+                + ", digest="
+                + irisTranslation
+                    .pipelineStateUnsupportedReasonSetSha256()
+                + ", "
+                + (irisTranslation
+                    .pipelineStateUnsupportedReasonSetComplete()
+                    ? "complete" : "truncated")
+                + ")");
         if (irisTranslation.running()) {
             msg(src,
                     "§7Iris Metal execution: §ePending; pipeline.status=pending; Iris OpenGL active");

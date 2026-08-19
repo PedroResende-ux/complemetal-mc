@@ -35,8 +35,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
   private static final int STARTUP_TIMEOUT_TICKS = 1_800;
   private static final int WORLD_TIMEOUT_TICKS = 3_600;
   private static final int SHADER_TIMEOUT_TICKS = 3_600;
-  private static final long EXPECTED_COMPLEMENTARY_PROGRAMS = 76;
-  private static final long EXPECTED_COMPLEMENTARY_STAGES = 152;
+  private static final long EXPECTED_COMPLEMENTARY_PROGRAMS = 231;
+  private static final long EXPECTED_COMPLEMENTARY_STAGES = 462;
 
   @Override
   public void runTest(ClientGameTestContext context) {
@@ -153,6 +153,11 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "Iris loaded " + Iris.getCurrentPackName()
               + " instead of " + expectedShaderPack);
       context.waitFor(client -> irisOwnsRenderGraph(), WORLD_TIMEOUT_TICKS);
+      singleplayer.getServer().runCommand("gamemode spectator @a");
+      visitDimension(singleplayer, context, "minecraft:the_nether", 82);
+      visitDimension(singleplayer, context, "minecraft:the_end", 82);
+      visitDimension(singleplayer, context, "minecraft:overworld", 102);
+      singleplayer.getServer().runCommand("gamemode creative @a");
       RendererSnapshot initialIrisStart = snapshot(context);
       context.waitTicks(120);
       long initialScreenshotCapture = screenshotCaptureCount(context);
@@ -229,26 +234,34 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
 
       VisualMetrics visualMetrics =
           analyzeScreenshots(shadersOn, shadersOff, shadersReenabled);
+      context.waitTicks(100);
+      IrisTranslationCoordinator.Status earlyPipelineStatus =
+          context.computeOnClient(
+              client -> IrisTranslationCoordinator.status());
+      System.out.println("[MetalRender exact-JAR early pipeline] accepted="
+          + earlyPipelineStatus.pipelineVariantsAccepted()
+          + ", pending=" + earlyPipelineStatus.pipelineStatesPending()
+          + ", attempted=" + earlyPipelineStatus.pipelineStatesAttempted()
+          + ", succeeded=" + earlyPipelineStatus.pipelineStatesSucceeded()
+          + ", unsupported="
+          + earlyPipelineStatus.pipelineStatesUnsupported()
+          + ", failed=" + earlyPipelineStatus.pipelineStatesFailed()
+          + ", incomplete="
+          + earlyPipelineStatus.pipelineIncompleteVariants()
+          + ", lastFailure="
+          + earlyPipelineStatus.pipelineStateLastFailure());
       context.waitFor(client -> {
         IrisTranslationCoordinator.Status status =
             IrisTranslationCoordinator.status();
         return status.running() && status.queued() == 0
-            && status.attempted() == EXPECTED_COMPLEMENTARY_PROGRAMS
             && status.libraryValidationEnabled()
             && status.libraryValidationReady()
             && status.libraryValidationComplete()
-            && status.libraryProgramsAttempted()
-                == EXPECTED_COMPLEMENTARY_PROGRAMS
-            && status.libraryProgramsSucceeded()
-                == EXPECTED_COMPLEMENTARY_PROGRAMS
-            && status.libraryStagesAttempted()
-                == EXPECTED_COMPLEMENTARY_STAGES
-            && status.libraryStagesSucceeded()
-                == EXPECTED_COMPLEMENTARY_STAGES
             && status.compiledArtifactSetComplete()
             && status.libraryStagesPending() == 0
             && status.libraryStagesInFlight() == 0;
       }, SHADER_TIMEOUT_TICKS);
+      context.waitTicks(100);
       IrisTranslationCoordinator.Status translationStatus =
           context.computeOnClient(
               client -> IrisTranslationCoordinator.status());
@@ -290,6 +303,24 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
                   && translationStatus.translated() == 0),
           "warm-cache run did not reuse every captured program");
       requireMslLibraryValidation(translationStatus, cacheExpectation);
+      System.out.println("[MetalRender exact-JAR] programs="
+          + translationStatus.attempted() + ", stages="
+          + translationStatus.libraryStagesAttempted()
+          + ", pipelineDraws="
+          + translationStatus.pipelineDrawsObserved()
+          + ", pipelineDispatches="
+          + translationStatus.pipelineDispatchesObserved()
+          + ", pipelineVariants="
+          + translationStatus.pipelineVariantsAccepted()
+          + ", pipelineMapped="
+          + translationStatus.pipelineStatesSucceeded()
+          + ", pipelineUnsupported="
+          + translationStatus.pipelineStatesUnsupported()
+          + ", pipelineIncomplete="
+          + translationStatus.pipelineIncompleteVariants()
+          + ", pipelineLastFailure="
+          + translationStatus.pipelineStateLastFailure());
+      requirePipelineStateCapture(translationStatus);
       context.runOnClient(client -> NativeBridge.nFlushFrames());
       NativeFaultCounters nativeFaultEnd =
           context.computeOnClient(client -> nativeFaultCounters());
@@ -304,6 +335,67 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           cacheExpectation, backendExpectation, nativeFaultBaseline,
           nativeFaultEnd, nativeFaultDelta);
     }
+  }
+
+  private static void visitDimension(TestSingleplayerContext singleplayer,
+      ClientGameTestContext context, String dimension, int y) {
+    singleplayer.getServer().runCommand("execute as @a in " + dimension
+        + " run tp @s 0 " + y + " 0");
+    context.waitFor(client -> client.level != null
+        && client.level.dimension().identifier().toString().equals(dimension),
+        WORLD_TIMEOUT_TICKS);
+    context.waitFor(client -> IrisApi.getInstance().isShaderPackInUse(),
+        SHADER_TIMEOUT_TICKS);
+    context.waitFor(client -> irisOwnsRenderGraph(), WORLD_TIMEOUT_TICKS);
+    singleplayer.getServer().runCommand("execute in " + dimension
+        + " run setblock 0 " + (y - 2) + " 0 minecraft:stone");
+    context.waitTicks(60);
+  }
+
+  private static void requirePipelineStateCapture(
+      IrisTranslationCoordinator.Status status) {
+    require(status.pipelineDrawsObserved() > 0,
+        "no registered Iris draw was observed");
+    require(status.pipelineDispatchesObserved() >= 0,
+        "Iris compute dispatch counter is invalid");
+    require(status.pipelineVariantsAccepted() > 0,
+        "no Iris pipeline-state variant was accepted");
+    require(status.pipelineVariantsRejected() == 0,
+        "Iris pipeline-state queue rejected variants: "
+            + status.pipelineVariantsRejected());
+    require(status.pipelineIncompleteVariants() == 0,
+        "Iris pipeline-state capture observed incomplete variants: "
+            + status.pipelineIncompleteVariants());
+    require(status.pipelineStatesPending() == 0,
+        "Iris pipeline-state queue did not drain");
+    require(status.pipelineStatesAttempted()
+            == status.pipelineVariantsAccepted(),
+        "Iris pipeline-state attempts do not cover every accepted variant");
+    require(status.pipelineStatesSucceeded()
+            == status.pipelineStatesAttempted(),
+        "not every Iris pipeline-state variant produced a verified key: "
+            + status.pipelineStatesSucceeded() + "/"
+            + status.pipelineStatesAttempted());
+    require(status.pipelineStatesUnsupported() == 0,
+        "Iris pipeline-state mapping reported unsupported variants: "
+            + status.pipelineStatesUnsupported() + " ("
+            + status.pipelineStateLastFailure() + ")");
+    require(status.pipelineStatesFailed() == 0,
+        "Iris pipeline-state mapping failed: "
+            + status.pipelineStatesFailed() + " ("
+            + status.pipelineStateLastFailure() + ")");
+    require(status.pipelineStatesExecutionBlocked()
+            <= status.pipelineStatesSucceeded(),
+        "Metal execution blocker count exceeds captured states: "
+            + status.pipelineStatesExecutionBlocked() + "/"
+            + status.pipelineStatesSucceeded());
+    require(status.pipelineStateSetComplete(),
+        "pipeline-state identity set exceeded its verified bound");
+    require(status.pipelineStateSetSha256().matches("[0-9a-f]{64}"),
+        "pipeline-state digest is invalid: "
+            + status.pipelineStateSetSha256());
+    require(status.pipelineStateCaptureComplete(),
+        "Iris pipeline-state capture gate is incomplete");
   }
 
   private static void requireMslLibraryValidation(
@@ -552,7 +644,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         .getMetadata().getVersion().getFriendlyString();
     String json = String.format(Locale.ROOT, """
         {
-          "schemaVersion": 3,
+          "schemaVersion": 4,
           "status": "PASS",
           "environment": "production-fabric",
           "javaMajor": 25,
@@ -580,6 +672,12 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "shaderPackInitiallyLoaded": true,
           "shaderPackDisabledAndApplied": true,
           "shaderPackReenabledAndApplied": true,
+          "dimensionRoute": [
+            "minecraft:overworld",
+            "minecraft:the_nether",
+            "minecraft:the_end",
+            "minecraft:overworld"
+          ],
           "frameCount": %d,
           "metalFramesWhileShaderPackDisabled": %d,
           "successfulPresentationsWhileShaderPackDisabled": %d,
@@ -593,6 +691,31 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             "captureFailures": %d,
             "queuedAtEvidence": %d,
             "pipelineStatus": "pending"
+          },
+          "irisPipelineStateCapture": {
+            "complete": %s,
+            "drawsObserved": %d,
+            "dispatchesObserved": %d,
+            "variantsAccepted": %d,
+            "variantsRejected": %d,
+            "incompleteVariants": %d,
+            "statesPending": %d,
+            "statesAttempted": %d,
+            "statesSucceeded": %d,
+            "cacheHits": %d,
+            "statesUnsupported": %d,
+            "unsupportedReasonCount": %d,
+            "unsupportedReasonSetComplete": %s,
+            "unsupportedReasonSetSha256": %s,
+            "unsupportedReasonSummary": %s,
+            "statesFailed": %d,
+            "executionBlocked": %d,
+            "stateIdentityCount": %d,
+            "stateSetSha256": %s,
+            "stateSetComplete": %s,
+            "lastFailure": %s,
+            "pipelineStatus": "pending",
+            "irisOpenGlActive": true
           },
           "generatedMslLibraryValidation": {
             "enabled": %s,
@@ -679,6 +802,28 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         translationStatus.rejected(),
         translationStatus.captureFailures(),
         translationStatus.queued(),
+        Boolean.toString(translationStatus.pipelineStateCaptureComplete()),
+        translationStatus.pipelineDrawsObserved(),
+        translationStatus.pipelineDispatchesObserved(),
+        translationStatus.pipelineVariantsAccepted(),
+        translationStatus.pipelineVariantsRejected(),
+        translationStatus.pipelineIncompleteVariants(),
+        translationStatus.pipelineStatesPending(),
+        translationStatus.pipelineStatesAttempted(),
+        translationStatus.pipelineStatesSucceeded(),
+        translationStatus.pipelineStateCacheHits(),
+        translationStatus.pipelineStatesUnsupported(),
+        translationStatus.pipelineStateUnsupportedReasonCount(),
+        Boolean.toString(
+            translationStatus.pipelineStateUnsupportedReasonSetComplete()),
+        quote(translationStatus.pipelineStateUnsupportedReasonSetSha256()),
+        quote(translationStatus.pipelineStateUnsupportedReasonSummary()),
+        translationStatus.pipelineStatesFailed(),
+        translationStatus.pipelineStatesExecutionBlocked(),
+        translationStatus.pipelineStateIdentityCount(),
+        quote(translationStatus.pipelineStateSetSha256()),
+        Boolean.toString(translationStatus.pipelineStateSetComplete()),
+        quote(translationStatus.pipelineStateLastFailure()),
         Boolean.toString(translationStatus.libraryValidationEnabled()),
         Boolean.toString(translationStatus.libraryValidationReady()),
         Boolean.toString(translationStatus.libraryValidationComplete()),

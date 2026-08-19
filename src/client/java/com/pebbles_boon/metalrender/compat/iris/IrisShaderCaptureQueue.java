@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * queue.</p>
  */
 public final class IrisShaderCaptureQueue {
-  public static final int DEFAULT_CAPACITY = 128;
+  public static final int DEFAULT_CAPACITY = 512;
   public static final long DEFAULT_MAX_PROGRAM_CHARS = 4L * 1024L * 1024L;
   public static final long DEFAULT_MAX_QUEUED_CHARS = 32L * 1024L * 1024L;
 
@@ -24,7 +24,7 @@ public final class IrisShaderCaptureQueue {
   private final long maxQueuedChars;
   private final int recentKeyCapacity;
   private final IrisTranslationProfile profile;
-  private final ConcurrentLinkedQueue<IrisFinalShaderProgram> queue =
+  private final ConcurrentLinkedQueue<Submission> queue =
       new ConcurrentLinkedQueue<>();
   private final AtomicInteger queuedPrograms = new AtomicInteger();
   private final AtomicLong queuedChars = new AtomicLong();
@@ -65,6 +65,17 @@ public final class IrisShaderCaptureQueue {
    * deduplicate, execute tools, touch disk, or wait for a consumer.
    */
   public Offer offer(IrisFinalShaderProgram program) {
+    return offer(program, null);
+  }
+
+  /**
+   * Enqueues one generation-specific program association. Duplicate shader
+   * contents are still returned to the worker so a reload can resolve its new
+   * OpenGL program generation; the {@link CapturedProgram#duplicate()} flag
+   * prevents redundant translation work.
+   */
+  public Offer offer(IrisFinalShaderProgram program,
+      IrisProgramIdentityRegistry.Registration registration) {
     Objects.requireNonNull(program, "program");
     // Rejected attempts still mean Iris is actively linking a pack. Extending
     // the quiet period prevents the consumer from competing with the rest of
@@ -86,7 +97,7 @@ public final class IrisShaderCaptureQueue {
       return new Offer(Disposition.FULL);
     }
 
-    queue.offer(program);
+    queue.offer(new Submission(program, registration));
     return new Offer(Disposition.ACCEPTED);
   }
 
@@ -95,23 +106,24 @@ public final class IrisShaderCaptureQueue {
    * Iris' link thread.
    */
   public Optional<CapturedProgram> poll() {
-    while (true) {
-      IrisFinalShaderProgram program = queue.poll();
-      if (program == null) {
-        return Optional.empty();
-      }
-      queuedPrograms.decrementAndGet();
-      queuedChars.addAndGet(-program.retainedChars());
+    Submission submission = queue.poll();
+    if (submission == null) {
+      return Optional.empty();
+    }
+    IrisFinalShaderProgram program = submission.program();
+    queuedPrograms.decrementAndGet();
+    queuedChars.addAndGet(-program.retainedChars());
 
-      IrisShaderCacheKey key = IrisShaderCacheKey.from(program, profile);
-      synchronized (recentKeys) {
-        if (recentKeys.containsKey(key)) {
-          continue;
-        }
+    IrisShaderCacheKey key = IrisShaderCacheKey.from(program, profile);
+    boolean duplicate;
+    synchronized (recentKeys) {
+      duplicate = recentKeys.containsKey(key);
+      if (!duplicate) {
         remember(key);
       }
-      return Optional.of(new CapturedProgram(key, program));
     }
+    return Optional.of(new CapturedProgram(key, program,
+        Optional.ofNullable(submission.registration()), duplicate));
   }
 
   public int size() {
@@ -167,11 +179,20 @@ public final class IrisShaderCaptureQueue {
     }
   }
 
+  private record Submission(IrisFinalShaderProgram program,
+                            IrisProgramIdentityRegistry.Registration
+                                registration) {
+  }
+
   public record CapturedProgram(IrisShaderCacheKey key,
-                                IrisFinalShaderProgram program) {
+                                IrisFinalShaderProgram program,
+                                Optional<IrisProgramIdentityRegistry.Registration>
+                                    registration,
+                                boolean duplicate) {
     public CapturedProgram {
       Objects.requireNonNull(key, "key");
       Objects.requireNonNull(program, "program");
+      Objects.requireNonNull(registration, "registration");
     }
   }
 }
