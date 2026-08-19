@@ -144,6 +144,14 @@ public final class LwjglShadercSpvcBackend
           shaderc_target_env_opengl, shaderc_env_version_opengl_4_5);
       Shaderc.shaderc_compile_options_set_target_spirv(options,
           shaderc_spirv_version_1_0);
+      /*
+       * Resource names are part of the GL-to-Metal binding bridge. They are
+       * deliberately retained in SPIR-V so reflected resources can be matched
+       * to the uniform/block names observed at the live Iris OpenGL boundary.
+       * They are diagnostics/ABI metadata only and never enter the semantic
+       * resource-layout identity.
+       */
+      Shaderc.shaderc_compile_options_set_generate_debug_info(options);
       Shaderc.shaderc_compile_options_set_optimization_level(options,
           shaderc_optimization_level_performance);
       Shaderc.shaderc_compile_options_set_auto_bind_uniforms(options, true);

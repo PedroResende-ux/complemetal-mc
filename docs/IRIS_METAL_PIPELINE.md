@@ -42,7 +42,7 @@ intentionally opt-in and fail-open:
 | Persist original shader-pack GLSL | Prohibited |
 | Compile generated MSL into an ephemeral Metal library | Implemented as opt-in validation in `0.3.0-alpha.1+mc26.2` |
 | Capture Iris framebuffer, blend, depth and vertex state | Implemented and exact-JAR validated |
-| Reflect and bind Iris uniforms, samplers, images and buffers | Pending |
+| Reflect and bind Iris uniforms, samplers, images and buffers | Implemented and exact-JAR validated |
 | Reproduce the Iris shadow/composite render graph on Metal | Pending |
 | Create and load device-specific MTL4 pipeline archives | Pending |
 | Execute Iris shader-pack draws through Metal | Pending |
@@ -52,6 +52,21 @@ translation failures, cache failures and missing LWJGL native modules are
 contained in the background path; Iris continues with its normal renderer.
 Geometry shaders are not advertised as supported because Metal has no direct
 geometry-shader stage.
+
+Stage 4 retains resource names in optimized SPIR-V as non-semantic ABI
+metadata. Uniform-block interface names are distinguished from GLSL instance
+names, and neither form participates in the content identity. The live bridge
+tracks direct Iris, Sodium and Mojang GL paths, including `glBindBufferRange`
+offset/size and `GL_TEXTURE_BUFFER` backing storage. Missing names, locations,
+textures or buffers reject that pipeline variant rather than inventing a
+binding.
+
+The final Stage 4 exact-JAR matrix reflected 6,248 declarations from 462
+stages in 231 linked programs. All observed pipeline variants resolved their
+runtime resource sets in Metal 4 cold/warm and forced Metal 3 cold/warm runs,
+with zero incomplete variants. This proves resource capture for that exact
+workload; it still does not create a Metal pipeline, reproduce pass ordering
+or execute generated MSL.
 
 The Stage 2 validator accepts at most 16 MiB of verified MSL per stage. It
 requires argument-buffer tier 2, compiles an executable MSL 3.0 library with

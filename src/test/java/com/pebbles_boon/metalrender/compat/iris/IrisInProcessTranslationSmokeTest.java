@@ -7,6 +7,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Set;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
@@ -164,6 +166,49 @@ final class IrisInProcessTranslationSmokeTest {
     assertStage(translation.stage(IrisShaderStage.FRAGMENT), "fragment");
   }
 
+  @Test
+  void retainsResourceNamesNeededByTheRuntimeBindingBridge()
+      throws Exception {
+    assumeEnabled();
+    LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
+        LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
+    IrisFinalShaderProgram program =
+        IrisFinalShaderProgram.fromGraphicsLink("resource-name-smoke",
+            """
+            #version 450
+            layout(std140) uniform CameraData {
+              mat4 projection;
+            } cameraData;
+            void main() {
+              gl_Position = cameraData.projection * vec4(0.0, 0.0, 0.0, 1.0);
+            }
+            """,
+            null, null, null,
+            """
+            #version 450
+            uniform sampler2D albedoSampler;
+            uniform float exposure;
+            layout(location = 0) out vec4 outColor;
+            void main() {
+              outColor = texture(albedoSampler, vec2(0.5)) * exposure;
+            }
+            """);
+
+    IrisShaderTranslation translation = backend.translate(program);
+    IrisSpirvResourceLayout vertex = reflect(
+        translation.stage(IrisShaderStage.VERTEX).spirv());
+    IrisSpirvResourceLayout fragment = reflect(
+        translation.stage(IrisShaderStage.FRAGMENT).spirv());
+
+    assertTrue(vertex.diagnosticNamesComplete());
+    assertTrue(fragment.diagnosticNamesComplete());
+    assertTrue(names(vertex).contains("CameraData"), names(vertex).toString());
+    assertTrue(names(fragment).contains("albedoSampler"),
+        names(fragment).toString());
+    assertTrue(names(fragment).contains("exposure"),
+        names(fragment).toString());
+  }
+
   private static void assumeEnabled() {
     Assumptions.assumeTrue(Boolean.getBoolean(ENABLED_PROPERTY)
             || "1".equals(System.getenv(ENABLED_ENVIRONMENT)),
@@ -181,5 +226,17 @@ final class IrisInProcessTranslationSmokeTest {
     assertTrue(artifacts.msl().contains(mslStage));
     assertTrue(artifacts.msl().matches(
         "(?s).*\\bmain\\w*\\s*\\(.*"));
+  }
+
+  private static IrisSpirvResourceLayout reflect(byte[] spirv) {
+    IrisSpirvResourceReflector.ReflectionResult reflected =
+        IrisSpirvResourceReflector.reflect(spirv);
+    assertTrue(reflected.successful(), reflected.detail());
+    return reflected.layout().orElseThrow();
+  }
+
+  private static Set<String> names(IrisSpirvResourceLayout layout) {
+    return layout.diagnosticNames().values().stream()
+        .collect(Collectors.toUnmodifiableSet());
   }
 }

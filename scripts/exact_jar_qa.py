@@ -841,6 +841,44 @@ def pipeline_state_capture_is_complete(value: Any) -> bool:
     )
 
 
+def resource_reflection_is_complete(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return (
+        value.get("complete") is True
+        and value.get("programsAttempted") == EXPECTED_COMPLEMENTARY_PROGRAMS
+        and value.get("programsSucceeded") == EXPECTED_COMPLEMENTARY_PROGRAMS
+        and value.get("programsUnsupported") == 0
+        and value.get("programsFailed") == 0
+        and value.get("stagesReflected") == EXPECTED_COMPLEMENTARY_STAGES
+        and type(value.get("bindingsReflected")) is int
+        and value.get("bindingsReflected", 0) > 0
+        and value.get("layoutIdentityCount")
+            == EXPECTED_COMPLEMENTARY_PROGRAMS
+        and value.get("layoutSetComplete") is True
+        and isinstance(value.get("layoutSetSha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["layoutSetSha256"])
+            is not None
+        and value.get("lastFailure") == ""
+        and type(value.get("bindingVariantsAttempted")) is int
+        and value.get("bindingVariantsAttempted", 0) > 0
+        and value.get("bindingVariantsSucceeded")
+            == value.get("bindingVariantsAttempted")
+        and value.get("bindingVariantsIncomplete") == 0
+        and type(value.get("runtimeBindingsMatched")) is int
+        and value.get("runtimeBindingsMatched", 0) > 0
+        and value.get("bindingIncompleteReasonCount") == 0
+        and value.get("bindingIncompleteReasonSetComplete") is True
+        and isinstance(value.get("bindingIncompleteReasonSetSha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            value["bindingIncompleteReasonSetSha256"],
+        ) is not None
+        and value.get("bindingIncompleteReasonSummary") == ""
+        and value.get("runtimeBindingsCaptured") is True
+    )
+
+
 def iris_runtime_ownership_check_passed(value: Any) -> bool:
     return (
         isinstance(value, dict)
@@ -927,13 +965,14 @@ def driver_identity_matches_manifest(
         "generatedMslLibraryValidation")
     pipeline_state_capture = driver_result.get(
         "irisPipelineStateCapture")
+    resource_reflection = driver_result.get("irisResourceReflection")
     iris_runtime_ownership = driver_result.get("irisRuntimeOwnership")
     generated_msl_boundary = driver_result.get(
         "generatedMslExecutionBoundary")
     if not isinstance(iris_translation, dict):
         return False
     return (
-        driver_result.get("schemaVersion") == 4
+        driver_result.get("schemaVersion") == 5
         and driver_result.get("status") == "PASS"
         and actual_path == expected_path
         and driver_result.get("exactJarSha256") == release.get("sha256")
@@ -955,6 +994,7 @@ def driver_identity_matches_manifest(
             "minecraft:the_end", "minecraft:overworld",
         ]
         and pipeline_state_capture_is_complete(pipeline_state_capture)
+        and resource_reflection_is_complete(resource_reflection)
         and msl_library_validation_is_safe(msl_library_validation)
         and isinstance(native_faults, dict)
         and native_faults.get("semantics")

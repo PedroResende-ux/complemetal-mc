@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Iris resource-binding milestone
+
+- Retain optimized SPIR-V resource names as non-semantic ABI metadata and
+  reflect complete uniform, sampler, image, UBO and SSBO layouts without
+  allowing names or compiler IDs to affect content identity.
+- Capture direct Iris, Sodium and Mojang OpenGL resource paths, including UBO
+  block indices, exact buffer ranges and texture-buffer backing storage.
+- Resolve each observed pipeline variant fail-closed against the live runtime
+  bindings while Iris/OpenGL remains the visible renderer.
+- Pass packaged-JAR Metal 4 and forced Metal 3 cold/warm validation with 231
+  programs, 462 stages, 6,248 reflected resources, 231 layout identities and
+  zero incomplete binding variants.
+
 ### Iris pipeline-state milestone
 
 - Capture generation-safe Iris program, framebuffer and texture identities,

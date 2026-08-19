@@ -59,7 +59,22 @@ unsupported or failed state mappings. The final four runs produced the same
 
 This remains metadata capture, not MTL4 draw encoding. Twelve observed
 line-loop or triangle-fan variants carry explicit index-expansion blockers and
-continue through Iris/OpenGL. Resource binding is the next ordered gate.
+continue through Iris/OpenGL.
+
+## Stage 4 Iris resource-binding milestone
+
+The development branch now reflects verified SPIR-V into semantic resource
+layouts and joins them to the exact runtime bindings observed from Iris,
+Sodium and Mojang's OpenGL encoder. The bridge records uniform values,
+sampler/texture/image units, texture-buffer storage, UBO block bindings and
+buffer ranges, and SSBO binding points. Missing data remains fail-closed for
+the experimental candidate and fail-open to Iris/OpenGL.
+
+The exact packaged JAR passed Metal 4 and forced Metal 3 cold/warm runs with
+231 programs, 462 stages, 6,248 reflected declarations, 231 resource-layout
+identities and zero incomplete runtime binding variants. Generated MSL still
+does not create a pipeline or encode a draw; render-graph capture is the next
+gate.
 
 Late native encode or presentation failures fall back on the following frame;
 Minecraft cannot replay vanilla submissions already skipped in the in-flight

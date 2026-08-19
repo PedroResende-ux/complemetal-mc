@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender.compat.iris.mixin;
 
 import com.mojang.blaze3d.opengl.GlStateManager;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlStateTracker;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingTracker;
 import com.pebbles_boon.metalrender.compat.iris.IrisPipelineStateCapture;
 import com.pebbles_boon.metalrender.compat.iris.IrisShaderCapture;
 import org.spongepowered.asm.mixin.Mixin;
@@ -24,9 +25,26 @@ public abstract class IrisGlStateManagerMixin {
     return metalrender$capture().tracker();
   }
 
+  private static IrisGlResourceBindingTracker metalrender$resources() {
+    return IrisGlResourceBindingTracker.global();
+  }
+
   @Inject(method = "_glUseProgram", at = @At("TAIL"))
   private static void metalrender$useProgram(int program, CallbackInfo ci) {
     metalrender$capture().useProgram(program);
+  }
+
+  @Inject(method = "_glGetUniformLocation", at = @At("RETURN"))
+  private static void metalrender$uniformLocation(int program,
+      CharSequence name, CallbackInfoReturnable<Integer> callback) {
+    metalrender$resources().uniformLocation(program, name,
+        callback.getReturnValue());
+  }
+
+  @Inject(method = "_glUniform1i", at = @At("TAIL"))
+  private static void metalrender$uniform1i(int location, int value,
+      CallbackInfo ci) {
+    metalrender$resources().uniformInts(location, value);
   }
 
   @Inject(method = "glDeleteProgram", at = @At("TAIL"))
@@ -169,6 +187,16 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_deleteTexture", at = @At("TAIL"))
   private static void metalrender$deleteTexture(int texture, CallbackInfo ci) {
     metalrender$state().deleteTexture(texture);
+  }
+
+  @Inject(method = "_activeTexture", at = @At("TAIL"))
+  private static void metalrender$activeTexture(int texture, CallbackInfo ci) {
+    metalrender$resources().activeTexture(texture);
+  }
+
+  @Inject(method = "_bindTexture", at = @At("TAIL"))
+  private static void metalrender$bindTexture(int texture, CallbackInfo ci) {
+    metalrender$resources().bindTexture(texture);
   }
 
   @Inject(method = "_drawElements", at = @At("HEAD"))

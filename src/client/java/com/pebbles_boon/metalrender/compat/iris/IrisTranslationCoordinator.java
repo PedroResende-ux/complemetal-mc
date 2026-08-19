@@ -9,6 +9,7 @@ import java.util.HexFormat;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -53,6 +54,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   private final IrisPipelineStateCapture pipelineStateCapture;
   private final IrisPipelineStateCache pipelineStateCache;
   private final IrisSpecializationStateReader specializationStateReader;
+  private final IrisProgramResourceLayoutReader resourceLayoutReader;
   private final IrisMslLibraryValidator libraryValidator;
   private final boolean libraryValidationEnabled;
   private final ArrayBlockingQueue<LibraryStageJob> libraryStageQueue;
@@ -104,6 +106,31 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       new ConcurrentSkipListSet<>();
   private final AtomicBoolean pipelineStateSetComplete =
       new AtomicBoolean(true);
+  private final java.util.Set<String> resourceProgramsProcessed =
+      ConcurrentHashMap.newKeySet();
+  private final AtomicLong resourceProgramsAttempted = new AtomicLong();
+  private final AtomicLong resourceProgramsSucceeded = new AtomicLong();
+  private final AtomicLong resourceProgramsUnsupported = new AtomicLong();
+  private final AtomicLong resourceProgramsFailed = new AtomicLong();
+  private final AtomicLong resourceStagesReflected = new AtomicLong();
+  private final AtomicLong resourceBindingsReflected = new AtomicLong();
+  private final ConcurrentSkipListSet<String> resourceLayoutIdentityLines =
+      new ConcurrentSkipListSet<>();
+  private final ConcurrentHashMap<String, IrisProgramResourceLayout>
+      resourceLayouts = new ConcurrentHashMap<>();
+  private final AtomicBoolean resourceLayoutSetComplete =
+      new AtomicBoolean(true);
+  private final AtomicReference<String> resourceLayoutLastFailure =
+      new AtomicReference<>("");
+  private final AtomicLong resourceBindingVariantsAttempted =
+      new AtomicLong();
+  private final AtomicLong resourceBindingVariantsSucceeded =
+      new AtomicLong();
+  private final AtomicLong resourceBindingVariantsIncomplete =
+      new AtomicLong();
+  private final AtomicLong resourceBindingsMatched = new AtomicLong();
+  private final BoundedReasonSet resourceBindingIncompleteReasons =
+      new BoundedReasonSet(DEFAULT_PIPELINE_STATE_UNSUPPORTED_REASON_CAPACITY);
 
   IrisTranslationCoordinator(IrisShaderCaptureQueue captureQueue,
       IrisShaderTranslatorBackend backend, IrisPipelineCache cache,
@@ -156,6 +183,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     pipelineStateCapture = IrisPipelineStateCapture.global();
     pipelineStateCache = new IrisPipelineStateCache(cacheRoot);
     specializationStateReader = new IrisSpecializationStateReader(cache,
+        backend.profile());
+    resourceLayoutReader = new IrisProgramResourceLayoutReader(cache,
         backend.profile());
     this.libraryValidator = Objects.requireNonNull(
         libraryValidator, "libraryValidator");
@@ -257,7 +286,10 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           0, 0, 0, 0,
           0, true, emptyPipelineStateSetSha256(), "",
           0, 0, 0, true,
-          emptyPipelineStateSetSha256(), "");
+          emptyPipelineStateSetSha256(), "",
+          0, 0, 0, 0, 0, 0, 0, true,
+          emptyPipelineStateSetSha256(), "",
+          0, 0, 0, 0, 0, true, emptyPipelineStateSetSha256(), "");
     }
     return coordinator.snapshot();
   }
@@ -311,9 +343,11 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   }
 
   private void process(IrisShaderCaptureQueue.CapturedProgram captured) {
-    captured.registration().ifPresent(registration ->
-        IrisProgramIdentityRegistry.global().resolve(registration,
-            captured.key(), captured.program().sources().keySet()));
+    IrisProgramIdentityRegistry.ResolvedProgram resolved =
+        captured.registration().map(registration ->
+            IrisProgramIdentityRegistry.global().resolve(registration,
+                captured.key(), captured.program().sources().keySet()))
+            .orElse(null);
     if (captured.duplicate()) {
       return;
     }
@@ -337,6 +371,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         scheduleLibraryValidation(program,
             IrisShaderCacheKey.from(program, backend.profile()),
             backend.profile(), LibraryStageSource.CACHE);
+        reflectResourceLayout(resolved);
         return;
       }
       IrisShaderTranslation result = backend.translate(program);
@@ -353,8 +388,49 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         scheduleLibraryValidation(program, result.key(), result.profile(),
             LibraryStageSource.TRANSLATION);
       }
+      reflectResourceLayout(resolved);
     } catch (Exception | LinkageError error) {
       recordFailure(error, program);
+    }
+  }
+
+  private void reflectResourceLayout(
+      IrisProgramIdentityRegistry.ResolvedProgram program) {
+    if (program == null
+        || !resourceProgramsProcessed.add(program.shaderKey().sha256())) {
+      return;
+    }
+    resourceProgramsAttempted.incrementAndGet();
+    try {
+      IrisProgramResourceLayoutReader.Result result =
+          resourceLayoutReader.read(program);
+      if (result instanceof IrisProgramResourceLayoutReader.Unsupported
+          unsupported) {
+        resourceProgramsUnsupported.incrementAndGet();
+        resourceLayoutLastFailure.set(unsupported.reason());
+        return;
+      }
+      IrisProgramResourceLayout layout =
+          ((IrisProgramResourceLayoutReader.Complete) result).layout();
+      String identity = program.shaderKey().sha256() + '|'
+          + layout.key().sha256() + '\n';
+      if (resourceLayoutIdentityLines.size()
+          >= DEFAULT_PIPELINE_STATE_IDENTITY_CAPACITY
+          && !resourceLayoutIdentityLines.contains(identity)) {
+        resourceLayoutSetComplete.set(false);
+        resourceProgramsFailed.incrementAndGet();
+        resourceLayoutLastFailure.set(
+            "resource-layout-identity-capacity-exceeded");
+        return;
+      }
+      resourceLayoutIdentityLines.add(identity);
+      resourceStagesReflected.addAndGet(layout.stages().size());
+      resourceBindingsReflected.addAndGet(layout.resourceCount());
+      resourceLayouts.put(program.shaderKey().sha256(), layout);
+      resourceProgramsSucceeded.incrementAndGet();
+    } catch (Exception | LinkageError error) {
+      resourceProgramsFailed.incrementAndGet();
+      resourceLayoutLastFailure.set(redactedFailure(error));
     }
   }
 
@@ -403,11 +479,40 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         pipelineStatesExecutionBlocked.incrementAndGet();
       }
       retainPipelineStateIdentity(stored.verified());
+      resolveResourceBindings(program, captured.resourceBindings());
     } catch (Exception | LinkageError error) {
       pipelineStatesFailed.incrementAndGet();
       pipelineStateLastFailure.set(redactedFailure(error));
     }
     return true;
+  }
+
+  private void resolveResourceBindings(
+      IrisProgramIdentityRegistry.ResolvedProgram program,
+      IrisGlResourceBindingSnapshot snapshot) {
+    resourceBindingVariantsAttempted.incrementAndGet();
+    IrisProgramResourceLayout layout = resourceLayouts.get(
+        program.shaderKey().sha256());
+    if (layout == null) {
+      recordIncompleteResourceBindings("program-layout-unavailable");
+      return;
+    }
+    IrisResourceBindingResolver.Result result =
+        IrisResourceBindingResolver.resolve(layout, snapshot);
+    if (result instanceof IrisResourceBindingResolver.Incomplete incomplete) {
+      recordIncompleteResourceBindings(incomplete.reason());
+      return;
+    }
+    IrisResourceBindingResolver.Complete complete =
+        (IrisResourceBindingResolver.Complete) result;
+    resourceBindingsMatched.addAndGet(complete.matchedResources());
+    resourceBindingVariantsSucceeded.incrementAndGet();
+  }
+
+  private void recordIncompleteResourceBindings(String reason) {
+    resourceBindingVariantsIncomplete.incrementAndGet();
+    resourceBindingIncompleteReasons.add(reason);
+    resourceLayoutLastFailure.set(reason);
   }
 
   private void recordPipelineStateUnsupported(String reason) {
@@ -694,7 +799,28 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         pipelineStatesFailed.get(), pipelineStatesExecutionBlocked.get(),
         pipelineStateIdentityLines.size(),
         pipelineStateSetComplete.get(), pipelineStateSetSha256(),
-        pipelineStateLastFailure.get());
+        pipelineStateLastFailure.get(),
+        resourceProgramsAttempted.get(), resourceProgramsSucceeded.get(),
+        resourceProgramsUnsupported.get(), resourceProgramsFailed.get(),
+        resourceStagesReflected.get(), resourceBindingsReflected.get(),
+        resourceLayoutIdentityLines.size(),
+        resourceLayoutSetComplete.get(), resourceLayoutSetSha256(),
+        resourceLayoutLastFailure.get(),
+        resourceBindingVariantsAttempted.get(),
+        resourceBindingVariantsSucceeded.get(),
+        resourceBindingVariantsIncomplete.get(), resourceBindingsMatched.get(),
+        resourceBindingIncompleteReasons.size(),
+        resourceBindingIncompleteReasons.complete(),
+        resourceBindingIncompleteReasons.sha256(),
+        resourceBindingIncompleteReasons.summary());
+  }
+
+  private String resourceLayoutSetSha256() {
+    MessageDigest digest = newSha256();
+    for (String line : resourceLayoutIdentityLines) {
+      digest.update(line.getBytes(StandardCharsets.US_ASCII));
+    }
+    return HexFormat.of().formatHex(digest.digest());
   }
 
   private static String redactedFailure(Throwable error) {
@@ -821,7 +947,25 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
                        int pipelineStateIdentityCount,
                        boolean pipelineStateSetComplete,
                        String pipelineStateSetSha256,
-                       String pipelineStateLastFailure) {
+                       String pipelineStateLastFailure,
+                       long resourceProgramsAttempted,
+                       long resourceProgramsSucceeded,
+                       long resourceProgramsUnsupported,
+                       long resourceProgramsFailed,
+                       long resourceStagesReflected,
+                       long resourceBindingsReflected,
+                       int resourceLayoutIdentityCount,
+                       boolean resourceLayoutSetComplete,
+                       String resourceLayoutSetSha256,
+                       String resourceLayoutLastFailure,
+                       long resourceBindingVariantsAttempted,
+                       long resourceBindingVariantsSucceeded,
+                       long resourceBindingVariantsIncomplete,
+                       long resourceBindingsMatched,
+                       int resourceBindingIncompleteReasonCount,
+                       boolean resourceBindingIncompleteReasonSetComplete,
+                       String resourceBindingIncompleteReasonSetSha256,
+                       String resourceBindingIncompleteReasonSummary) {
     public Status {
       Objects.requireNonNull(cacheRoot, "cacheRoot");
       Objects.requireNonNull(lastFailure, "lastFailure");
@@ -837,6 +981,14 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           "pipelineStateUnsupportedReasonSetSha256");
       Objects.requireNonNull(pipelineStateUnsupportedReasonSummary,
           "pipelineStateUnsupportedReasonSummary");
+      Objects.requireNonNull(resourceLayoutSetSha256,
+          "resourceLayoutSetSha256");
+      Objects.requireNonNull(resourceLayoutLastFailure,
+          "resourceLayoutLastFailure");
+      Objects.requireNonNull(resourceBindingIncompleteReasonSetSha256,
+          "resourceBindingIncompleteReasonSetSha256");
+      Objects.requireNonNull(resourceBindingIncompleteReasonSummary,
+          "resourceBindingIncompleteReasonSummary");
     }
 
     /**
@@ -873,6 +1025,26 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           && pipelineStatesUnsupported == 0
           && pipelineStatesFailed == 0
           && pipelineStateSetComplete;
+    }
+
+    public boolean resourceReflectionComplete() {
+      return resourceProgramsAttempted > 0
+          && resourceProgramsAttempted == resourceProgramsSucceeded
+          && resourceProgramsUnsupported == 0
+          && resourceProgramsFailed == 0
+          && resourceStagesReflected > 0
+          && resourceLayoutIdentityCount == resourceProgramsSucceeded
+          && resourceLayoutSetComplete;
+    }
+
+    public boolean resourceBindingCaptureComplete() {
+      return resourceReflectionComplete()
+          && resourceBindingVariantsAttempted > 0
+          && resourceBindingVariantsAttempted
+              == resourceBindingVariantsSucceeded
+          && resourceBindingVariantsIncomplete == 0
+          && resourceBindingsMatched > 0
+          && resourceBindingIncompleteReasonSetComplete;
     }
   }
 

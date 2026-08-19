@@ -20,6 +20,7 @@ public final class IrisPipelineStateCapture {
           DEFAULT_RECENT_VARIANT_CAPACITY);
 
   private final IrisGlStateTracker tracker;
+  private final IrisGlResourceBindingTracker resourceBindings;
   private final IrisProgramIdentityRegistry identities;
   private final int queueCapacity;
   private final int recentVariantCapacity;
@@ -39,6 +40,7 @@ public final class IrisPipelineStateCapture {
       IrisProgramIdentityRegistry identities, int queueCapacity,
       int recentVariantCapacity) {
     this.tracker = Objects.requireNonNull(tracker, "tracker");
+    resourceBindings = IrisGlResourceBindingTracker.global();
     this.identities = Objects.requireNonNull(identities, "identities");
     if (queueCapacity <= 0 || recentVariantCapacity < queueCapacity) {
       throw new IllegalArgumentException("invalid pipeline capture bounds");
@@ -57,15 +59,18 @@ public final class IrisPipelineStateCapture {
 
   public void initializeOpenGlDefaults() {
     tracker.initializeOpenGlDefaults();
+    resourceBindings.initializeOpenGlDefaults();
     currentGlProgram = 0;
   }
 
   public void registerProgram(int glProgram) {
     tracker.registerProgram(glProgram);
+    resourceBindings.registerProgram(glProgram);
   }
 
   public void deleteProgram(int glProgram) {
     tracker.deleteProgram(glProgram);
+    resourceBindings.deleteProgram(glProgram);
     if (currentGlProgram == glProgram) {
       // OpenGL retains a deleted current program until unbound. Keep the
       // numeric binding so any final draw stays associated with its exact
@@ -76,6 +81,7 @@ public final class IrisPipelineStateCapture {
   public void useProgram(int glProgram) {
     currentGlProgram = glProgram;
     tracker.useProgram(glProgram);
+    resourceBindings.useProgram(glProgram);
   }
 
   public void draw(int primitiveMode) {
@@ -128,7 +134,8 @@ public final class IrisPipelineStateCapture {
     if (!snapshot.complete()) {
       incompleteVariants.incrementAndGet();
     }
-    queue.offer(new PendingState(registration, snapshot));
+    queue.offer(new PendingState(registration, snapshot,
+        resourceBindings.snapshot()));
     variantsAccepted.incrementAndGet();
   }
 
@@ -167,7 +174,8 @@ public final class IrisPipelineStateCapture {
 
   public record PendingState(
       IrisProgramIdentityRegistry.Registration registration,
-      IrisGlStateSnapshot snapshot) {
+      IrisGlStateSnapshot snapshot,
+      IrisGlResourceBindingSnapshot resourceBindings) {
     public PendingState {
       Objects.requireNonNull(registration, "registration");
       Objects.requireNonNull(snapshot, "snapshot");

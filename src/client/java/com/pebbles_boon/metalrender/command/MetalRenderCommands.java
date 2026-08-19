@@ -239,6 +239,33 @@ public final class MetalRenderCommands {
                 + irisTranslation.pipelineStateSetSha256() + " §7("
                 + (irisTranslation.pipelineStateSetComplete()
                     ? "complete" : "incomplete") + ")");
+        msg(src, "§7Iris resource reflection: "
+                + (irisTranslation.resourceReflectionComplete()
+                    ? "§aComplete" : "§eCollecting/fallback")
+                + " §7(programs="
+                + irisTranslation.resourceProgramsSucceeded() + "/"
+                + irisTranslation.resourceProgramsAttempted()
+                + ", stages="
+                + irisTranslation.resourceStagesReflected()
+                + ", bindings="
+                + irisTranslation.resourceBindingsReflected()
+                + ", unsupported="
+                + irisTranslation.resourceProgramsUnsupported() + ")");
+        msg(src, "§7Iris runtime resource parity: "
+                + (irisTranslation.resourceBindingCaptureComplete()
+                    ? "§aComplete" : "§eCollecting/fallback")
+                + " §7(variants="
+                + irisTranslation.resourceBindingVariantsSucceeded() + "/"
+                + irisTranslation.resourceBindingVariantsAttempted()
+                + ", matched="
+                + irisTranslation.resourceBindingsMatched()
+                + ", incomplete="
+                + irisTranslation.resourceBindingVariantsIncomplete()
+                + ")");
+        msg(src, "§7Iris resource-layout digest: §f"
+                + irisTranslation.resourceLayoutSetSha256() + " §7("
+                + (irisTranslation.resourceLayoutSetComplete()
+                    ? "complete" : "incomplete") + ")");
         msg(src, "§7Iris pipeline-state unsupported reasons: §f"
                 + (irisTranslation.pipelineStateUnsupportedReasonSummary()
                     .isEmpty()

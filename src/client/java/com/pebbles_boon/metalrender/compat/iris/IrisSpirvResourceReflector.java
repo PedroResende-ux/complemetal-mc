@@ -760,7 +760,20 @@ public final class IrisSpirvResourceReflector {
               "multiple resources use " + address);
         }
         resources.add(resource);
-        String name = names[variable.resultId];
+        /*
+         * OpenGL identifies interface blocks by the block/type name, not by
+         * the optional GLSL instance name. shaderc emits both as OpName when
+         * an instance exists, and emits only the struct name for anonymous
+         * blocks. Prefer the struct name for UBO parity with
+         * glGetUniformBlockIndex; all other resources retain the variable
+         * name used by glGetUniformLocation.
+         */
+        String name = kind == ResourceKind.UNIFORM_BUFFER
+            ? names[baseTypeId] : names[variable.resultId];
+        if ((name == null || name.isBlank())
+            && kind == ResourceKind.UNIFORM_BUFFER) {
+          name = names[variable.resultId];
+        }
         if (name != null && !name.isBlank()) {
           diagnosticNames.put(address, name);
         }

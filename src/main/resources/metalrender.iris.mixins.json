@@ -10,6 +10,7 @@
     "IrisDhLodRenderProgramMixin",
     "IrisFrameBufferCacheMixin",
     "IrisGlCommandEncoderMixin",
+    "IrisGlProgramResourceMixin",
     "IrisGlRenderPassMixin",
     "IrisGlStateManagerMixin",
     "IrisGlTextureMixin",
@@ -17,7 +18,8 @@
     "IrisProgramBuilderAccessor",
     "IrisProgramBuilderMixin",
     "IrisRenderSystemMixin",
-    "IrisShaderCreatorMixin"
+    "IrisShaderCreatorMixin",
+    "IrisSodiumGlDrawContextMixin"
   ],
   "injectors": {
     "defaultRequire": 0

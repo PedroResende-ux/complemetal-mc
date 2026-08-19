@@ -303,6 +303,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
                   && translationStatus.translated() == 0),
           "warm-cache run did not reuse every captured program");
       requireMslLibraryValidation(translationStatus, cacheExpectation);
+      requireResourceReflection(translationStatus);
       System.out.println("[MetalRender exact-JAR] programs="
           + translationStatus.attempted() + ", stages="
           + translationStatus.libraryStagesAttempted()
@@ -318,9 +319,23 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           + translationStatus.pipelineStatesUnsupported()
           + ", pipelineIncomplete="
           + translationStatus.pipelineIncompleteVariants()
+          + ", resourcePrograms="
+          + translationStatus.resourceProgramsSucceeded()
+          + ", resourceStages="
+          + translationStatus.resourceStagesReflected()
+          + ", resourceBindings="
+          + translationStatus.resourceBindingsReflected()
+          + ", bindingVariants="
+          + translationStatus.resourceBindingVariantsSucceeded() + "/"
+          + translationStatus.resourceBindingVariantsAttempted()
+          + ", bindingIncomplete="
+          + translationStatus.resourceBindingVariantsIncomplete()
+          + ", bindingReasons="
+          + translationStatus.resourceBindingIncompleteReasonSummary()
           + ", pipelineLastFailure="
           + translationStatus.pipelineStateLastFailure());
       requirePipelineStateCapture(translationStatus);
+      requireResourceBindings(translationStatus);
       context.runOnClient(client -> NativeBridge.nFlushFrames());
       NativeFaultCounters nativeFaultEnd =
           context.computeOnClient(client -> nativeFaultCounters());
@@ -396,6 +411,55 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             + status.pipelineStateSetSha256());
     require(status.pipelineStateCaptureComplete(),
         "Iris pipeline-state capture gate is incomplete");
+  }
+
+  private static void requireResourceReflection(
+      IrisTranslationCoordinator.Status status) {
+    require(status.resourceReflectionComplete(),
+        "Iris SPIR-V resource reflection did not complete: "
+            + status.resourceLayoutLastFailure());
+    require(status.resourceProgramsAttempted()
+            == EXPECTED_COMPLEMENTARY_PROGRAMS,
+        "unexpected reflected resource program count: "
+            + status.resourceProgramsAttempted());
+    require(status.resourceProgramsSucceeded()
+            == EXPECTED_COMPLEMENTARY_PROGRAMS,
+        "not every Iris program produced a resource layout: "
+            + status.resourceProgramsSucceeded());
+    require(status.resourceStagesReflected()
+            == EXPECTED_COMPLEMENTARY_STAGES,
+        "unexpected reflected resource stage count: "
+            + status.resourceStagesReflected());
+    require(status.resourceBindingsReflected() > 0,
+        "no Iris shader resource binding was reflected");
+    require(status.resourceLayoutIdentityCount()
+            == EXPECTED_COMPLEMENTARY_PROGRAMS,
+        "resource-layout identity set does not cover every program");
+    require(status.resourceLayoutSetSha256().matches("[0-9a-f]{64}"),
+        "resource-layout identity digest is invalid");
+  }
+
+  private static void requireResourceBindings(
+      IrisTranslationCoordinator.Status status) {
+    require(status.resourceBindingCaptureComplete(),
+        "Iris runtime resource binding parity is incomplete: "
+            + status.resourceBindingIncompleteReasonSummary());
+    require(status.resourceBindingVariantsAttempted()
+            == status.pipelineStatesSucceeded(),
+        "resource binding snapshots do not cover every mapped variant: "
+            + status.resourceBindingVariantsAttempted() + "/"
+            + status.pipelineStatesSucceeded());
+    require(status.resourceBindingVariantsSucceeded()
+            == status.resourceBindingVariantsAttempted(),
+        "not every resource binding snapshot passed parity: "
+            + status.resourceBindingVariantsSucceeded() + "/"
+            + status.resourceBindingVariantsAttempted());
+    require(status.resourceBindingVariantsIncomplete() == 0,
+        "incomplete resource binding snapshots were observed");
+    require(status.resourceBindingsMatched() > 0,
+        "no reflected Iris resource was matched to a runtime binding");
+    require(status.resourceBindingIncompleteReasonSetComplete(),
+        "resource binding reason set exceeded its verified bound");
   }
 
   private static void requireMslLibraryValidation(
@@ -644,7 +708,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         .getMetadata().getVersion().getFriendlyString();
     String json = String.format(Locale.ROOT, """
         {
-          "schemaVersion": 4,
+          "schemaVersion": 5,
           "status": "PASS",
           "environment": "production-fabric",
           "javaMajor": 25,
@@ -716,6 +780,28 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             "lastFailure": %s,
             "pipelineStatus": "pending",
             "irisOpenGlActive": true
+          },
+          "irisResourceReflection": {
+            "complete": %s,
+            "programsAttempted": %d,
+            "programsSucceeded": %d,
+            "programsUnsupported": %d,
+            "programsFailed": %d,
+            "stagesReflected": %d,
+            "bindingsReflected": %d,
+            "layoutIdentityCount": %d,
+            "layoutSetComplete": %s,
+            "layoutSetSha256": %s,
+            "lastFailure": %s,
+            "bindingVariantsAttempted": %d,
+            "bindingVariantsSucceeded": %d,
+            "bindingVariantsIncomplete": %d,
+            "runtimeBindingsMatched": %d,
+            "bindingIncompleteReasonCount": %d,
+            "bindingIncompleteReasonSetComplete": %s,
+            "bindingIncompleteReasonSetSha256": %s,
+            "bindingIncompleteReasonSummary": %s,
+            "runtimeBindingsCaptured": true
           },
           "generatedMslLibraryValidation": {
             "enabled": %s,
@@ -824,6 +910,26 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         quote(translationStatus.pipelineStateSetSha256()),
         Boolean.toString(translationStatus.pipelineStateSetComplete()),
         quote(translationStatus.pipelineStateLastFailure()),
+        Boolean.toString(translationStatus.resourceReflectionComplete()),
+        translationStatus.resourceProgramsAttempted(),
+        translationStatus.resourceProgramsSucceeded(),
+        translationStatus.resourceProgramsUnsupported(),
+        translationStatus.resourceProgramsFailed(),
+        translationStatus.resourceStagesReflected(),
+        translationStatus.resourceBindingsReflected(),
+        translationStatus.resourceLayoutIdentityCount(),
+        Boolean.toString(translationStatus.resourceLayoutSetComplete()),
+        quote(translationStatus.resourceLayoutSetSha256()),
+        quote(translationStatus.resourceLayoutLastFailure()),
+        translationStatus.resourceBindingVariantsAttempted(),
+        translationStatus.resourceBindingVariantsSucceeded(),
+        translationStatus.resourceBindingVariantsIncomplete(),
+        translationStatus.resourceBindingsMatched(),
+        translationStatus.resourceBindingIncompleteReasonCount(),
+        Boolean.toString(
+            translationStatus.resourceBindingIncompleteReasonSetComplete()),
+        quote(translationStatus.resourceBindingIncompleteReasonSetSha256()),
+        quote(translationStatus.resourceBindingIncompleteReasonSummary()),
         Boolean.toString(translationStatus.libraryValidationEnabled()),
         Boolean.toString(translationStatus.libraryValidationReady()),
         Boolean.toString(translationStatus.libraryValidationComplete()),

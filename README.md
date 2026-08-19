@@ -30,6 +30,7 @@ Metal 3 compatibility stream. Actual MTL4 draw encoding is disabled.
 | Iris | Optional; 1.11.2 compatibility target; Iris rendering remains OpenGL |
 | Iris-to-Metal in stable `0.2.1` | Experimental opt-in cache preparation; no Metal execution or FPS claim |
 | Iris compiler milestone in development `0.3.0-alpha.1` | Optional ephemeral MSL library validation; no pipeline, draw or FPS claim |
+| Iris resource milestone on the development branch | SPIR-V layout reflection and live GL binding parity validated; no Metal render graph or draw |
 | Display scope | Window resize and fullscreen are validated; true 2x Retina backing is not validated |
 | Power/external display lifecycle | Sleep/wake and display hot-plug/reconnect are not validated |
 | High-refresh presentation | Real presented 200 Hz pacing is not validated |
@@ -179,7 +180,8 @@ Stable refers only to the conservative hybrid profile in the support matrix.
 This release is not a complete MTL4 renderer and carries no guaranteed
 performance uplift. Stable `0.2.1` only prepares SPIR-V/MSL cache artifacts.
 Development `0.3.0-alpha.1` can additionally compile and release ephemeral
-Metal libraries, but still creates no Iris Metal pipeline and does not replace
+Metal libraries, and the current branch can reflect and resolve their runtime
+resource ABI, but still creates no Iris Metal pipeline and does not replace
 Iris' OpenGL draws. Neither boundary currently increases Iris FPS. Native
 payload and lifecycle checks complement, but do not replace, visual comparison
 on real hardware.

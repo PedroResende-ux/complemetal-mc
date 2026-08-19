@@ -10,7 +10,7 @@ through the validation stages, and every experimental failure stays fail-open.
 | 1 | Final Iris GLSL -> SPIR-V -> MSL cache | Complete | 76 Complementary Reimagined programs, 152 SPIR-V and 152 MSL stages, clean cold/warm cache |
 | 2 | Apple Metal compiler validation | Complete in `0.3.0-alpha.1+mc26.2` | Every generated stage creates an ephemeral `MTLLibrary`, resolves `main0` with the expected function type, then releases it; 152/152 and zero failures |
 | 3 | Capture complete Iris pipeline state | Complete | Vertex layout, attachment formats, blend/depth/stencil/cull/topology and specialization state are captured and content-keyed |
-| 4 | Reflect and bind resources | Pending | Uniforms, samplers, textures, images, UBOs and SSBOs have deterministic argument-buffer layouts and parity tests |
+| 4 | Reflect and bind resources | Complete | Uniforms, samplers, textures, images, UBOs and SSBOs have deterministic argument-buffer layouts and parity tests |
 | 5 | Reproduce the Iris render graph | Pending | Shadow, geometry, composite and final pass routing, history ping-pong and barriers are represented without Metal output replacing Iris |
 | 6 | Build the MTL4 pipeline/compiler cache | Pending | Device/OS/compiler-keyed pipelines load cold and warm, recover from stale archives and create no draw on failure |
 | 7 | Shadow execution and visual parity | Pending | Metal renders offscreen beside Iris; automated image comparisons pass before any OpenGL draw is suppressed |
@@ -54,9 +54,26 @@ Line-loop and triangle-fan states are captured and cacheable but retain an
 explicit Metal execution blocker until Stage 8 provides validated index
 expansion. Iris/OpenGL therefore still owns every visible draw.
 
-Stage 4 is now the active development target: reflect each verified SPIR-V
-stage and bind the resulting resource layout to the actual Iris runtime
-uniform, sampler, image, UBO and SSBO state.
+## Delivered Stage 4 boundary
+
+Stage 4 reflects every integrity-checked SPIR-V stage into a bounded semantic
+resource layout whose identity excludes compiler IDs and diagnostic names.
+Names retained by translation profile 5 are used only to join that layout to
+the live Iris/OpenGL ABI. Runtime capture covers plain uniforms, sampled and
+storage images, texture/sampler units, texture-buffer backing storage, UBO
+block indices and exact buffer ranges, and SSBO binding points.
+
+Complementary Reimagined r5.8.1 passed cold and warm exact-JAR runs in both
+the Metal 4 hybrid and forced Metal 3 profiles. Every run reflected 231
+programs, 462 stages and 6,248 resource declarations into 231 layout
+identities with digest
+`d2d51d9ff5cbbac4ff3bfa4b138db5da8fb00a566454564a485dd8d70791acc5`.
+Every observed pipeline variant completed runtime binding resolution with
+zero missing resources and a complete empty failure-reason set.
+
+Stage 5 is now the active target: represent pass ordering, framebuffer
+routing, history ping-pong and synchronization without allowing generated MSL
+to own a visible draw.
 
 The persistent pipeline cache belongs to stage 6 because its key must include
 the complete state captured in stages 3-5 plus GPU identity, OS build and Metal

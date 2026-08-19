@@ -145,6 +145,20 @@ final class IrisSpirvResourceReflectorTest {
   }
 
   @Test
+  void uniformBlockUsesInterfaceTypeNameInsteadOfInstanceName() {
+    ModuleBuilder module = completeModule(
+        "albedo", 4, 3, false, ByteOrder.LITTLE_ENDIAN);
+    module.name(10, "CameraData");
+    module.name(36, "cameraData");
+    IrisSpirvResourceLayout layout = successful(module);
+    ResourceBinding uniformBuffer = resource(layout,
+        ResourceKind.UNIFORM_BUFFER);
+
+    assertEquals("CameraData",
+        layout.diagnosticName(uniformBuffer.address()).orElseThrow());
+  }
+
+  @Test
   void acceptsByteSwappedSpirvDeterministically() {
     ModuleBuilder module = completeModule(
         "albedo", 4, 3, false, ByteOrder.LITTLE_ENDIAN);
