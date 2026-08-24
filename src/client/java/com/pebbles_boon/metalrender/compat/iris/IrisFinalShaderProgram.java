@@ -4,6 +4,7 @@ import java.util.Collections;
 import java.util.EnumMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.List;
 
 /**
  * Immutable capture of the final GLSL strings after Iris transformations.
@@ -14,19 +15,31 @@ import java.util.Objects;
 public final class IrisFinalShaderProgram {
   private final String programName;
   private final EnumMap<IrisShaderStage, String> sources;
+  private final List<IrisVertexLayoutCapture.ShaderInput> vertexShaderInputs;
   private final long retainedChars;
 
   private IrisFinalShaderProgram(String programName,
       Map<IrisShaderStage, String> sources) {
+    this(programName, sources, List.of());
+  }
+
+  private IrisFinalShaderProgram(String programName,
+      Map<IrisShaderStage, String> sources,
+      List<IrisVertexLayoutCapture.ShaderInput> vertexShaderInputs) {
     this.programName = Objects.requireNonNull(programName, "programName");
     this.sources = new EnumMap<>(IrisShaderStage.class);
     this.sources.putAll(sources);
+    this.vertexShaderInputs = List.copyOf(vertexShaderInputs);
 
     long chars = programName.length();
     for (String source : this.sources.values()) {
       if (source != null) {
         chars = Math.addExact(chars, source.length());
       }
+    }
+    for (IrisVertexLayoutCapture.ShaderInput input
+        : this.vertexShaderInputs) {
+      chars = Math.addExact(chars, input.linkedName().length());
     }
     retainedChars = chars;
   }
@@ -109,6 +122,24 @@ public final class IrisFinalShaderProgram {
 
   public Map<IrisShaderStage, String> sources() {
     return Collections.unmodifiableMap(sources);
+  }
+
+  /**
+   * Returns a capture whose vertex SPIR-V locations and packed input ABI are
+   * tied to the same immutable format Iris linked into OpenGL.
+   */
+  public IrisFinalShaderProgram withVertexShaderInputs(
+      List<IrisVertexLayoutCapture.ShaderInput> inputs) {
+    Objects.requireNonNull(inputs, "inputs");
+    if (!hasStage(IrisShaderStage.VERTEX)) {
+      throw new IllegalStateException(
+          "vertex inputs require a captured vertex stage");
+    }
+    return new IrisFinalShaderProgram(programName, sources, inputs);
+  }
+
+  public List<IrisVertexLayoutCapture.ShaderInput> vertexShaderInputs() {
+    return vertexShaderInputs;
   }
 
   /**

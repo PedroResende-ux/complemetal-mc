@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender.compat.iris;
 
 import com.mojang.blaze3d.vertex.VertexFormat;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -14,12 +15,15 @@ public final class IrisShaderCapture {
   private static final IrisShaderCaptureQueue QUEUE =
       IrisShaderCaptureQueue.createDefault();
   private static final AtomicLong CAPTURE_FAILURES = new AtomicLong();
+  private static final int CAPTURE_FAILURE_REASON_CAPACITY = 32;
+  private static final ConcurrentSkipListSet<String> CAPTURE_FAILURE_REASONS =
+      new ConcurrentSkipListSet<>();
 
   private IrisShaderCapture() {
   }
 
   public static boolean isEnabled() {
-    return Boolean.getBoolean(ENABLED_PROPERTY);
+    return IrisMetalFeatureFlags.enabled(ENABLED_PROPERTY);
   }
 
   /**
@@ -48,13 +52,17 @@ public final class IrisShaderCapture {
           IrisFinalShaderProgram.fromGraphicsLink(name, vertex, geometry,
               tessControl, tessEvaluation, fragment);
       IrisVertexLayoutCapture.Layout layout =
-          IrisVertexLayoutCapture.capture(vertexFormat);
+          IrisVertexLayoutCapture.captureLinked(glProgram, vertexFormat,
+              fallback);
+      layout = IrisVertexLayoutCapture.resolveShaderInputFormats(vertex,
+          layout);
+      program = program.withVertexShaderInputs(layout.shaderInputs());
       enqueueRegistered(program, glProgram,
           new IrisProgramIdentityRegistry.ProgramDescriptor(
               IrisPipelineState.PassKind.LINKED_GRAPHICS, name, fallback,
               layout.buffers(), layout.attributes()));
     } catch (RuntimeException error) {
-      CAPTURE_FAILURES.incrementAndGet();
+      recordCaptureFailure(error);
     }
   }
 
@@ -82,13 +90,17 @@ public final class IrisShaderCapture {
           IrisFinalShaderProgram.fromProgramBuilderGraphics(name, vertex,
               geometry, fragment);
       IrisVertexLayoutCapture.Layout layout =
-          IrisVertexLayoutCapture.capture(vertexFormat);
+          IrisVertexLayoutCapture.captureLinked(glProgram, vertexFormat,
+              true);
+      layout = IrisVertexLayoutCapture.resolveShaderInputFormats(vertex,
+          layout);
+      program = program.withVertexShaderInputs(layout.shaderInputs());
       enqueueRegistered(program, glProgram,
           new IrisProgramIdentityRegistry.ProgramDescriptor(
               IrisPipelineState.PassKind.FULLSCREEN_GRAPHICS, name, false,
               layout.buffers(), layout.attributes()));
     } catch (RuntimeException error) {
-      CAPTURE_FAILURES.incrementAndGet();
+      recordCaptureFailure(error);
     }
   }
 
@@ -116,7 +128,7 @@ public final class IrisShaderCapture {
               IrisPipelineState.PassKind.COMPUTE, name, false, java.util.List.of(),
               java.util.List.of()));
     } catch (RuntimeException error) {
-      CAPTURE_FAILURES.incrementAndGet();
+      recordCaptureFailure(error);
     }
   }
 
@@ -152,7 +164,7 @@ public final class IrisShaderCapture {
     } catch (RuntimeException error) {
       // Keep Iris' link thread free of logger locks and I/O. Diagnostics are
       // exposed through the coordinator status instead.
-      CAPTURE_FAILURES.incrementAndGet();
+      recordCaptureFailure(error);
     }
   }
 
@@ -162,7 +174,7 @@ public final class IrisShaderCapture {
       queue.offer(IrisFinalShaderProgram.fromProgramBuilderGraphics(name,
           vertex, geometry, fragment));
     } catch (RuntimeException error) {
-      CAPTURE_FAILURES.incrementAndGet();
+      recordCaptureFailure(error);
     }
   }
 
@@ -172,7 +184,7 @@ public final class IrisShaderCapture {
       queue.offer(IrisFinalShaderProgram.fromProgramBuilderCompute(name,
           compute));
     } catch (RuntimeException error) {
-      CAPTURE_FAILURES.incrementAndGet();
+      recordCaptureFailure(error);
     }
   }
 
@@ -193,6 +205,30 @@ public final class IrisShaderCapture {
 
   public static long captureFailures() {
     return CAPTURE_FAILURES.get();
+  }
+
+  public static String captureFailureReasonSummary() {
+    synchronized (CAPTURE_FAILURE_REASONS) {
+      return String.join(",", CAPTURE_FAILURE_REASONS);
+    }
+  }
+
+  private static void recordCaptureFailure(RuntimeException error) {
+    String message = error.getMessage();
+    String reason = (message == null || message.isBlank())
+        ? error.getClass().getSimpleName() : message;
+    reason = reason.trim().replaceAll("[^A-Za-z0-9._:/-]", "_");
+    if (reason.length() > 96) {
+      reason = reason.substring(0, 96);
+    }
+    synchronized (CAPTURE_FAILURE_REASONS) {
+      CAPTURE_FAILURE_REASONS.add(reason.isEmpty() ? "unknown" : reason);
+      while (CAPTURE_FAILURE_REASONS.size()
+          > CAPTURE_FAILURE_REASON_CAPACITY) {
+        CAPTURE_FAILURE_REASONS.pollLast();
+      }
+    }
+    CAPTURE_FAILURES.incrementAndGet();
   }
 
   static IrisShaderCaptureQueue captureQueue() {

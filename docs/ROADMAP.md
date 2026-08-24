@@ -1,101 +1,108 @@
 # Iris-to-Metal roadmap
 
-This roadmap is ordered. A later stage cannot enable Metal draws until every
-earlier acceptance gate is green. Iris/OpenGL remains the visible renderer
-through the validation stages, and every experimental failure stays fail-open.
+This roadmap records the completed `0.3.0+mc26.2` path. Every stage remains a
+separate fail-closed acceptance boundary; a later success never hides an
+earlier translation, state, resource, parity, lifecycle, or performance
+failure.
 
-| Stage | Goal | State | Exit gate |
+| Stage | Goal | `0.3.0` state | Exit evidence |
 | --- | --- | --- | --- |
-| 0 | Stable Minecraft 26.2 hybrid renderer | Complete in `0.2.1+mc26.2` | Exact-JAR Metal 4/Metal 3, Iris on/off/on, dimensions and native lifecycle pass |
-| 1 | Final Iris GLSL -> SPIR-V -> MSL cache | Complete | 76 Complementary Reimagined programs, 152 SPIR-V and 152 MSL stages, clean cold/warm cache |
-| 2 | Apple Metal compiler validation | Complete in `0.3.0-alpha.1+mc26.2` | Every generated stage creates an ephemeral `MTLLibrary`, resolves `main0` with the expected function type, then releases it; 152/152 and zero failures |
-| 3 | Capture complete Iris pipeline state | Complete | Vertex layout, attachment formats, blend/depth/stencil/cull/topology and specialization state are captured and content-keyed |
-| 4 | Reflect and bind resources | Complete | Uniforms, samplers, textures, images, UBOs and SSBOs have deterministic argument-buffer layouts and parity tests |
-| 5 | Reproduce the Iris render graph | Complete | Shadow, geometry, composite and final pass routing, history ping-pong and barriers are represented without Metal output replacing Iris |
-| 6 | Build the MTL4 pipeline/compiler cache | Pending | Device/OS/compiler-keyed pipelines load cold and warm, recover from stale archives and create no draw on failure |
-| 7 | Shadow execution and visual parity | Pending | Metal renders offscreen beside Iris; automated image comparisons pass before any OpenGL draw is suppressed |
-| 8 | Selective Metal cutover | Pending | One validated pass at a time replaces Iris, with immediate per-frame OpenGL fallback and lifecycle recovery |
-| 9 | Performance and stable release | Pending | Reproducible A/B frame-time, stutter and GPU/CPU measurements show a benefit without visual or lifecycle regressions |
+| 0 | Minecraft 26.2 renderer foundation | Complete | Exact-JAR Fabric environment, native lifecycle and Metal 3 fallback |
+| 1 | Final Iris GLSL -> SPIR-V -> MSL cache | Complete | 231 Complementary programs and 462 stages, integrity-checked cold/warm cache |
+| 2 | Apple Metal compiler validation | Complete | 462/462 stages compile, resolve `main0` with the correct function type and leave no live libraries |
+| 3 | Complete Iris pipeline state | Complete | Vertex ABI, targets, blend/depth/stencil/raster/topology and specialization state are content-keyed |
+| 4 | Resource reflection and binding | Complete | 6,248 declarations across uniforms, samplers, textures, images, UBOs and SSBOs; missing data rejects the candidate |
+| 5 | Iris render graph | Complete | SHADOW, GEOMETRY, DEFERRED, COMPOSITE and FINAL, history ping-pong, transfers and barriers represented |
+| 6 | MTL4 pipeline/archive cache | Complete for the validated workload | Device/OS/compiler-qualified cold compile, warm archive hits and stale-archive recovery |
+| 7 | Offscreen execution and parity | Complete | Four-phase MTL4 replay plus exact 3/3 FINAL parity, zero differing pixels in final acceptance |
+| 8 | Selective cutover | Complete | Fenced IOSurface presentation, paired FINAL OpenGL cancellation and fail-open recovery |
+| 9 | Full graph ownership and stable performance | Complete for the supported release matrix | Persistent Metal resources, frame-batched MTL4 execution, async presentation, lifecycle PASS, forced Metal 3 PASS and two matched A/B PASS results |
 
-## Delivered Stage 2 boundary
+## Stage 9 release boundary
 
-Stage 2 compiles and validates generated MSL only. It does not create a render
-pipeline, retain a library handle, encode a command or execute an Iris shader
-through Metal. The translation profile emits Metal argument-buffer resource
-declarations so real shader packs do not exceed Metal's direct buffer-index
-limit; runtime binding remains Stage 4.
+Stage 9 replaces the supported live Iris shader-pass graph, not every piece of
+Minecraft. Metal owns the validated shader-pack SHADOW, GEOMETRY, DEFERRED,
+COMPOSITE and FINAL work. Minecraft UI and deliberately unsupported content
+continue through their normal renderer. The final Metal IOSurface is attached
+to a GL rectangle texture for the final framebuffer blit, so macOS does not
+perform a CPU output readback.
 
-The exact alpha JAR passed cold and warm Complementary Reimagined runs in both
-the Metal 4 hybrid and forced Metal 3 profiles. Each run validated 76 programs
-and 152 ephemeral Metal libraries with zero unsupported stages, failures,
-pending jobs or live libraries. Cold runs translated all 76 programs; warm
-runs reused all 76 SPIR-V/MSL cache entries but intentionally repeated Apple
-Metal compilation because no persistent library or pipeline artifact exists at
-this stage.
+Production ownership has these prerequisites:
 
-## Delivered Stage 3 boundary
+1. packaged stable MetalRender version rather than a dev/alpha classpath;
+2. Apple Silicon macOS 26 or newer;
+3. a successful native Metal 4 command-buffer/feedback probe;
+4. final Iris shader translation and Apple compilation complete;
+5. exact pipeline state and resource layouts complete;
+6. device-qualified MTL4 pipelines available;
+7. three consecutive visual-parity passes;
+8. complete graph resources, draw packets and hazard barriers;
+9. a completed presentation surface or a previously fenced reusable surface.
 
-Stage 3 captures generation-safe program and resource identities, vertex
-layouts, color/depth/stencil attachment formats, blend and color masks,
-depth/stencil/raster/multisample state, primitive topology, and verified
-SPIR-V specialization constants. Complete states are stored in a bounded,
-content-addressed cache; no state can become a Metal candidate when required
-input is unknown.
+If any prerequisite fails, the candidate remains on Iris/OpenGL. Failures
+before suppression affect no visible draw. A fatal failure after a draw was
+already suppressed can make the current in-flight frame incomplete; ownership
+is invalidated and the following frame returns to the safe path.
 
-The expanded exact-JAR route now covers Overworld, Nether, End, return to
-Overworld, and an Iris off/on rebuild. Complementary Reimagined r5.8.1 passed
-cold and warm runs in both the Metal 4 hybrid and forced Metal 3 profiles:
-231 programs, 462 generated and Apple-compiled stages, 185 mapped variants and
-90 per-run pipeline-state identities, with zero rejected, incomplete,
-unsupported or failed mappings. The observed per-run state digest was stable
-across the final four acceptance runs.
+## Delivered execution architecture
 
-Line-loop and triangle-fan states are captured and cacheable but retain an
-explicit Metal execution blocker until Stage 8 provides validated index
-expansion. Iris/OpenGL therefore still owns every visible draw.
+- Final Iris GLSL is hashed and translated off the render thread.
+- SPIR-V/MSL artifacts are immutable, bounded and content-addressed; original
+  shader-pack GLSL is not persisted.
+- Pipeline archives include the translation profile, complete render state,
+  GPU identity, OS build and compiler identity.
+- Compatible textures use synchronized IOSurface or resident Metal handles.
+- Vertex/index data uses bounded content-addressed resident Metal buffers.
+- Persistent graph attachments retain history across frames.
+- RAW, WAR and WAW dependencies generate explicit MTL4 barriers.
+- Clear, transfer and draw commands are batched into a frame command buffer.
+- Worker submission uses direct native packets; render-thread status,
+  promotion and bind probes do not block when a previous surface can be reused.
+- MTL4 commit feedback provides raw GPU timings and completion/error state.
 
-## Delivered Stage 4 boundary
+The validated steady-state graph observed 13 render passes and 19 draws per
+frame with 18 explicit hazard barriers. Those counts describe the exact
+Complementary workload, not a fixed renderer limit.
 
-Stage 4 reflects every integrity-checked SPIR-V stage into a bounded semantic
-resource layout whose identity excludes compiler IDs and diagnostic names.
-Names retained by translation profile 5 are used only to join that layout to
-the live Iris/OpenGL ABI. Runtime capture covers plain uniforms, sampled and
-storage images, texture/sampler units, texture-buffer backing storage, UBO
-block indices and exact buffer ranges, and SSBO binding points.
+## Release acceptance
 
-Complementary Reimagined r5.8.1 passed cold and warm exact-JAR runs in both
-the Metal 4 hybrid and forced Metal 3 profiles. Every run reflected 231
-programs, 462 stages and 6,248 resource declarations into 231 layout
-identities with digest
-`d2d51d9ff5cbbac4ff3bfa4b138db5da8fb00a566454564a485dd8d70791acc5`.
-Every observed pipeline variant completed runtime binding resolution with
-zero missing resources and a complete empty failure-reason set.
+The exact packaged JAR must pass all of the following before publication:
 
-## Delivered Stage 5 boundary
+- Metal 4 cold and warm runs with full graph ownership required;
+- Metal 3 cold and warm runs with Iris/OpenGL ownership retained;
+- Iris initially on, disabled, reapplied and reenabled;
+- Overworld -> Nether -> End -> Overworld;
+- resize, fullscreen and surface suspend/restore;
+- translation, reflection, pipeline, graph and visual-parity checks;
+- zero ownership failures and zero native command/feedback faults;
+- 600-frame matched CPU/GPU samples for OpenGL and Metal;
+- at least 5% CPU p50 and p95 improvement, no more than 5% p99/GPU-tail
+  regression, and no stutter regression;
+- a second matched A/B in reverse launch order.
 
-Stage 5 captures the live Iris frame as a bounded, content-addressed render
-graph. It represents shadow, geometry, deferred, composite and final phases;
-framebuffer and texture dependencies; memory barriers; blits, copies and
-mipmap generation; and history ping-pong without using transient OpenGL names
-as graph identity. Draw nodes reference the complete shader, pipeline-state
-and resource-layout keys delivered by stages 1-4.
+The final stable exact JAR uses SHA-256
+`4e874abbde4fdbc5e6edd72bc6cd419e321a15ced9f255df67d86091953cb57e`.
+Its Metal 4 and Metal 3 cold/warm matrix plus both opposite-order A/B gates
+passed. The independent artifact evidence is recorded in
+[`RELEASE_CHECKLIST_0.3.0.md`](RELEASE_CHECKLIST_0.3.0.md).
 
-Complementary Reimagined r5.8.1 passed cold and warm exact-JAR runs in both
-the Metal 4 hybrid and forced Metal 3 profiles. Each run built 16 graphs with
-9 bounded graph identities, all mandatory phases, 51 barriers, 92 transfers
-and at least 228 ping-pong resource observations. Every graph completed with
-zero unsupported or failed builds. The generated-MSL execution signal
-remained false and Iris/OpenGL retained every visible draw.
+## Explicitly deferred hardware validation
 
-Stage 6 is now the active target. The persistent pipeline cache key must include
-the complete state captured in stages 3-5 plus GPU identity, OS build and Metal
-compiler version; creating it earlier would have cached guessed, unusable
-pipelines.
+Stage 9 is complete for the declared software/support matrix. It does not
+claim validation of true 2x Retina backing, physical sleep/wake, external
+display reconnect, or real presented 200 Hz cadence. These require separate
+hardware-controlled runs and remain release exclusions, not hidden Stage 9
+successes.
 
-## Release rule
+## Performance interpretation
 
-No FPS claim is made until stage 9. A translated or Metal-compiled shader is
-not an accelerated renderer by itself. Each stage must retain evidence from
-the exact packaged JAR. Before Stage 7, runtime ownership evidence must remain
-Iris/OpenGL and the generated-MSL boundary must remain explicitly static and
-validation-only rather than being reported as draw telemetry.
+The two qualifying stable A/B runs showed a 42.6-44.8% CPU p50 improvement,
+27.1-37.4% CPU p95 improvement, a first-run 38.3% CPU p99 improvement and a
+reverse-run 1.5% CPU p99 regression within the 5% limit, plus 10.5-19.5% GPU
+p95 and 11.5-32.5% GPU p99 improvements in the exact M4 Pro 1280x720
+Complementary scene. Both sides had zero >=100 ms stutters.
+
+This is evidence that the Stage 9 path can raise FPS and reduce frame time in
+that CPU/driver-sensitive scene. It is not a universal percentage promise:
+fragment math, high shadow resolution, volumetrics, bandwidth, resolution,
+pack settings and world complexity can move the bottleneck elsewhere.

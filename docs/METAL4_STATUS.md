@@ -1,152 +1,102 @@
 # Metal 4 implementation status
 
-This document distinguishes implemented behavior from planned work. It is part
-of the release contract: the status exposed by the game must match this table.
+This document is part of the `0.3.0+mc26.2` release contract. Runtime status
+must distinguish Metal 4 availability, active Iris graph ownership and the
+Metal 3/OpenGL fallback; creating an MTL4 object alone is not an active draw
+claim.
 
-| Area | `0.2.1+mc26.2` status |
+| Area | Stable `0.3.0` status |
 | --- | --- |
-| Runtime API detection | Implemented |
-| Metal 4 command queue / allocator / completion probe | Implemented when exposed by the OS |
-| Runtime configuration and status reporting | Implemented |
-| Static native arena startup cap | Implemented with `recommendedMaxWorkingSetSize` |
-| IOSurface slot ownership and completion fences | Implemented |
-| Reversed-Z depth state | Implemented |
-| MetalFX spatial scaling path | Experimental opt-in; outside stable support while hardware conformance is pending |
-| Atlas/lightmap handoff | Fenced asynchronous GPU readback |
-| Metal 3 render compatibility stream | Active stable terrain draw path |
-| Safe alpha composite with vanilla feature overlay | Default |
-| Fast vanilla-terrain suppression | Disabled pending depth/coverage validation |
-| Native entity/particle replacement | Release-locked off pending fenced texture readback |
-| Iris compatibility transition gate | Live Iris state and the applied renderer pause latch both block Metal frame encoding |
-| MTL4 render pipeline / draw encoder | Not active |
-| Validated mesh-shader terrain path | Disabled |
-| Validated Hi-Z occlusion path | Disabled |
-| Overworld, Nether and End active-path transition | Validated |
-| Window resize and fullscreen transition | Validated |
-| True 2x Retina framebuffer backing | Not validated; outside stable support |
-| Sleep/wake and display hot-plug/reconnect | Not validated; outside stable support |
-| Real presented 200 Hz pacing | Not validated; outside stable support |
+| Metal 4 API/runtime detection | Implemented with a real command-buffer and completion-feedback probe |
+| MTL4 command queue and allocator | Active for the Iris graph on supported macOS 26 systems |
+| Iris GLSL -> SPIR-V -> MSL | Implemented after final Iris transformations; bounded cache |
+| Apple Metal library validation | Implemented for every accepted stage |
+| Device-qualified pipeline archive | Implemented with warm reuse and stale-archive recovery |
+| Full Iris pipeline/resource ABI | Captured, reflected and fail-closed |
+| Persistent Metal graph resources | Implemented with history preservation and bounded native allocation |
+| MTL4 frame execution | Active for validated SHADOW, GEOMETRY, DEFERRED, COMPOSITE and FINAL passes |
+| Hazards | Explicit RAW/WAR/WAW tracking and MTL4 barriers |
+| Texture input | IOSurface handoff or bounded resident Metal texture |
+| Vertex/index input | Bounded resident Metal buffer cache |
+| Presentation | Asynchronous fenced IOSurface handoff; reusable last completed surface |
+| Visual parity | Three consecutive exact final-frame comparisons required before ownership |
+| Metal 3 fallback | Iris/OpenGL remains visible; no MTL4 draw ownership |
+| Resize/fullscreen/surface restore | Exact-JAR validated |
+| Overworld/Nether/End transition | Exact-JAR validated |
+| Iris shader toggle/reload | Exact-JAR validated |
+| Matched frame-time gate | Passed twice in opposite launch orders |
+| True 2x Retina backing | Not validated; outside stable scope |
+| Physical sleep/wake | Not validated; outside stable scope |
+| External display reconnect | Not validated; outside stable scope |
+| Real presented 200 Hz | Not validated; outside stable scope |
 
-The bundled shader library is intentionally compiled with the Metal 3 language
-standard because the active draw stream is still the compatibility path.
-Creating Metal 4 queue/allocator objects does not convert those pipelines or
-encoders into MTL4.
+## Production activation
 
-## `0.3.0-alpha.1` Iris compiler milestone
+The complete Iris-to-Metal path defaults on only when all static conditions
+are true:
 
-The development alpha adds a third, separately opt-in boundary after the Iris
-SPIR-V/MSL cache. On a ready Apple Silicon renderer it asks the Apple Metal
-runtime compiler to create an ephemeral executable `MTLLibrary` for each
-verified MSL stage, resolves `main0`, verifies its function type and releases
-both objects immediately. The boundary requires argument-buffer tier 2 and is
-limited to 16 MiB of MSL per stage.
+- the classes come from a packaged stable version such as
+  `0.3.0+mc26.2`, not a dev or prerelease classpath;
+- the OS is macOS 26 or newer;
+- the process architecture is Apple Silicon.
 
-This validation runs in both the Metal 4 hybrid and forced Metal 3 profiles;
-it is not MTL4 draw encoding. It creates no render pipeline, persistent
-archive, command encoder or Iris draw. Exact-JAR cold/warm tests passed 152 of
-152 stages in both profiles, while visible shader-pack ownership remained with
-Iris/OpenGL. The next roadmap target is complete Iris pipeline-state capture,
-not a renderer cutover.
-
-## Stage 3 Iris pipeline-state milestone
-
-The development branch now captures and content-keys the complete pipeline
-state observed for registered Iris programs. The exact-JAR acceptance route
-passed Metal 4 and forced Metal 3 cold/warm runs with 231 programs, 462
-Apple-compiled MSL stages, 185 mapped variants and zero incomplete,
-unsupported or failed state mappings. The final four runs produced the same
-90-entry per-run state digest.
-
-This remains metadata capture, not MTL4 draw encoding. Twelve observed
-line-loop or triangle-fan variants carry explicit index-expansion blockers and
-continue through Iris/OpenGL.
-
-## Stage 4 Iris resource-binding milestone
-
-The development branch now reflects verified SPIR-V into semantic resource
-layouts and joins them to the exact runtime bindings observed from Iris,
-Sodium and Mojang's OpenGL encoder. The bridge records uniform values,
-sampler/texture/image units, texture-buffer storage, UBO block bindings and
-buffer ranges, and SSBO binding points. Missing data remains fail-closed for
-the experimental candidate and fail-open to Iris/OpenGL.
-
-The exact packaged JAR passed Metal 4 and forced Metal 3 cold/warm runs with
-231 programs, 462 stages, 6,248 reflected declarations, 231 resource-layout
-identities and zero incomplete runtime binding variants. Generated MSL still
-does not create a pipeline or encode a draw; render-graph capture is the next
-gate.
-
-## Stage 5 Iris render-graph milestone
-
-The development branch now turns each sampled Iris frame into a bounded,
-content-addressed execution plan. It represents shadow, geometry, deferred,
-composite and final phases; framebuffer and texture dependencies; barriers;
-blits, copies and mip generation; and history ping-pong. Transient OpenGL
-object names are canonicalized out of graph identity, while draw nodes retain
-their shader, complete pipeline-state and resource-layout keys.
-
-The exact packaged JAR passed Metal 4 and forced Metal 3 cold/warm runs. Each
-run built 16 graphs with 9 bounded identities, all mandatory phases, 51
-barriers, 92 transfers, at least 228 ping-pong observations and zero
-unsupported or failed graph builds. This milestone does not create a Metal
-pipeline, encode a command or replace an Iris draw; the execution boundary is
-reported explicitly as false.
-
-Late native encode or presentation failures fall back on the following frame;
-Minecraft cannot replay vanilla submissions already skipped in the in-flight
-frame. One incomplete in-flight frame therefore remains a documented recovery
-limitation rather than a promise of replay.
+Native availability, translation, pipeline, graph and parity checks still run
+before any OpenGL draw is suppressed. `-Dmetalrender.irisMetal.enabled=false`
+disables the whole path. The older fine-grained
+`metalrender.experimental.irisMetal*` properties remain as diagnostic
+overrides, not normal installation requirements.
 
 ## Backend names
 
-- `METAL4_RUNTIME_VERIFIED_METAL3_RENDER`: an MTL4 command buffer was encoded,
-  committed and completed without feedback errors, but draw commands still use
-  the Metal 3 compatibility stream.
+- `METAL4`: the native runtime probe passed and the validated Iris graph is
+  actively encoded through MTL4.
+- `METAL4_RUNTIME_VERIFIED_METAL3_RENDER`: MTL4 runtime probing passed, but
+  the active compatibility draw stream is still Metal 3.
 - `METAL3`: Metal 4 was not requested.
-- `METAL3_FALLBACK_NO_METAL4`: Metal 4 was requested but is not exposed by the
-  current device/operating-system runtime.
-- `METAL3_FALLBACK_METAL4_PROBE_PENDING`: MTL4 objects exist, but the completion
-  probe has not established a usable runtime.
-- `METAL3_FALLBACK_METAL4_PROBE_FAILED`: Metal 4 is exposed, but the real
-  command-buffer completion probe failed.
-- `UNAVAILABLE`: native initialization did not complete and Minecraft retains
-  its normal renderer.
+- `METAL3_FALLBACK_NO_METAL4`: Metal 4 was requested but unavailable.
+- `METAL3_FALLBACK_METAL4_PROBE_PENDING`: configuration/probe is incomplete.
+- `METAL3_FALLBACK_METAL4_PROBE_FAILED`: the real MTL4 probe failed.
+- `UNAVAILABLE`: native initialization did not complete; Minecraft retains its
+  normal renderer.
 
-`nIsMetal4Active()` reports the completed runtime probe. It must not be
-interpreted as proof that the renderer's draw stream uses MTL4.
-`nIsMetal4DrawPathActive()` is the separate draw-path signal and is false in
-this release.
+`nIsMetal4Active()` means the runtime probe completed. It is not enough to
+prove visible Metal execution. `nIsMetal4DrawPathActive()` plus exact full
+graph ownership/presentation telemetry establish the active MTL4 draw path.
 
-The packaged native-payload smoke test verifies extraction, initialization,
-ABI/status signals and selected resource lifetimes. The regular client game
-test covers the active hybrid and native-disabled lifecycle. The separate
-exact-release-JAR Iris harness adds coarse shader-toggle image checks. Those
-checks reject uniform output and verify that the re-enabled Iris image is
-closer to the initial Iris image than to the shaders-off image, but they are
-not full reference-image parity proof.
+## Correctness and ownership rules
+
+Pipeline candidates are rejected when required vertex formats, attachments,
+resource bindings, subresources, buffer ranges, texture formats, topology or
+specialization state are unknown. Geometry shaders are unsupported. The
+renderer does not synthesize missing resources.
+
+Before production ownership, Metal final output must match Iris/OpenGL for
+three consecutive frames. The final acceptance run uses exact native row order
+and recorded zero different pixels, zero RMSE and zero maximum channel delta.
+
+Each submitted frame owns its IOSurface and feedback state until it is
+completed, promoted, bound and fenced or explicitly discarded. Status,
+promotion and bind calls avoid render-thread mutex waits only when the caller
+can safely show the previous fenced surface; the first usable surface remains
+blocking so startup cannot suppress a frame without an image.
+
+## Performance status
+
+The Stage 9 candidate passed two 600-frame matched warm-cache A/B gates in
+opposite launch orders. Metal improved every required CPU and GPU percentile,
+with no >=100 ms stutters and no MTL4 commit-feedback errors. Detailed numbers
+and the exact scenario are in [README.md](../README.md) and the final stable
+artifact evidence is in
+[`RELEASE_CHECKLIST_0.3.0.md`](RELEASE_CHECKLIST_0.3.0.md).
+
+The measured uplift applies to the tested M4 Pro, 1280x720 Complementary
+Reimagined r5.8.1 scenario. A GPU-bound pack or resolution can show a smaller
+gain because shader math and memory traffic are not removed by translation.
 
 ## Stable support boundary
 
-Stable in `0.2.1+mc26.2` means the conservative hybrid profile:
-
-1. Selected terrain is mirrored through the Metal 3 compatibility stream.
-2. Minecraft retains unsupported or deliberately excluded content, including
-   native entity and particle replacement.
-3. Metal 4 queue/allocator APIs may be initialized and completion-probed, but
-   no game draw is encoded through MTL4.
-4. World lifecycle validation includes Overworld, Nether and End transitions.
-5. Iris shader packs retain Iris' OpenGL renderer. The opt-in
-   GLSL-to-SPIR-V-to-MSL path only prepares cache artifacts and makes no
-   performance claim.
-6. Initialization, capture and compatibility failures remain fail-open to
-   Minecraft's renderer.
-
-The following are explicitly outside this release's validated stable scope:
-
-- a true 2x Retina backing framebuffer;
-- macOS sleep/wake;
-- external-display hot-plug or reconnect;
-- real display presentation at 200 Hz.
-
-The native 200 Hz stress loop exercises offscreen buffer throughput, ownership
-and slot recycling. It is not a display cadence or presentation test.
+Stable means full graph ownership only for states that pass every strict gate.
+Unsupported content retains Iris/OpenGL or Minecraft rendering. Native
+entity/particle replacement, experimental mesh shaders, Hi-Z culling,
+MetalFX conformance, physical power/display lifecycle and 200 Hz presentation
+are not implied by the Stage 9 Iris graph release.

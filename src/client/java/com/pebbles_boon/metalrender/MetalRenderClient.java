@@ -644,7 +644,7 @@ public class MetalRenderClient implements ClientModInitializer {
           : Path.of(configuredRoot);
       if (IrisTranslationCoordinator.startIfEnabled(cacheRoot)) {
         MetalLogger.info(
-            "experimental Iris final-GLSL translation worker enabled");
+            "Iris-to-Metal translation and graph worker enabled");
       }
     } catch (Throwable error) {
       MetalLogger.warn(

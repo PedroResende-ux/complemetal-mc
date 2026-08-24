@@ -26,10 +26,21 @@ final class IrisRenderGraphKeyTest {
         .pingPongResourceCount());
   }
 
+  @Test
+  void textureAllocationExtentsParticipateInGraphIdentity() {
+    IrisRenderGraph original = graph(List.of(new IrisRenderGraph.Edge(0, 1)));
+    IrisRenderGraph resized = new IrisRenderGraph(
+        List.of(new IrisRenderGraph.Resource(0,
+            IrisRenderGraph.ResourceKind.TEXTURE, "rgba16-float", 1,
+            1280, 720, 1, 1)), original.nodes(), original.edges());
+    assertNotEquals(original.key(), resized.key());
+  }
+
   private static IrisRenderGraph graph(List<IrisRenderGraph.Edge> edges) {
     return new IrisRenderGraph(
         List.of(new IrisRenderGraph.Resource(0,
-            IrisRenderGraph.ResourceKind.TEXTURE, "rgba16-float", 1)),
+            IrisRenderGraph.ResourceKind.TEXTURE, "rgba16-float", 1,
+            1920, 1080, 1, 1)),
         List.of(
             new IrisRenderGraph.Node(0, IrisRenderGraph.NodeKind.DRAW,
                 IrisRenderGraph.Phase.GEOMETRY, SHADER, PIPELINE, 0,

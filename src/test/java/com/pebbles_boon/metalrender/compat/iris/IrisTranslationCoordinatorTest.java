@@ -19,6 +19,40 @@ final class IrisTranslationCoordinatorTest {
   Path temporaryDirectory;
 
   @Test
+  void onlyQueuedResourceReplacementIsRecoverableDuringOwnership() {
+    assertTrue(IrisTranslationCoordinator.recoverableOwnershipInvalidation(
+        "graph-native-resource-generation-stale"));
+    assertTrue(IrisTranslationCoordinator.recoverableOwnershipInvalidation(
+        "graph-frame-texture-generation-stale"));
+    assertFalse(IrisTranslationCoordinator.recoverableOwnershipInvalidation(
+        "graph-native-presentation-size-unsupported"));
+    assertFalse(IrisTranslationCoordinator.recoverableOwnershipInvalidation(
+        "graph-native-draw-pipeline-state-mismatch"));
+    assertFalse(IrisTranslationCoordinator.recoverableOwnershipInvalidation(
+        null));
+  }
+
+  @Test
+  void fullGraphParityRequiresThreeConsecutivePassingFrames() {
+    assertFalse(IrisTranslationCoordinator.fullGraphParityConverged(
+        new IrisVisualParityGate.Status(4, 3, 1, 2,
+            0.0015, 0.2, 27, false)));
+    assertTrue(IrisTranslationCoordinator.fullGraphParityConverged(
+        new IrisVisualParityGate.Status(6, 5, 1, 3,
+            0.0015, 0.2, 27, false)));
+  }
+
+  @Test
+  void packedHdrReadbackIsRestrictedToExactDiagnosticMode() {
+    assertTrue(IrisTranslationCoordinator.fullGraphReadbackFormatSupported(
+        "rgba8-unorm", false));
+    assertFalse(IrisTranslationCoordinator.fullGraphReadbackFormatSupported(
+        "rg11b10-float", false));
+    assertTrue(IrisTranslationCoordinator.fullGraphReadbackFormatSupported(
+        "rg11b10-float", true));
+  }
+
+  @Test
   void backgroundWorkerTranslatesAndExposesStableCounters()
       throws Exception {
     IrisTranslationProfile profile =
@@ -85,10 +119,74 @@ final class IrisTranslationCoordinatorTest {
       assertEquals(0, status.translated());
       assertEquals(1, status.failed());
       assertTrue(status.lastFailure().contains("geometry unsupported"));
+      assertEquals("geometry-unsupported-keep-iris-opengl",
+          status.translationFailureReasonSummary());
       assertEquals(0, backend.calls.get());
     } finally {
       coordinator.close();
     }
+  }
+
+  @Test
+  void exposesBoundedTranslationFailureDiagnostics() {
+    IrisTranslationCoordinator.BoundedReasonSet reasons =
+        new IrisTranslationCoordinator.BoundedReasonSet(4);
+    reasons.add(IrisTranslationCoordinator.diagnosticFailureReason(
+        new IrisShaderTranslationException(
+            "shaderc failed for vertex: vertex.glsl:42: error: bad token")));
+
+    assertEquals(1, reasons.size());
+    assertTrue(reasons.complete());
+    assertEquals(
+        "shaderc_failed_for_vertex:_vertex.glsl:42:_error:_bad_token",
+        reasons.summary());
+    assertTrue(reasons.sha256().matches("[0-9a-f]{64}"));
+  }
+
+  @Test
+  void boundedReasonsAreSortedNormalizedAndFailClosedWhenTruncated() {
+    IrisTranslationCoordinator.BoundedReasonSet reasons =
+        new IrisTranslationCoordinator.BoundedReasonSet(2);
+
+    reasons.add(" z reason ");
+    reasons.add("a reason");
+    reasons.add("middle/reason");
+    reasons.add("a reason");
+
+    assertEquals(2, reasons.size());
+    assertEquals("a_reason,middle/reason", reasons.summary());
+    assertFalse(reasons.complete());
+    assertTrue(reasons.sha256().matches("[0-9a-f]{64}"));
+  }
+
+  @Test
+  void shadowPlanStatusRequiresObservedUnblockedExecution() {
+    String emptyDigest = new IrisTranslationCoordinator.BoundedReasonSet(2)
+        .sha256();
+
+    assertTrue(new IrisTranslationCoordinator.ShadowPlanStatus(
+        2, 2, 0, 14, 0, true, emptyDigest, "").complete());
+    assertFalse(new IrisTranslationCoordinator.ShadowPlanStatus(
+        2, 1, 1, 14, 1, true, emptyDigest,
+        "resource-metadata-incomplete").complete());
+    assertFalse(new IrisTranslationCoordinator.ShadowPlanStatus(
+        0, 0, 0, 0, 0, true, emptyDigest, "").complete());
+  }
+
+  @Test
+  void shadowReplayExecutionGateRequiresAllPhasesAndCleanAccounting() {
+    String emptyDigest = new IrisTranslationCoordinator.BoundedReasonSet(2)
+        .sha256();
+    String phases = "SHADOW,GEOMETRY,COMPOSITE,FINAL";
+
+    assertTrue(new IrisTranslationCoordinator.ShadowReplayStatus(
+        true, 8, 4, 4, 4, 0, 0, 0, 4, true, 4, phases,
+        "18446744073709551615", 1280, 720, 0, true, emptyDigest, "")
+        .executionComplete());
+    assertFalse(new IrisTranslationCoordinator.ShadowReplayStatus(
+        true, 8, 4, 4, 3, 1, 0, 0, 4, true, 3,
+        "SHADOW,GEOMETRY,FINAL", "9", 1280, 720, 1, true, emptyDigest,
+        "native-replay-unsupported").executionComplete());
   }
 
   private static IrisFinalShaderProgram graphics(String name) {

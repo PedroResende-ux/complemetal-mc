@@ -1,137 +1,153 @@
 # MetalRender
 
-MetalRender is a Fabric client renderer for Apple Silicon Macs. Its stable
-profile mirrors selected Minecraft terrain data into a native Metal 3
-compatibility stream and falls back to Minecraft's normal renderer whenever
-the native path is unsupported or cannot be initialized.
+MetalRender is a Fabric client renderer for Apple Silicon Macs. Version
+`0.3.0+mc26.2` adds a stable Iris-to-Metal 4 path for Minecraft Java Edition
+26.2: Iris' final transformed GLSL is compiled through SPIR-V and MSL, cached
+as device-qualified Metal pipelines, and executed as one persistent
+Metal-owned frame graph. The final image is handed to Minecraft through a
+fenced IOSurface without a CPU pixel copy.
 
-The `0.2.x` line targets Minecraft Java Edition 26.2. The stable
-`0.2.1+mc26.2` release is deliberately hybrid: MetalRender probes and
-instantiates Metal 4 command-queue and allocator objects when the operating
-system exposes them, while all active native draw encoding remains on the
-Metal 3 compatibility stream. Actual MTL4 draw encoding is disabled.
+The release is deliberately fail-open. If Metal 4, a translated shader,
+pipeline state, resource binding, lifecycle state, or presentation surface is
+not proven safe, MetalRender retains Iris/OpenGL or Minecraft's normal
+renderer. It never guesses a missing binding or silently substitutes a shader.
 
 > MetalRender is not affiliated with or endorsed by Apple or Mojang.
 
-## Support matrix
+## Supported release matrix
 
-| Component | Supported configuration |
+| Component | Validated configuration |
 | --- | --- |
-| MetalRender | `0.2.1+mc26.2` |
-| Minecraft | 26.2 |
-| Loader | Fabric Loader 0.19.3 or newer |
+| MetalRender | `0.3.0+mc26.2` |
+| Minecraft | Java Edition 26.2 |
+| Loader | Fabric Loader 0.19.3 or newer compatible build |
 | Fabric API | 0.156.0+26.2 or newer compatible 26.2 build |
 | Java | 25 |
-| Platform | Apple Silicon macOS |
-| Native deployment target | macOS 14.0 |
-| Native draw path | Metal 3 compatibility terrain stream |
-| Metal 4 | Runtime-detected queue/allocator probe only; no MTL4 draws |
-| Sodium | Optional; 0.9.1 for Minecraft 26.2 is the compatibility target |
-| Iris | Optional; 1.11.2 compatibility target; Iris rendering remains OpenGL |
-| Iris-to-Metal in stable `0.2.1` | Experimental opt-in cache preparation; no Metal execution or FPS claim |
-| Iris compiler milestone in development `0.3.0-alpha.1` | Optional ephemeral MSL library validation; no pipeline, draw or FPS claim |
-| Iris resource milestone on the development branch | SPIR-V layout reflection and live GL binding parity validated; no Metal render graph or draw |
-| Display scope | Window resize and fullscreen are validated; true 2x Retina backing is not validated |
-| Power/external display lifecycle | Sleep/wake and display hot-plug/reconnect are not validated |
-| High-refresh presentation | Real presented 200 Hz pacing is not validated |
-| Other operating systems / Intel Macs | Safe vanilla fallback, no MetalRender acceleration |
+| Platform | Apple Silicon, macOS 26, Metal 4 runtime |
+| Iris | 1.11.2 for Minecraft 26.2 |
+| Sodium | 0.9.1 for Minecraft 26.2 |
+| Shader-pack acceptance workload | Complementary Reimagined r5.8.1 |
+| Iris draw path | SHADOW, GEOMETRY, DEFERRED, COMPOSITE and FINAL graph owned by Metal 4 after parity validation |
+| Presentation | Asynchronous fenced IOSurface handoff; no CPU output copy and no steady-state `glFinish` |
+| Metal 3 / unavailable Metal 4 | Safe Iris/OpenGL or Minecraft fallback |
 
-The packaged native library is arm64-only. Metal 4 is never assumed from a
-marketing device name: MetalRender probes the runtime APIs and reports the
-result in the settings screen and `/metalrender status`.
+The packaged native library is arm64-only with a macOS 14 deployment target,
+but automatic Iris graph ownership is enabled only by the packaged stable JAR
+on Apple Silicon macOS 26 or newer. Other shader packs are not advertised as
+prevalidated: supported states may use Metal after the same strict gates;
+unknown or unsupported states remain on Iris/OpenGL.
 
-## What changed for 26.2
+The following are outside this release's validated scope:
 
-The `0.2.1+mc26.2` stable patch replaces the misleading random F3 status with
-deterministic active, Iris/OpenGL pause, initialization and fallback states;
-adds a valid Mod Menu icon; and blocks Metal frame encoding until both Iris'
-live compatibility state and the renderer's applied pause latch permit it.
-This patch does not change the native draw-path boundary described below.
+- true 2x Retina framebuffer backing;
+- physical macOS sleep/wake;
+- external-display hot-plug or reconnect;
+- real display presentation at 200 Hz;
+- Intel Macs and non-macOS systems;
+- geometry-shader packs, because Metal has no direct geometry-shader stage.
 
-- Updated the Fabric toolchain, mappings and Java target for Minecraft 26.2.
-- Rebased renderer hooks on the 26.2 extraction/render lifecycle.
-- Added lazy, checksum-versioned loading of the bundled native library.
-- Added fail-open initialization and explicit restart/shutdown handling.
-- Added a conservative Metal terrain composite between vanilla opaque terrain
-  and vanilla feature rendering, keeping entities, particles and incomplete
-  chunk areas on the vanilla path by default.
-- Replaced synchronous raw OpenGL atlas/lightmap readback with Minecraft's
-  fenced texture-to-buffer handoff.
-- Reworked IOSurface reuse around per-slot state and completion fences.
-- Corrected reversed-Z depth state and private OIT texture allocation.
-- Replaced the fixed 3 GiB native arena with a startup budget that is capped
-  against Metal's `recommendedMaxWorkingSetSize`. This is a static safety cap,
-  not a runtime memory-pressure handler.
-- Added optional MetalFX scaling and runtime QoS controls.
-- Match the native frame-time budget to the active display refresh and the
-  user's Minecraft FPS cap by default.
-- Disabled unvalidated mesh-shader and Hi-Z paths by default.
-- Added unit, JNI parity and packaged-JAR verification.
-- Added automatic Iris shader-pack compatibility pause plus an opt-in,
-  fail-open capture and GLSL-to-SPIR-V-to-MSL translation foundation.
+## What Stage 9 delivers
 
-See [Metal 4 status](docs/METAL4_STATUS.md) for the exact implementation
-boundary, [Iris to Metal pipeline](docs/IRIS_METAL_PIPELINE.md) for the shader
-translation contract, [the ordered Iris-to-Metal roadmap](docs/ROADMAP.md) for
-the remaining gates, [the 0.3.0 alpha Stage 2
-checklist](docs/RELEASE_CHECKLIST_0.3.0-alpha.1.md), [the 0.2.1 release
-checklist](docs/RELEASE_CHECKLIST_0.2.1.md) for stable artifact evidence, and
-[the changelog](CHANGELOG.md) for release details. The original
-[`0.2.0` checklist](docs/RELEASE_CHECKLIST.md) remains a historical record.
+The stable path performs the complete validated chain:
+
+```text
+Iris final GLSL
+  -> shaderc SPIR-V with OpenGL semantics
+  -> SPIRV-Cross MSL
+  -> Apple Metal library
+  -> device/OS/compiler-qualified MTL4 pipeline archive
+  -> persistent Metal graph resources
+  -> frame-batched MTL4 passes, draws, transfers and barriers
+  -> fenced IOSurface presentation
+```
+
+The implementation captures and keys the exact Iris vertex ABI, attachment
+formats, blend/depth/stencil/raster state, specialization constants, uniforms,
+samplers, textures, images, UBOs and SSBOs. It retains compatible buffers and
+textures in bounded resident caches, tracks RAW/WAR/WAW graph hazards, and
+uses asynchronous frame submissions so the render thread can reuse the last
+completed surface rather than waiting behind native encoding.
+
+Exact-JAR acceptance covers cold and warm caches, Iris on/off/on, Overworld,
+Nether, End and return to Overworld, resize, fullscreen, surface suspend and
+restore, exact three-frame visual parity, persistent pipeline archives, and a
+forced Metal 3 fallback. See [the roadmap](docs/ROADMAP.md),
+[Metal 4 status](docs/METAL4_STATUS.md), [pipeline details](docs/IRIS_METAL_PIPELINE.md),
+[release checklist](docs/RELEASE_CHECKLIST_0.3.0.md), and
+[changelog](CHANGELOG.md).
+
+## Performance evidence
+
+On the validated M4 Pro test scene at 1280x720 with Complementary Reimagined
+r5.8.1, render distance 8, simulation distance 5, fixed camera, noon and clear
+weather, two 600-frame warm-cache A/B runs passed in both launch orders.
+
+First matched run:
+
+| Metric | Iris/OpenGL | Metal 4 | Metal improvement |
+| --- | ---: | ---: | ---: |
+| CPU p50 | 5.898 ms | 3.253 ms | 44.8% |
+| CPU p95 | 8.719 ms | 5.462 ms | 37.4% |
+| CPU p99 | 11.118 ms | 6.858 ms | 38.3% |
+| GPU p95 | 7.773 ms | 6.257 ms | 19.5% |
+| GPU p99 | 9.596 ms | 6.477 ms | 32.5% |
+
+Reverse-order repeat:
+
+| Metric | Iris/OpenGL | Metal 4 | Metal improvement |
+| --- | ---: | ---: | ---: |
+| CPU p50 | 5.776 ms | 3.318 ms | 42.6% |
+| CPU p95 | 6.808 ms | 4.965 ms | 27.1% |
+| CPU p99 | 7.442 ms | 7.550 ms | -1.5% (within 5% gate) |
+| GPU p95 | 7.073 ms | 6.328 ms | 10.5% |
+| GPU p99 | 7.411 ms | 6.559 ms | 11.5% |
+
+Both sides recorded zero >=100 ms CPU/GPU stutters, and Metal recorded zero
+commit-feedback errors. These numbers prove an uplift for this exact matched
+scene; they are not a universal FPS guarantee. Fragment-math, shadow,
+volumetric, memory-bandwidth, resolution, pack and world bottlenecks can change
+the result.
 
 ## Install
 
-1. Install Minecraft 26.2, Fabric Loader and Fabric API.
-2. Use a Java 25 runtime.
-3. Copy the MetalRender JAR into the instance's `mods` directory.
-4. Start the game and run `/metalrender status`.
+1. Install Minecraft 26.2, Fabric Loader, Fabric API, Sodium and Iris.
+2. Use Java 25 and place the MetalRender JAR in the instance's `mods` folder.
+3. Install/select the shader pack, start the game, and run
+   `/metalrender status`.
 
-MetalRender does not abort startup on an unsupported machine. If the platform,
-Minecraft backend or native library is unsuitable, it stays disabled and
-Minecraft continues with its normal renderer.
+No JVM enable flags are required for stable `0.3.0`. To disable the complete
+Iris-to-Metal path for troubleshooting, add:
 
-Capture and initialization failures retain the normal renderer immediately.
-If native encoding or presentation fails after a vanilla submission has
-already been suppressed, the in-flight frame can be incomplete; the handshake
-is reset so the next frame returns to vanilla.
-
-## Build
-
-```bash
-./gradlew clean test check build
+```text
+-Dmetalrender.irisMetal.enabled=false
 ```
 
-This is the development build and test path. It does not pretend that an
-offline Metal shader library exists when the Metal compiler is unavailable.
+After disabling, Iris continues through OpenGL. Include the flag state when
+reporting a bug.
 
-To rebuild the native library without recompiling offline Metal shaders:
+## Build and verify
 
-```bash
-BUILD_SHADERS=0 ./compile_native.sh
-```
-
-A full shader rebuild requires the complete Xcode toolchain selected with
-`DEVELOPER_DIR`; Command Line Tools alone do not provide `metal` and
-`metallib`. Xcode 26 may also require its separately installed Metal Toolchain
-component:
+Development build:
 
 ```bash
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  xcodebuild -downloadComponent MetalToolchain
+./gradlew test check build
 ```
 
-For a publishable artifact, run the fail-closed release gate with full Xcode
-selected:
+Publishable release build with full Xcode selected:
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   ./gradlew clean test check build releaseCheck
 ```
 
-`releaseCheck` rebuilds the native library and every offline shader, verifies
-source and packaged-binary JNI parity, and rejects a JAR without a compiled
-`shaders.metallib`. Ordinary development builds can still use the native
-inline-shader fallback.
+`releaseCheck` rebuilds the native arm64 library and offline Metal shaders,
+checks all Java/JNI declarations, runs the test suite, and verifies the exact
+JAR payload. Xcode 26 may require its separately installed Metal Toolchain:
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild -downloadComponent MetalToolchain
+```
 
 Useful focused checks:
 
@@ -139,68 +155,16 @@ Useful focused checks:
 ./gradlew test checkJniParity
 ./gradlew verifyReleaseJar
 ./scripts/run_asan_smoke.sh
+python3 scripts/exact_jar_qa.py --help
+python3 scripts/stage9_performance_qa.py --help
 ```
-
-The ASan helper checks the instrumented native payload, including texture
-upload/flush and 1000 Metal 4-runtime/Metal 3-draw hybrid plus 240 forced
-Metal 3 offscreen frames. It
-clone-copies and ad-hoc signs a temporary Java 25 launcher because macOS
-rejects sanitizer injection into the stock Hardened Runtime launcher. It
-always rebuilds the optimized release native payload before returning. A
-process-wide ASan Minecraft run is not a reliable gate on this system because
-the closed Apple OpenGL shader linker can fault under sanitizer injection.
-
-## Runtime controls
-
-Open the MetalRender panel from Video Settings or use `/metalrender config
-open`. The Metal 4 hybrid runtime is enabled by default when the operating
-system exposes it; MetalFX remains opt-in. Both retain conservative fallbacks.
-Safe alpha-overlay mode keeps vanilla terrain underneath and renders vanilla
-entities, particles and translucent terrain after the Metal opaque composite.
-Fast terrain replacement remains a command-line development experiment until
-native depth interop and full mesh coverage pass conformance.
-Experimental mesh shaders and Hi-Z culling are off in the supported release
-configuration; explicit JVM properties can opt into those development paths.
-Native entity/particle replacement is release-locked off because that legacy
-path still uses unsafe raw OpenGL texture readback on the current macOS driver.
-
-The development Stage 2 Iris compiler validation requires all three JVM
-properties below. It is intended for isolated QA profiles, not the supported
-stable install:
-
-```text
--Dmetalrender.experimental.irisMetalPipeline=true
--Dmetalrender.experimental.irisMetalTranslation=true
--Dmetalrender.experimental.irisMetalLibraryValidation=true
-```
-
-See [COMMANDS.md](COMMANDS.md) for the complete command list.
-
-Stable refers only to the conservative hybrid profile in the support matrix.
-This release is not a complete MTL4 renderer and carries no guaranteed
-performance uplift. Stable `0.2.1` only prepares SPIR-V/MSL cache artifacts.
-Development `0.3.0-alpha.1` can additionally compile and release ephemeral
-Metal libraries, and the current branch can reflect and resolve their runtime
-resource ABI, but still creates no Iris Metal pipeline and does not replace
-Iris' OpenGL draws. Neither boundary currently increases Iris FPS. Native
-payload and lifecycle checks complement, but do not replace, visual comparison
-on real hardware.
 
 ## Reporting bugs
 
-Include:
-
-- the MetalRender version and Minecraft version;
-- macOS version and Mac model;
-- output from `/metalrender status`;
-- `latest.log`;
-- whether the issue disappears after `/metalrender restart`;
-- a screenshot or short capture for visual corruption.
-
-Do not report a successful synthetic/native smoke test as proof of correct
-in-game rendering. The stable profile was validated separately in game.
-True 2x Retina backing, sleep/wake, external-display reconnect and real
-presented 200 Hz pacing remain outside the validated `0.2.1` support scope.
+Include the MetalRender/Minecraft/macOS versions, Mac model, shader pack,
+`/metalrender status`, `latest.log`, whether the issue remains after
+`/metalrender restart`, and a screenshot or short capture. Also state whether
+`-Dmetalrender.irisMetal.enabled=false` removes the issue.
 
 ## License
 

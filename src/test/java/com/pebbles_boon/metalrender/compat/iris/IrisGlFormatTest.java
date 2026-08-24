@@ -7,13 +7,21 @@ import org.junit.jupiter.api.Test;
 
 final class IrisGlFormatTest {
   @Test
-  void mapsExactPackColorAndDepthFormats() {
-    assertEquals("rgba8-unorm",
-        IrisGlFormat.cacheName(0x8058).orElseThrow());
-    assertEquals("rgba16-float",
-        IrisGlFormat.cacheName(0x881A).orElseThrow());
-    assertEquals("d32-float",
-        IrisGlFormat.cacheName(0x8CAC).orElseThrow());
-    assertTrue(IrisGlFormat.cacheName(-1).isEmpty());
+  void acceptsOnlyByteExactRgba8Uploads() {
+    assertEquals(4, IrisGlFormat.bytesPerPixel(0x8058).orElseThrow());
+    assertEquals(4, IrisGlFormat.exactUploadBytesPerPixel(
+        0x8058, 0x1908, 0x1401).orElseThrow());
+    assertTrue(IrisGlFormat.exactUploadBytesPerPixel(
+        0x8058, 0x1907, 0x1401).isEmpty());
+    assertTrue(IrisGlFormat.exactUploadBytesPerPixel(
+        0x8058, 0x1908, 0x1406).isEmpty());
+  }
+
+  @Test
+  void distinguishesIntegerAndNormalizedUploadClasses() {
+    assertEquals(8, IrisGlFormat.exactUploadBytesPerPixel(
+        0x8D76, 0x8D99, 0x1403).orElseThrow());
+    assertTrue(IrisGlFormat.exactUploadBytesPerPixel(
+        0x8D76, 0x1908, 0x1403).isEmpty());
   }
 }

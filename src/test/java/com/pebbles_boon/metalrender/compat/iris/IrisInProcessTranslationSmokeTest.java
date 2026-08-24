@@ -5,9 +5,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.mojang.blaze3d.GpuFormat;
+import com.mojang.blaze3d.vertex.VertexFormat;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Set;
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
@@ -61,6 +65,158 @@ final class IrisInProcessTranslationSmokeTest {
     assertEquals(2, translation.stages().size());
     assertStage(translation.stage(IrisShaderStage.VERTEX), "vertex");
     assertStage(translation.stage(IrisShaderStage.FRAGMENT), "fragment");
+    String vertexMsl = translation.stage(IrisShaderStage.VERTEX).msl();
+    assertTrue(vertexMsl.matches(
+        "(?s).*\\.gl_Position\\.y\\s*=\\s*-\\(.*\\.gl_Position\\.y\\).*"),
+        vertexMsl);
+    assertTrue(vertexMsl.matches(
+        "(?s).*\\.gl_Position\\.z\\s*=\\s*\\(.*\\.gl_Position\\.z\\s*\\+\\s*"
+            + ".*\\.gl_Position\\.w\\)\\s*\\*\\s*0\\.5.*"), vertexMsl);
+  }
+
+  @Test
+  void optimizesOrdinaryMathButPreservesExplicitPreciseMath()
+      throws Exception {
+    assumeEnabled();
+    LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
+        LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
+    IrisFinalShaderProgram program =
+        IrisFinalShaderProgram.fromGraphicsLink("math-contract-smoke",
+            """
+            #version 450
+            layout(location = 0) in vec3 inPosition;
+            uniform float scale;
+            void main() {
+              gl_Position = vec4(inPosition * scale + vec3(0.25), 1.0);
+            }
+            """,
+            null, null, null,
+            """
+            #version 450
+            uniform float exposure;
+            layout(location = 0) out vec4 outColor;
+            void main() {
+              precise float preserved = exposure * 0.5 + 0.25;
+              outColor = vec4(preserved);
+            }
+            """);
+
+    IrisShaderTranslation translation = backend.translate(program);
+    String vertexMsl = translation.stage(IrisShaderStage.VERTEX).msl();
+    String fragmentMsl = translation.stage(IrisShaderStage.FRAGMENT).msl();
+
+    assertFalse(vertexMsl.contains("[[clang::optnone]]"), vertexMsl);
+    assertFalse(vertexMsl.contains("spvFMul("), vertexMsl);
+    assertTrue(fragmentMsl.contains("[[clang::optnone]]"), fragmentMsl);
+    assertTrue(fragmentMsl.contains("spvFMul("), fragmentMsl);
+  }
+
+  @Test
+  void remapsIrisLocationsAndWidensPackedVertexInputs() throws Exception {
+    assumeEnabled();
+    LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
+        LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
+    IrisFinalShaderProgram program =
+        IrisFinalShaderProgram.fromGraphicsLink("packed-input-smoke",
+            """
+            #version 450
+            in vec3 iris_Position;
+            in ivec3 iris_Entity;
+            void main() {
+              gl_Position = vec4(iris_Position
+                  + vec3(iris_Entity) * 0.0001, 1.0);
+            }
+            """,
+            null, null, null,
+            """
+            #version 450
+            layout(location = 0) out vec4 outColor;
+            void main() { outColor = vec4(1.0); }
+            """)
+            .withVertexShaderInputs(List.of(
+                new IrisVertexLayoutCapture.ShaderInput(
+                    "iris_Position", 0,
+                    new IrisPipelineState.DataFormat("rgb32-float")),
+                new IrisVertexLayoutCapture.ShaderInput(
+                    "iris_Entity", 6,
+                    new IrisPipelineState.DataFormat("rgba16-uint"))));
+
+    String msl = backend.translate(program)
+        .stage(IrisShaderStage.VERTEX).msl();
+
+    assertTrue(msl.matches(
+        "(?s).*float3\\s+iris_Position\\s+\\[\\[attribute\\(0\\)\\]\\].*"),
+        msl);
+    assertTrue(msl.matches(
+        "(?s).*uint4\\s+iris_Entity\\s+\\[\\[attribute\\(6\\)\\]\\].*"),
+        msl);
+    assertTrue(msl.contains("int3(in.iris_Entity.xyz)"), msl);
+  }
+
+  @Test
+  void mapsNormalizedStorageToRawIntegerMetalInput() throws Exception {
+    assumeEnabled();
+    LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
+        LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
+    String vertex = """
+        #version 450
+        in uvec4 a_LightAndData;
+        void main() {
+          gl_Position = vec4(a_LightAndData) * 0.0001;
+        }
+        """;
+    IrisVertexLayoutCapture.Layout layout =
+        IrisVertexLayoutCapture.resolveShaderInputFormats(vertex,
+            IrisVertexLayoutCapture.capture(VertexFormat.builder(0)
+                .addAttribute("a_LightAndData", GpuFormat.RGBA8_UNORM)
+                .build(), true));
+    IrisFinalShaderProgram program =
+        IrisFinalShaderProgram.fromGraphicsLink("normalized-integer-smoke",
+            vertex, null, null, null,
+            """
+            #version 450
+            layout(location = 0) out vec4 outColor;
+            void main() { outColor = vec4(1.0); }
+            """)
+            .withVertexShaderInputs(layout.shaderInputs());
+
+    String msl = backend.translate(program)
+        .stage(IrisShaderStage.VERTEX).msl();
+
+    assertEquals("rgba8-uint",
+        layout.attributes().getFirst().format().cacheName());
+    assertTrue(msl.matches(
+        "(?s).*uint4\\s+a_LightAndData\\s+\\[\\[attribute\\(0\\)\\]\\].*"),
+        msl);
+  }
+
+  @Test
+  void preservesOpenGlDefaultComponentsForWiderShaderInput()
+      throws Exception {
+    assumeEnabled();
+    LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
+        LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
+    IrisFinalShaderProgram program =
+        IrisFinalShaderProgram.fromGraphicsLink("default-components-smoke",
+            """
+            #version 450
+            in vec4 Position;
+            void main() { gl_Position = Position; }
+            """,
+            null, null, null,
+            """
+            #version 450
+            layout(location = 0) out vec4 outColor;
+            void main() { outColor = vec4(1.0); }
+            """)
+            .withVertexShaderInputs(List.of(
+                new IrisVertexLayoutCapture.ShaderInput("Position", 0,
+                    new IrisPipelineState.DataFormat("rgb32-float"))));
+
+    String msl = backend.translate(program)
+        .stage(IrisShaderStage.VERTEX).msl();
+
+    assertTrue(msl.contains("[[attribute(0)]]"), msl);
   }
 
   @Test
@@ -207,6 +363,99 @@ final class IrisInProcessTranslationSmokeTest {
         names(fragment).toString());
     assertTrue(names(fragment).contains("exposure"),
         names(fragment).toString());
+  }
+
+  @Test
+  void reflectsExactSpirvCrossArgumentBufferIds() throws Exception {
+    assumeEnabled();
+    LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
+        LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
+    IrisFinalShaderProgram program = IrisFinalShaderProgram.fromGraphicsLink(
+        "argument-layout-smoke",
+        """
+        #version 450
+        layout(location=0) in vec3 pos;
+        uniform mat4 model;
+        uniform float exposure;
+        layout(std140,binding=3) uniform Camera { vec4 tint; } camera;
+        layout(std430,binding=4) buffer Data { float values[]; } data;
+        layout(binding=5) uniform sampler2D tex;
+        void main() {
+          gl_Position=model*vec4(pos,1)+camera.tint*exposure
+              +texture(tex,vec2(.5))+vec4(data.values[0]);
+        }
+        """, null, null, null,
+        """
+        #version 450
+        layout(location=0) out vec4 outColor;
+        void main() { outColor=vec4(1); }
+        """);
+    byte[] spirv = backend.translate(program)
+        .stage(IrisShaderStage.VERTEX).spirv();
+
+    IrisMslArgumentLayoutReader.StageResult result =
+        IrisMslArgumentLayoutReader.reflect(IrisShaderStage.VERTEX, spirv);
+    assertTrue(result instanceof IrisMslArgumentLayoutReader.StageComplete,
+        result.toString());
+    IrisMslArgumentLayout.StageLayout layout =
+        ((IrisMslArgumentLayoutReader.StageComplete) result).layout();
+    Map<IrisSpirvResourceLayout.ResourceAddress,
+        IrisMslArgumentLayout.ArgumentBinding> bindings =
+        layout.bindings().stream().collect(Collectors.toMap(
+            IrisMslArgumentLayout.ArgumentBinding::address,
+            binding -> binding));
+
+    assertEquals(1, bindings.get(
+        new IrisSpirvResourceLayout.DescriptorAddress(0, 3)).primaryId());
+    assertEquals(5, bindings.get(
+        new IrisSpirvResourceLayout.DescriptorAddress(0, 4)).primaryId());
+    IrisMslArgumentLayout.ArgumentBinding sampled = bindings.get(
+        new IrisSpirvResourceLayout.DescriptorAddress(0, 5));
+    assertEquals(3, sampled.primaryId());
+    assertEquals(4, sampled.secondaryId());
+    assertEquals(0, bindings.get(
+        new IrisSpirvResourceLayout.UniformLocation(0, 1)).primaryId());
+    assertEquals(2, bindings.get(
+        new IrisSpirvResourceLayout.UniformLocation(0, 2)).primaryId());
+  }
+
+  @Test
+  void reflectsSampledImageUsedByTextureQuery() throws Exception {
+    assumeEnabled();
+    LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
+        LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
+    IrisFinalShaderProgram program = IrisFinalShaderProgram.fromGraphicsLink(
+        "texture-only-argument-smoke",
+        """
+        #version 450
+        layout(location=0) in vec3 pos;
+        layout(binding=2) uniform isampler2D sectionTimeInfo;
+        void main() {
+          int value=textureSize(sectionTimeInfo,0).x;
+          gl_Position=vec4(pos+vec3(float(value)*0.000001),1);
+        }
+        """, null, null, null,
+        """
+        #version 450
+        layout(location=0) out vec4 outColor;
+        void main() { outColor=vec4(1); }
+        """);
+    byte[] spirv = backend.translate(program)
+        .stage(IrisShaderStage.VERTEX).spirv();
+
+    IrisMslArgumentLayoutReader.StageResult result =
+        IrisMslArgumentLayoutReader.reflect(IrisShaderStage.VERTEX, spirv);
+    assertTrue(result instanceof IrisMslArgumentLayoutReader.StageComplete,
+        result.toString());
+    IrisMslArgumentLayout.ArgumentBinding sampled =
+        ((IrisMslArgumentLayoutReader.StageComplete) result).layout()
+            .bindings().stream()
+            .filter(binding -> binding.kind()
+                == IrisSpirvResourceLayout.ResourceKind.SAMPLED_IMAGE)
+            .findFirst().orElseThrow();
+    assertTrue(sampled.primaryId() >= 0);
+    assertTrue(sampled.secondaryId() < 0
+        || sampled.secondaryId() != sampled.primaryId());
   }
 
   private static void assumeEnabled() {

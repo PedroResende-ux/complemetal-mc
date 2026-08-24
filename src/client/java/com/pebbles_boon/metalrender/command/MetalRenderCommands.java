@@ -184,6 +184,22 @@ public final class MetalRenderCommands {
                     : irisTranslation.enabled()
                         ? "§eEnabled, worker unavailable"
                         : "§7Disabled"));
+        if (!irisTranslation.translationFailureReasonSummary().isEmpty()) {
+            msg(src, "§7Iris translation failure reasons: §f"
+                    + irisTranslation.translationFailureReasonSummary()
+                    + " §7(count="
+                    + irisTranslation.translationFailureReasonCount()
+                    + ", "
+                    + (irisTranslation.translationFailureReasonSetComplete()
+                        ? "complete" : "truncated")
+                    + ")");
+        }
+        if (!com.pebbles_boon.metalrender.compat.iris.IrisShaderCapture
+                .captureFailureReasonSummary().isEmpty()) {
+            msg(src, "§7Iris capture failure reasons: §f"
+                    + com.pebbles_boon.metalrender.compat.iris.IrisShaderCapture
+                        .captureFailureReasonSummary());
+        }
         if (irisTranslation.libraryValidationEnabled()) {
             msg(src, "§7Iris MSL library validation: "
                     + (irisTranslation.libraryValidationComplete()
@@ -274,11 +290,112 @@ public final class MetalRenderCommands {
                 + graph.graphsAttempted() + ", nodes="
                 + graph.nodesRepresented() + ", edges="
                 + graph.edgesRepresented() + ", barriers="
-                + graph.barriersRepresented() + ", transfers="
+                + graph.barriersRepresented() + ", clears="
+                + graph.clearsRepresented() + ", transfers="
                 + graph.transfersRepresented() + ", pingPong="
                 + graph.pingPongResourcesRepresented() + ")");
         msg(src, "§7Iris render-graph phases: §f" + graph.phaseSummary()
                 + " §7(digest=" + graph.graphSetSha256() + ")");
+        IrisTranslationCoordinator.MetalGraphResourceStatus graphResources =
+                IrisTranslationCoordinator.metalGraphResourceStatus();
+        msg(src, "§7Iris Metal graph attachments: "
+                + (graphResources.complete() ? "§aPrivate/resident"
+                    : graphResources.safeUnsupportedFallback()
+                        ? "§7Metal 3 safe fallback"
+                        : graphResources.enabled()
+                            ? "§eCollecting/fallback" : "§7Disabled")
+                + " §7(plans=" + graphResources.plansComplete() + "/"
+                + graphResources.plansObserved() + ", allocations="
+                + graphResources.allocationsRequested() + ", native="
+                + graphResources.nativeTextureCount() + ", bytes="
+                + graphResources.nativeTextureBytes() + ", blockers="
+                + graphResources.blockerCount() + ")");
+        if (!graphResources.blockerSummary().isEmpty()) {
+            msg(src, "§7Iris Metal attachment blockers: §f"
+                    + graphResources.blockerSummary());
+        }
+        IrisTranslationCoordinator.FullGraphStatus fullGraph =
+                IrisTranslationCoordinator.fullGraphStatus();
+        msg(src, "§7Iris full Metal graph: "
+                + (fullGraph.validated() ? "§aValidated offscreen"
+                    : fullGraph.enabled() ? "§eCollecting/fallback"
+                    : "§7Disabled")
+                + " §7(frames=" + fullGraph.framesSucceeded() + "/"
+                + fullGraph.framesAttempted() + ", planned="
+                + fullGraph.framesPlanned() + ", pending="
+                + fullGraph.framesPending() + ", draws="
+                + fullGraph.draws() + ", operations="
+                + fullGraph.operations() + ", initialized="
+                + fullGraph.initializedResources() + ", hash="
+                + fullGraph.lastOutputHashUnsigned() + ", ownership="
+                + fullGraph.ownershipMode() + ", invalidated="
+                + fullGraph.ownershipFramesInvalidated() + ")");
+        if (!fullGraph.blockerSummary().isEmpty()) {
+            msg(src, "§7Iris full graph blockers: §f"
+                    + fullGraph.blockerSummary());
+        }
+        IrisTranslationCoordinator.ShadowPlanStatus shadow =
+                IrisTranslationCoordinator.shadowPlanStatus();
+        msg(src, "§7Iris shadow replay plan: "
+                + (shadow.complete() ? "§aStructurally complete"
+                    : "§eCollecting/fallback")
+                + " §7(plans=" + shadow.structurallyComplete() + "/"
+                + shadow.plansObserved() + ", steps="
+                + shadow.executionSteps() + ", blockers="
+                + shadow.blockerCount() + ")");
+        if (!shadow.blockerSummary().isEmpty()) {
+            msg(src, "§7Iris shadow replay blockers: §f"
+                    + shadow.blockerSummary());
+        }
+        IrisTranslationCoordinator.ShadowBufferStatus shadowBuffers =
+                IrisTranslationCoordinator.shadowBufferStatus();
+        msg(src, "§7Iris shadow replay buffers: "
+                + (shadowBuffers.complete() ? "§aComplete"
+                    : shadowBuffers.enabled() ? "§eCollecting/fallback"
+                    : "§7Disabled")
+                + " §7(plans=" + shadowBuffers.completePlans() + "/"
+                + shadowBuffers.plansObserved() + ", images="
+                + shadowBuffers.bufferImages() + ", bytes="
+                + shadowBuffers.bufferBytes() + ", blockers="
+                + shadowBuffers.blockerCount() + ")");
+        if (!shadowBuffers.blockerSummary().isEmpty()) {
+            msg(src, "§7Iris shadow buffer blockers: §f"
+                    + shadowBuffers.blockerSummary());
+        }
+        IrisTranslationCoordinator.ShadowArgumentStatus shadowArguments =
+                IrisTranslationCoordinator.shadowArgumentStatus();
+        msg(src, "§7Iris MSL argument tables: "
+                + (shadowArguments.complete() ? "§aComplete"
+                    : shadowArguments.enabled() ? "§eCollecting/fallback"
+                    : "§7Disabled")
+                + " §7(plans=" + shadowArguments.completePlans() + "/"
+                + shadowArguments.plansObserved() + ", arguments="
+                + shadowArguments.argumentsResolved() + ", inlineBytes="
+                + shadowArguments.inlineUniformBytes() + ", blockers="
+                + shadowArguments.blockerCount() + ")");
+        if (!shadowArguments.blockerSummary().isEmpty()) {
+            msg(src, "§7Iris MSL argument blockers: §f"
+                    + shadowArguments.blockerSummary());
+        }
+        IrisTranslationCoordinator.ShadowReplayStatus shadowReplay =
+                IrisTranslationCoordinator.shadowReplayStatus();
+        msg(src, "§7Iris native Metal 4 replay: "
+                + (shadowReplay.executionComplete()
+                    ? "§aExecution coverage complete"
+                    : shadowReplay.enabled() ? "§eShadow-only/fallback"
+                    : "§7Disabled")
+                + " §7(draws=" + shadowReplay.drawsSucceeded() + "/"
+                + shadowReplay.drawsAttempted() + ", ready="
+                + shadowReplay.drawsReady() + ", blocked="
+                + shadowReplay.drawsBlocked() + ", phases="
+                + shadowReplay.successfulPhaseSummary() + ", hash="
+                + shadowReplay.lastColorHashUnsigned() + ", target="
+                + shadowReplay.lastWidth() + "x"
+                + shadowReplay.lastHeight() + ")");
+        if (!shadowReplay.blockerSummary().isEmpty()) {
+            msg(src, "§7Iris native replay blockers: §f"
+                    + shadowReplay.blockerSummary());
+        }
         msg(src, "§7Iris pipeline-state unsupported reasons: §f"
                 + (irisTranslation.pipelineStateUnsupportedReasonSummary()
                     .isEmpty()
@@ -297,7 +414,7 @@ public final class MetalRenderCommands {
                 + ")");
         if (irisTranslation.running()) {
             msg(src,
-                    "§7Iris Metal execution: §ePending; pipeline.status=pending; Iris OpenGL active");
+                    "§7Iris Metal execution: §eShadow-only; visual parity and cutover are disarmed; Iris OpenGL active");
         }
         msg(src, "§7Init state: §f" + MetalRenderClient.getInitState());
         if (MetalRenderClient.getInitFailure() != null) {

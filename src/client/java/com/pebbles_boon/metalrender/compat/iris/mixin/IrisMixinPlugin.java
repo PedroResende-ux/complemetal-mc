@@ -1,6 +1,7 @@
 package com.pebbles_boon.metalrender.compat.iris.mixin;
 
 import com.pebbles_boon.metalrender.compat.iris.IrisShaderCapture;
+import com.pebbles_boon.metalrender.compat.iris.IrisMetalFeatureFlags;
 import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import java.util.List;
 import java.util.Set;
@@ -10,8 +11,8 @@ import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
 import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
 
 /**
- * Keeps the optional Iris hook completely off unless the startup JVM property
- * is explicitly enabled and Iris is installed.
+ * Loads Iris hooks only when Iris is installed and the stable production
+ * default or an explicit startup override enables the Metal path.
  */
 public final class IrisMixinPlugin implements IMixinConfigPlugin {
   @Override
@@ -28,7 +29,7 @@ public final class IrisMixinPlugin implements IMixinConfigPlugin {
       String mixinClassName) {
     try {
       return IrisShaderCapture.isEnabled()
-          && Boolean.getBoolean(
+          && IrisMetalFeatureFlags.enabled(
               IrisTranslationCoordinator.TRANSLATION_ENABLED_PROPERTY)
           && FabricLoader.getInstance().isModLoaded("iris");
     } catch (Throwable ignored) {

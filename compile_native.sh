@@ -83,6 +83,10 @@ if [[ "${BUILD_NATIVE:-1}" != "0" ]]; then
   native_output="$native_build_dir/libmetalrender.dylib"
   sanitizer_mode="${METALRENDER_NATIVE_SANITIZER:-}"
   native_compile_flags=(-O3 -DNDEBUG)
+  if [[ "${METALRENDER_NATIVE_DEBUG:-0}" == "1" ]]; then
+    native_compile_flags=(-O1 -g -DMETALRENDER_DEBUG=1)
+    echo "Building native library with debug diagnostics"
+  fi
   if [[ -n "$sanitizer_mode" ]]; then
     if [[ "$sanitizer_mode" != "address" ]]; then
       echo "Unsupported native sanitizer: $sanitizer_mode" >&2

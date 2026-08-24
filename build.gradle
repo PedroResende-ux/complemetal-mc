@@ -211,10 +211,12 @@ def buildReleaseNativePayload =
     }
 
 tasks.named("processResources") {
+    mustRunAfter "buildNative"
     mustRunAfter buildReleaseNativePayload
 }
 
 tasks.named("sourcesJar") {
+    mustRunAfter "buildNative"
     mustRunAfter buildReleaseNativePayload
 }
 

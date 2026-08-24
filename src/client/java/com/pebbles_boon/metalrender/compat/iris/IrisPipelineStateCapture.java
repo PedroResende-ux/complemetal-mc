@@ -1,9 +1,16 @@
 package com.pebbles_boon.metalrender.compat.iris;
 
+import com.pebbles_boon.metalrender.util.MetalLogger;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -14,6 +21,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class IrisPipelineStateCapture {
   public static final int DEFAULT_QUEUE_CAPACITY = 8_192;
   public static final int DEFAULT_RECENT_VARIANT_CAPACITY = 16_384;
+  private static final AtomicBoolean EXACT_HAND_VERTEX_LOGGED =
+      new AtomicBoolean();
   private static final IrisPipelineStateCapture GLOBAL =
       new IrisPipelineStateCapture(new IrisGlStateTracker(),
           IrisProgramIdentityRegistry.global(), DEFAULT_QUEUE_CAPACITY,
@@ -21,13 +30,14 @@ public final class IrisPipelineStateCapture {
 
   private final IrisGlStateTracker tracker;
   private final IrisGlResourceBindingTracker resourceBindings;
+  private final IrisDynamicDrawStateTracker dynamicState;
   private final IrisProgramIdentityRegistry identities;
   private final int queueCapacity;
   private final int recentVariantCapacity;
   private final ConcurrentLinkedQueue<PendingState> queue =
       new ConcurrentLinkedQueue<>();
   private final AtomicInteger queued = new AtomicInteger();
-  private final LinkedHashMap<StateSignature, Boolean> recentVariants =
+  private final LinkedHashMap<PipelineLookupKey, Boolean> recentVariants =
       new LinkedHashMap<>();
   private final AtomicLong drawsObserved = new AtomicLong();
   private final AtomicLong dispatchesObserved = new AtomicLong();
@@ -41,6 +51,7 @@ public final class IrisPipelineStateCapture {
       int recentVariantCapacity) {
     this.tracker = Objects.requireNonNull(tracker, "tracker");
     resourceBindings = IrisGlResourceBindingTracker.global();
+    dynamicState = IrisDynamicDrawStateTracker.global();
     this.identities = Objects.requireNonNull(identities, "identities");
     if (queueCapacity <= 0 || recentVariantCapacity < queueCapacity) {
       throw new IllegalArgumentException("invalid pipeline capture bounds");
@@ -58,8 +69,19 @@ public final class IrisPipelineStateCapture {
   }
 
   public void initializeOpenGlDefaults() {
+    IrisMetalCutoverPresenter.global().reset();
+    IrisGlTextureGpuHandoff.reset();
+    IrisMetalBufferResidentCache.reset();
     tracker.initializeOpenGlDefaults();
     resourceBindings.initializeOpenGlDefaults();
+    dynamicState.initializeOpenGlDefaults();
+    IrisGlBufferMirror.global().clear();
+    IrisGlTextureMirror.global().clear();
+    IrisGlSamplerMirror.global().clear();
+    IrisGlVertexArrayTracker.global().reset();
+    IrisGlGenericAttributeTracker.global().reset();
+    IrisRenderGraphCapture.global().resetShadowReplaySamples();
+    IrisVisualParityCapture.global().reset();
     currentGlProgram = 0;
   }
 
@@ -85,17 +107,73 @@ public final class IrisPipelineStateCapture {
   }
 
   public void draw(int primitiveMode) {
+    if (primitiveMode < 0) {
+      return;
+    }
+    draw(new IrisExecutionCommand.UnknownDraw(primitiveMode));
+  }
+
+  public void draw(IrisExecutionCommand.Draw command) {
+    draw(command, IrisVertexInputBindings.unavailable(
+        "direct-gl-buffer-state-not-captured"));
+  }
+
+  /** Captures a legacy/direct GL draw from the current generation-safe VAO. */
+  public void drawDirect(IrisExecutionCommand.Draw command) {
+    captureDrawDirect(command);
+  }
+
+  /**
+   * Captures a legacy/direct GL draw and returns the exact immutable state to
+   * a same-thread selective-cutover caller. No Metal work is performed here.
+   */
+  public Optional<PendingState> captureDrawDirect(
+      IrisExecutionCommand.Draw command) {
+    Objects.requireNonNull(command, "command");
     int glProgram = currentGlProgram;
     Optional<IrisProgramIdentityRegistry.Registration> registration =
         identities.lookup(glProgram);
     if (registration.isEmpty()) {
-      return;
+      return Optional.empty();
+    }
+    IrisProgramIdentityRegistry.Registration resolved =
+        registration.orElseThrow();
+    return captureDraw(command, IrisGlVertexArrayTracker.global().snapshot(
+        resolved.descriptor()));
+  }
+
+  public void draw(IrisExecutionCommand.Draw command,
+      IrisVertexInputBindings vertexInputBindings) {
+    captureDraw(command, vertexInputBindings);
+  }
+
+  /** Returns the state paired with this exact draw for same-thread cutover. */
+  public Optional<PendingState> captureDraw(
+      IrisExecutionCommand.Draw command,
+      IrisVertexInputBindings vertexInputBindings) {
+    Objects.requireNonNull(command, "command");
+    Objects.requireNonNull(vertexInputBindings, "vertexInputBindings");
+    int glProgram = currentGlProgram;
+    Optional<IrisProgramIdentityRegistry.Registration> registration =
+        identities.lookup(glProgram);
+    if (registration.isEmpty()) {
+      return Optional.empty();
     }
     drawsObserved.incrementAndGet();
-    capture(registration.orElseThrow(), tracker.snapshotDraw(primitiveMode));
+    return Optional.of(capture(registration.orElseThrow(),
+        tracker.snapshotDraw(command.primitiveMode()), command,
+        vertexInputBindings));
   }
 
   public void dispatch() {
+    dispatch(new IrisExecutionCommand.UnknownDispatch());
+  }
+
+  public void dispatch(IrisExecutionCommand command) {
+    Objects.requireNonNull(command, "command");
+    if (command instanceof IrisExecutionCommand.Draw) {
+      throw new IllegalArgumentException("draw command used for dispatch");
+    }
     int glProgram = currentGlProgram;
     Optional<IrisProgramIdentityRegistry.Registration> registration =
         identities.lookup(glProgram);
@@ -103,29 +181,291 @@ public final class IrisPipelineStateCapture {
       return;
     }
     dispatchesObserved.incrementAndGet();
-    capture(registration.orElseThrow(), tracker.snapshotDispatch());
+    capture(registration.orElseThrow(), tracker.snapshotDispatch(), command,
+        IrisVertexInputBindings.complete(java.util.List.of(), null));
   }
 
-  private void capture(
+  private PendingState capture(
       IrisProgramIdentityRegistry.Registration registration,
-      IrisGlStateSnapshot snapshot) {
+      IrisGlStateSnapshot snapshot, IrisExecutionCommand command,
+      IrisVertexInputBindings vertexInputBindings) {
+    IrisGlResourceBindingSnapshot capturedBindings =
+        resourceBindings.snapshot();
+    IrisRenderGraph.Phase phase =
+        IrisRenderGraphCapture.global().currentPhase();
+    boolean draw = command instanceof IrisExecutionCommand.Draw;
+    boolean sampledReplay = IrisGlBufferMirror.isEnabled() && draw
+        && IrisRenderGraphCapture.global().reserveShadowReplaySample();
+    boolean cutoverReplay = IrisGlBufferMirror.isEnabled() && draw
+        && IrisTranslationCoordinator.cutoverCaptureRequested(phase);
+    boolean graphReplay = IrisGlBufferMirror.isEnabled() && draw
+        && IrisRenderGraphCapture.global().captureFullGraphReplay();
+    boolean captureReplay = sampledReplay || cutoverReplay || graphReplay;
+    Optional<IrisReplayCaptureRequirements> captureRequirements =
+        graphReplay ? IrisTranslationCoordinator.replayCaptureRequirements(
+            registration, capturedBindings) : Optional.empty();
+    IrisShadowReplayBufferSnapshot replayBuffers =
+        graphReplay
+            ? IrisRenderGraphCapture.global().captureFullReplayBuffers(
+                command, vertexInputBindings, capturedBindings,
+                IrisGlBufferMirror.global(), registration.descriptor(),
+                IrisGlGenericAttributeTracker.global(),
+                captureRequirements.orElse(null))
+            : captureReplay
+            ? IrisShadowReplayBufferSnapshot.capture(command,
+                vertexInputBindings, capturedBindings,
+                IrisGlBufferMirror.global(), registration.descriptor(),
+                IrisGlGenericAttributeTracker.global())
+            : IrisShadowReplayBufferSnapshot.disabled();
+    if (captureReplay) {
+      IrisPrimitiveExpansion.Result expansion =
+          IrisPrimitiveExpansion.expand(command, replayBuffers);
+      command = expansion.command();
+      replayBuffers = expansion.buffers();
+      if (graphReplay) {
+        logExactHandVertexData(registration.descriptor(), command,
+            replayBuffers);
+        replayBuffers = replayBuffers.promoteGeometryToMetal();
+      }
+    }
+    IrisShadowReplayTextureSnapshot replayTextures =
+        graphReplay
+            ? IrisRenderGraphCapture.global().captureFullReplayTextures(
+                capturedBindings, IrisGlTextureMirror.global(),
+                registration.descriptor().programName(),
+                captureRequirements.orElse(null))
+            : captureReplay
+            ? cutoverReplay
+                ? IrisShadowReplayTextureSnapshot.captureForFinalCutover(
+                    capturedBindings, IrisGlTextureMirror.global())
+                : IrisShadowReplayTextureSnapshot.capture(capturedBindings,
+                    IrisGlTextureMirror.global(), false)
+            : IrisShadowReplayTextureSnapshot.disabled();
+    IrisShadowReplaySamplerSnapshot replaySamplers =
+        captureReplay
+            ? graphReplay && captureRequirements.isPresent()
+                ? IrisShadowReplaySamplerSnapshot.capture(capturedBindings,
+                    IrisGlSamplerMirror.global(), captureRequirements
+                        .orElseThrow().samplerUnits())
+                : IrisShadowReplaySamplerSnapshot.capture(capturedBindings,
+                    IrisGlSamplerMirror.global())
+            : IrisShadowReplaySamplerSnapshot.disabled();
     PendingState pending = new PendingState(registration, snapshot,
-        resourceBindings.snapshot());
+        capturedBindings, command, dynamicState.snapshot(),
+        vertexInputBindings, replayBuffers, replayTextures, replaySamplers);
+    // A full-graph candidate needs the immediate post-draw OpenGL image for
+    // every FINAL target. The ordinary four-sample phase budget may already
+    // be exhausted before Iris reaches its actual final program, while the
+    // same attachment can be cleared by frame cleanup before endFrame().
+    if (sampledReplay || graphReplay
+        && !IrisTranslationCoordinator.fullGraphOwnershipCaptureActive()) {
+      IrisVisualParityCapture.global().associate(pending, phase);
+    }
     IrisRenderGraphCapture.global().draw(pending);
     offer(pending);
+    return pending;
+  }
+
+  private static void logExactHandVertexData(
+      IrisProgramIdentityRegistry.ProgramDescriptor descriptor,
+      IrisExecutionCommand command,
+      IrisShadowReplayBufferSnapshot buffers) {
+    if (System.getProperty("metalrender.exactJar.expectedPath") == null
+        || !descriptor.programName().startsWith("hand_")
+        || !(command instanceof IrisExecutionCommand.DrawIndexed draw)
+        || !EXACT_HAND_VERTEX_LOGGED.compareAndSet(false, true)) {
+      return;
+    }
+    try {
+      IrisPipelineState.VertexBufferLayout layout = descriptor.vertexBuffers()
+          .stream().filter(candidate -> candidate.bufferIndex() == 0)
+          .findFirst().orElse(null);
+      IrisShadowReplayBufferSnapshot.VertexBufferRef vertexRef =
+          buffers.vertexBuffers().stream()
+              .filter(candidate -> candidate.slot() == 0)
+              .findFirst().orElse(null);
+      if (layout == null || vertexRef == null
+          || vertexRef.buffer().imageId() >= buffers.images().size()) {
+        MetalLogger.info("exact-JAR hand vertex data unavailable");
+        return;
+      }
+      IrisShadowReplayBufferSnapshot.BufferImage vertexImage =
+          buffers.images().get(vertexRef.buffer().imageId());
+      byte[] vertexBytes = vertexImage.bytes();
+      LinkedHashSet<Integer> vertexIndices = new LinkedHashSet<>();
+      String indices = exactHandIndices(draw, buffers, vertexIndices);
+      if (vertexIndices.isEmpty()) {
+        int available = Math.min(8,
+            vertexBytes.length / layout.strideBytes());
+        for (int index = 0; index < available; index++) {
+          vertexIndices.add(index);
+        }
+      }
+      StringBuilder decoded = new StringBuilder();
+      for (Integer vertex : vertexIndices.stream().limit(12).toList()) {
+        int base = Math.multiplyExact(vertex, layout.strideBytes());
+        if (base < 0 || base > vertexBytes.length - layout.strideBytes()) {
+          continue;
+        }
+        if (!decoded.isEmpty()) {
+          decoded.append(';');
+        }
+        decoded.append('v').append(vertex).append('[');
+        boolean first = true;
+        for (IrisPipelineState.VertexAttribute attribute
+            : descriptor.vertexAttributes()) {
+          if (attribute.bufferIndex() != 0) {
+            continue;
+          }
+          String value = exactHandAttribute(vertexBytes,
+              base + attribute.offsetBytes(), attribute.format().cacheName());
+          if (value.isEmpty()) {
+            continue;
+          }
+          if (!first) {
+            decoded.append(',');
+          }
+          first = false;
+          decoded.append('l').append(attribute.location()).append('=')
+              .append(value);
+        }
+        decoded.append(']');
+      }
+      MetalLogger.info("exact-JAR hand vertex data: program=%s command=%s "
+              + "stride=%d vertexBytes=%d sourceOffset=%d indices=%s "
+              + "vertices=%s",
+          descriptor.programName(), command.getClass().getSimpleName(),
+          layout.strideBytes(), vertexBytes.length,
+          vertexImage.sourceOffsetBytes(), indices,
+          decoded.isEmpty() ? "none" : decoded);
+    } catch (RuntimeException diagnosticFailure) {
+      MetalLogger.info("exact-JAR hand vertex data failed: %s",
+          diagnosticFailure.getClass().getSimpleName());
+    }
+  }
+
+  private static String exactHandIndices(
+      IrisExecutionCommand.DrawIndexed draw,
+      IrisShadowReplayBufferSnapshot buffers,
+      LinkedHashSet<Integer> vertexIndices) {
+    if (buffers.indexBuffer().isEmpty()) {
+      return "none";
+    }
+    IrisShadowReplayBufferSnapshot.BufferRef reference =
+        buffers.indexBuffer().orElseThrow();
+    IrisShadowReplayBufferSnapshot.BufferImage image =
+        buffers.images().get(reference.imageId());
+    byte[] bytes = image.bytes();
+    long relative = draw.indexOffsetBytes() - image.sourceOffsetBytes();
+    if (relative < 0 || relative > Integer.MAX_VALUE) {
+      return "out-of-range";
+    }
+    ByteBuffer input = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+    StringBuilder result = new StringBuilder();
+    int count = Math.min(draw.indexCount(), 24);
+    for (int index = 0; index < count; index++) {
+      long offset = relative + (long) index * draw.indexElementBytes();
+      if (offset < 0 || offset > bytes.length - draw.indexElementBytes()) {
+        break;
+      }
+      int raw = switch (draw.indexElementBytes()) {
+        case 1 -> Byte.toUnsignedInt(input.get((int) offset));
+        case 2 -> Short.toUnsignedInt(input.getShort((int) offset));
+        case 4 -> input.getInt((int) offset);
+        default -> throw new IllegalArgumentException("invalid index width");
+      };
+      int vertex = Math.addExact(raw, draw.baseVertex());
+      if (!result.isEmpty()) {
+        result.append(',');
+      }
+      result.append(vertex);
+      if (vertex >= 0 && vertexIndices.size() < 12) {
+        vertexIndices.add(vertex);
+      }
+    }
+    return result.isEmpty() ? "none" : result.toString();
+  }
+
+  private static String exactHandAttribute(byte[] bytes, int offset,
+      String format) {
+    ByteBuffer input = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+    return switch (format) {
+      case "rgb32-float" -> floats(input, offset, 3);
+      case "rg32-float" -> floats(input, offset, 2);
+      case "rgba8-unorm", "rgba8-snorm" -> unsignedBytes(input, offset, 4);
+      case "rg16-sint" -> signedShorts(input, offset, 2);
+      case "rgba16-uint" -> unsignedShorts(input, offset, 4);
+      default -> "";
+    };
+  }
+
+  private static String floats(ByteBuffer input, int offset, int count) {
+    if (offset < 0 || offset > input.capacity() - count * Float.BYTES) {
+      return "range";
+    }
+    StringBuilder value = new StringBuilder();
+    for (int index = 0; index < count; index++) {
+      if (index > 0) {
+        value.append('/');
+      }
+      value.append(String.format(Locale.ROOT, "%.4f",
+          input.getFloat(offset + index * Float.BYTES)));
+    }
+    return value.toString();
+  }
+
+  private static String unsignedBytes(ByteBuffer input, int offset,
+      int count) {
+    if (offset < 0 || offset > input.capacity() - count) {
+      return "range";
+    }
+    StringBuilder value = new StringBuilder();
+    for (int index = 0; index < count; index++) {
+      if (index > 0) {
+        value.append('/');
+      }
+      value.append(Byte.toUnsignedInt(input.get(offset + index)));
+    }
+    return value.toString();
+  }
+
+  private static String signedShorts(ByteBuffer input, int offset,
+      int count) {
+    if (offset < 0 || offset > input.capacity() - count * Short.BYTES) {
+      return "range";
+    }
+    StringBuilder value = new StringBuilder();
+    for (int index = 0; index < count; index++) {
+      if (index > 0) {
+        value.append('/');
+      }
+      short raw = input.getShort(offset + index * Short.BYTES);
+      value.append(raw).append('u').append(Short.toUnsignedInt(raw));
+    }
+    return value.toString();
+  }
+
+  private static String unsignedShorts(ByteBuffer input, int offset,
+      int count) {
+    if (offset < 0 || offset > input.capacity() - count * Short.BYTES) {
+      return "range";
+    }
+    StringBuilder value = new StringBuilder();
+    for (int index = 0; index < count; index++) {
+      if (index > 0) {
+        value.append('/');
+      }
+      value.append(Short.toUnsignedInt(
+          input.getShort(offset + index * Short.BYTES)));
+    }
+    return value.toString();
   }
 
   private void offer(PendingState pending) {
     IrisProgramIdentityRegistry.Registration registration =
         pending.registration();
     IrisGlStateSnapshot snapshot = pending.snapshot();
-    StateSignature signature = new StateSignature(registration.generation(),
-        snapshot.operation(), snapshot.program(), snapshot.drawFramebuffer(),
-        snapshot.drawBuffers(), snapshot.colorTargets(),
-        snapshot.depthAttachment(), snapshot.stencilAttachment(),
-        snapshot.depth(), snapshot.stencil(), snapshot.raster(),
-        snapshot.multisample(), snapshot.primitive(),
-        snapshot.unknownFields(), snapshot.resourceEvictions());
+    PipelineLookupKey signature = lookupKey(pending);
     synchronized (recentVariants) {
       if (recentVariants.containsKey(signature)) {
         return;
@@ -182,18 +522,90 @@ public final class IrisPipelineStateCapture {
     return incompleteVariants.get();
   }
 
+  /**
+   * Stable runtime lookup identity for a compiled pipeline. The monotonically
+   * increasing snapshot sequence is intentionally excluded; generation-
+   * qualified GL objects keep lifecycle changes fail-closed.
+   */
+  public static PipelineLookupKey lookupKey(PendingState pending) {
+    Objects.requireNonNull(pending, "pending");
+    IrisProgramIdentityRegistry.Registration registration =
+        pending.registration();
+    IrisGlStateSnapshot snapshot = pending.snapshot();
+    return new PipelineLookupKey(registration.generation(),
+        snapshot.operation(), snapshot.program(), snapshot.drawFramebuffer(),
+        snapshot.drawBuffers(), snapshot.colorTargets(),
+        snapshot.depthAttachment(), snapshot.stencilAttachment(),
+        snapshot.depth(), snapshot.stencil(), snapshot.raster(),
+        snapshot.multisample(), snapshot.primitive(),
+        snapshot.unknownFields(), snapshot.resourceEvictions());
+  }
+
   public record PendingState(
       IrisProgramIdentityRegistry.Registration registration,
       IrisGlStateSnapshot snapshot,
-      IrisGlResourceBindingSnapshot resourceBindings) {
+      IrisGlResourceBindingSnapshot resourceBindings,
+      IrisExecutionCommand command,
+      IrisDynamicDrawState dynamicState,
+      IrisVertexInputBindings vertexInputBindings,
+      IrisShadowReplayBufferSnapshot replayBuffers,
+      IrisShadowReplayTextureSnapshot replayTextures,
+      IrisShadowReplaySamplerSnapshot replaySamplers) {
+    public PendingState(
+        IrisProgramIdentityRegistry.Registration registration,
+        IrisGlStateSnapshot snapshot,
+        IrisGlResourceBindingSnapshot resourceBindings,
+        IrisExecutionCommand command,
+        IrisDynamicDrawState dynamicState,
+        IrisVertexInputBindings vertexInputBindings) {
+      this(registration, snapshot, resourceBindings, command, dynamicState,
+          vertexInputBindings, IrisShadowReplayBufferSnapshot.disabled(),
+          IrisShadowReplayTextureSnapshot.disabled(),
+          IrisShadowReplaySamplerSnapshot.disabled());
+    }
+
+    public PendingState(
+        IrisProgramIdentityRegistry.Registration registration,
+        IrisGlStateSnapshot snapshot,
+        IrisGlResourceBindingSnapshot resourceBindings,
+        IrisExecutionCommand command,
+        IrisDynamicDrawState dynamicState,
+        IrisVertexInputBindings vertexInputBindings,
+        IrisShadowReplayBufferSnapshot replayBuffers) {
+      this(registration, snapshot, resourceBindings, command, dynamicState,
+          vertexInputBindings, replayBuffers,
+          IrisShadowReplayTextureSnapshot.disabled(),
+          IrisShadowReplaySamplerSnapshot.disabled());
+    }
+
+    public PendingState(
+        IrisProgramIdentityRegistry.Registration registration,
+        IrisGlStateSnapshot snapshot,
+        IrisGlResourceBindingSnapshot resourceBindings,
+        IrisExecutionCommand command,
+        IrisDynamicDrawState dynamicState,
+        IrisVertexInputBindings vertexInputBindings,
+        IrisShadowReplayBufferSnapshot replayBuffers,
+        IrisShadowReplayTextureSnapshot replayTextures) {
+      this(registration, snapshot, resourceBindings, command, dynamicState,
+          vertexInputBindings, replayBuffers, replayTextures,
+          IrisShadowReplaySamplerSnapshot.disabled());
+    }
+
     public PendingState {
       Objects.requireNonNull(registration, "registration");
       Objects.requireNonNull(snapshot, "snapshot");
+      Objects.requireNonNull(command, "command");
+      Objects.requireNonNull(dynamicState, "dynamicState");
+      Objects.requireNonNull(vertexInputBindings, "vertexInputBindings");
+      Objects.requireNonNull(replayBuffers, "replayBuffers");
+      Objects.requireNonNull(replayTextures, "replayTextures");
+      Objects.requireNonNull(replaySamplers, "replaySamplers");
     }
   }
 
-  private record StateSignature(long registrationGeneration,
-                                IrisGlStateSnapshot.Operation operation,
+  public record PipelineLookupKey(long registrationGeneration,
+                                  IrisGlStateSnapshot.Operation operation,
       IrisGlStateSnapshot.StateValue<java.util.Optional<
           IrisGlStateSnapshot.ResourceHandle>> program,
       IrisGlStateSnapshot.StateValue<IrisGlStateSnapshot.ResourceHandle>
@@ -211,5 +623,23 @@ public final class IrisPipelineStateCapture {
       IrisGlStateSnapshot.PrimitiveState primitive,
       java.util.List<String> unknownFields,
       long resourceEvictions) {
+    public PipelineLookupKey {
+      if (registrationGeneration <= 0 || resourceEvictions < 0) {
+        throw new IllegalArgumentException("invalid pipeline lookup key");
+      }
+      Objects.requireNonNull(operation, "operation");
+      Objects.requireNonNull(program, "program");
+      Objects.requireNonNull(framebuffer, "framebuffer");
+      Objects.requireNonNull(drawBuffers, "drawBuffers");
+      colorTargets = List.copyOf(colorTargets);
+      Objects.requireNonNull(depthAttachment, "depthAttachment");
+      Objects.requireNonNull(stencilAttachment, "stencilAttachment");
+      Objects.requireNonNull(depth, "depth");
+      Objects.requireNonNull(stencil, "stencil");
+      Objects.requireNonNull(raster, "raster");
+      Objects.requireNonNull(multisample, "multisample");
+      Objects.requireNonNull(primitive, "primitive");
+      unknownFields = List.copyOf(unknownFields);
+    }
   }
 }

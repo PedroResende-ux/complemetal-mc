@@ -11,7 +11,7 @@ import java.util.HexFormat;
 /** Deterministic identity of a GL-name-free Iris render graph. */
 public record IrisRenderGraphKey(String sha256) {
   private static final byte[] DOMAIN =
-      "metalrender.iris.render-graph.v1".getBytes(StandardCharsets.US_ASCII);
+      "metalrender.iris.render-graph.v2".getBytes(StandardCharsets.US_ASCII);
 
   public IrisRenderGraphKey {
     IrisRenderGraph.requireSha(sha256, "render graph key");
@@ -27,6 +27,10 @@ public record IrisRenderGraphKey(String sha256) {
         put(output, resource.kind().name());
         put(output, resource.format());
         output.writeInt(resource.sampleCount());
+        output.writeInt(resource.width());
+        output.writeInt(resource.height());
+        output.writeInt(resource.depthOrLayers());
+        output.writeInt(resource.mipLevels());
       }
       output.writeInt(graph.nodes().size());
       for (IrisRenderGraph.Node node : graph.nodes()) {

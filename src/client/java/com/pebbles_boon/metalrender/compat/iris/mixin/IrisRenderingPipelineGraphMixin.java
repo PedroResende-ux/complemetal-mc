@@ -2,6 +2,8 @@ package com.pebbles_boon.metalrender.compat.iris.mixin;
 
 import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraph.Phase;
 import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture;
+import com.pebbles_boon.metalrender.compat.iris.IrisStage9PerformanceSampler;
+import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.injection.At;
@@ -16,6 +18,10 @@ public abstract class IrisRenderingPipelineGraphMixin {
   @Inject(method = "beginLevelRendering", at = @At("HEAD"), require = 0,
       remap = false)
   private void metalrender$beginFrame(CallbackInfo ci) {
+    IrisStage9PerformanceSampler.beginFrame();
+    IrisTranslationCoordinator.drainPreparedGraphExecution();
+    IrisTranslationCoordinator.beginFullGraphOwnershipFrame();
+    IrisTranslationCoordinator.beginCutoverFrame();
     IrisRenderGraphCapture.global().beginFrame();
     IrisRenderGraphCapture.global().phase(Phase.BEGIN);
   }
@@ -60,5 +66,7 @@ public abstract class IrisRenderingPipelineGraphMixin {
       remap = false)
   private void metalrender$endFrame(CallbackInfo ci) {
     IrisRenderGraphCapture.global().endFrame();
+    IrisTranslationCoordinator.endFullGraphOwnershipFrame();
+    IrisStage9PerformanceSampler.endFrame();
   }
 }

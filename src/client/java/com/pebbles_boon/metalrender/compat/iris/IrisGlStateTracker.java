@@ -92,6 +92,7 @@ public final class IrisGlStateTracker {
   private FramebufferEntry defaultFramebuffer;
   private StateValue<Optional<ResourceHandle>> currentProgram;
   private StateValue<ResourceHandle> currentDrawFramebuffer;
+  private StateValue<ResourceHandle> currentReadFramebuffer;
 
   private StateValue<Boolean> globalBlendEnabled;
   private StateValue<Integer> globalBlendRgbEquation;
@@ -179,6 +180,7 @@ public final class IrisGlStateTracker {
   public synchronized void initializeOpenGlDefaults() {
     currentProgram = known(Optional.empty());
     currentDrawFramebuffer = known(defaultFramebuffer.handle);
+    currentReadFramebuffer = known(defaultFramebuffer.handle);
     defaultFramebuffer.drawBuffers = known(List.of(GL_BACK));
     setGlobalBlendEnabled(false);
     blendEquation(GL_FUNC_ADD);
@@ -226,6 +228,20 @@ public final class IrisGlStateTracker {
     return texture == null ? Optional.empty() : Optional.of(texture.handle);
   }
 
+  /** Returns immutable allocation metadata for one live texture name. */
+  public synchronized Optional<TextureMetadata> textureMetadata(int name) {
+    TextureEntry texture = textures.get(name);
+    return texture == null ? Optional.empty()
+        : Optional.of(texture.metadata());
+  }
+
+  public synchronized Optional<TextureMetadata> textureMetadata(
+      ResourceHandle handle) {
+    TextureEntry texture = texture(handle);
+    return texture == null ? Optional.empty()
+        : Optional.of(texture.metadata());
+  }
+
   /** Returns the generation-qualified framebuffer, including framebuffer 0. */
   public synchronized Optional<ResourceHandle> framebufferHandle(int name) {
     if (name == 0) {
@@ -234,6 +250,60 @@ public final class IrisGlStateTracker {
     FramebufferEntry framebuffer = framebuffers.get(name);
     return framebuffer == null
         ? Optional.empty() : Optional.of(framebuffer.handle);
+  }
+
+  /** Returns the generation-qualified framebuffer currently bound for read. */
+  public synchronized Optional<ResourceHandle> readFramebufferHandle() {
+    return currentReadFramebuffer.isKnown()
+        ? Optional.of(currentReadFramebuffer.value()) : Optional.empty();
+  }
+
+  /** Returns the generation-qualified framebuffer currently bound for draw. */
+  public synchronized Optional<ResourceHandle> drawFramebufferHandle() {
+    return currentDrawFramebuffer.isKnown()
+        ? Optional.of(currentDrawFramebuffer.value()) : Optional.empty();
+  }
+
+  /**
+   * Returns the currently attached, generation-safe texture allocations for a
+   * named framebuffer. The result is complete only when every observed
+   * attachment is known, live and fully allocated; the default framebuffer is
+   * intentionally incomplete because its platform attachments are opaque.
+   */
+  public synchronized Optional<FramebufferMetadata> framebufferMetadata(
+      int name) {
+    FramebufferEntry framebuffer = framebufferByName(name);
+    if (framebuffer == null) {
+      return Optional.empty();
+    }
+    ArrayList<FramebufferAttachmentMetadata> attachments = new ArrayList<>();
+    boolean complete = !framebuffer.defaultFramebuffer
+        && !framebuffer.attachments.isEmpty();
+    for (Map.Entry<Integer, StateValue<Optional<TextureAttachment>>> entry
+        : framebuffer.attachments.entrySet()) {
+      StateValue<Optional<TextureAttachment>> state = entry.getValue();
+      if (!state.isKnown()) {
+        complete = false;
+        continue;
+      }
+      if (state.value().isEmpty()) {
+        continue;
+      }
+      TextureEntry texture = texture(state.value().orElseThrow().texture());
+      if (texture == null) {
+        complete = false;
+        continue;
+      }
+      TextureMetadata metadata = texture.metadata();
+      attachments.add(new FramebufferAttachmentMetadata(entry.getKey(),
+          metadata));
+      complete &= metadata.complete();
+    }
+    attachments.sort(java.util.Comparator.comparingInt(
+        FramebufferAttachmentMetadata::attachment));
+    complete &= !attachments.isEmpty();
+    return Optional.of(new FramebufferMetadata(framebuffer.handle,
+        attachments, complete));
   }
 
   public synchronized ResourceHandle registerProgram(int name) {
@@ -315,6 +385,10 @@ public final class IrisGlStateTracker {
         && expected.equals(currentDrawFramebuffer.value())) {
       currentDrawFramebuffer = known(defaultFramebuffer.handle);
     }
+    if (currentReadFramebuffer.isKnown()
+        && expected.equals(currentReadFramebuffer.value())) {
+      currentReadFramebuffer = known(defaultFramebuffer.handle);
+    }
     return true;
   }
 
@@ -335,34 +409,46 @@ public final class IrisGlStateTracker {
   }
 
   public synchronized void bindFramebuffer(int target, int name) {
-    if (target == GL_READ_FRAMEBUFFER) {
-      return;
-    }
-    requireDrawFramebufferTarget(target);
+    requireFramebufferTarget(target);
+    StateValue<ResourceHandle> binding;
     if (name == 0) {
-      currentDrawFramebuffer = known(defaultFramebuffer.handle);
-      return;
+      binding = known(defaultFramebuffer.handle);
+    } else {
+      FramebufferEntry entry = framebuffers.get(name);
+      binding = entry == null
+          ? unknown("framebuffer " + name + " has not been registered")
+          : known(entry.handle);
     }
-    FramebufferEntry entry = framebuffers.get(name);
-    currentDrawFramebuffer = entry == null
-        ? unknown("framebuffer " + name + " has not been registered")
-        : known(entry.handle);
+    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
+      currentDrawFramebuffer = binding;
+    }
+    if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) {
+      currentReadFramebuffer = binding;
+    }
   }
 
   public synchronized boolean bindFramebuffer(int target,
                                                ResourceHandle handle) {
-    if (target == GL_READ_FRAMEBUFFER) {
-      return true;
-    }
-    requireDrawFramebufferTarget(target);
+    requireFramebufferTarget(target);
     requireKind(handle, ResourceKind.FRAMEBUFFER);
     FramebufferEntry entry = framebuffer(handle);
     if (entry == null) {
-      currentDrawFramebuffer = unknown(
+      StateValue<ResourceHandle> stale = unknown(
           "stale framebuffer handle " + handle.name());
+      if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
+        currentDrawFramebuffer = stale;
+      }
+      if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) {
+        currentReadFramebuffer = stale;
+      }
       return false;
     }
-    currentDrawFramebuffer = known(handle);
+    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
+      currentDrawFramebuffer = known(handle);
+    }
+    if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) {
+      currentReadFramebuffer = known(handle);
+    }
     return true;
   }
 
@@ -393,6 +479,22 @@ public final class IrisGlStateTracker {
     existing.sampleCount = known(sampleCount);
     refreshTextureAttachments(existing);
     return existing.handle;
+  }
+
+  /** Defines exact 2D/array allocation metadata observed at texture creation. */
+  public synchronized ResourceHandle defineTexture(int name, String format,
+      int sampleCount, int width, int height, int depthOrLayers,
+      int mipLevels) {
+    if (width <= 0 || height <= 0 || depthOrLayers <= 0 || mipLevels <= 0) {
+      throw new IllegalArgumentException("invalid texture allocation extent");
+    }
+    ResourceHandle handle = defineTexture(name, format, sampleCount);
+    TextureEntry texture = textures.get(name);
+    texture.width = width;
+    texture.height = height;
+    texture.depthOrLayers = depthOrLayers;
+    texture.mipLevels = mipLevels;
+    return handle;
   }
 
   /** Registers a texture while explicitly preserving an unknown sample count. */
@@ -430,14 +532,11 @@ public final class IrisGlStateTracker {
   public synchronized boolean framebufferTexture2D(
       int target, int attachment, int textureTarget, int textureName,
       int mipLevel) {
-    if (target == GL_READ_FRAMEBUFFER) {
-      return false;
-    }
-    requireDrawFramebufferTarget(target);
+    requireFramebufferTarget(target);
     if (mipLevel < 0) {
       throw new IllegalArgumentException("negative texture mip level");
     }
-    FramebufferEntry framebuffer = boundFramebuffer();
+    FramebufferEntry framebuffer = boundFramebuffer(target);
     if (framebuffer == null || framebuffer.defaultFramebuffer) {
       return false;
     }
@@ -1094,6 +1193,13 @@ public final class IrisGlStateTracker {
     return snapshotFramebuffer();
   }
 
+  private FramebufferEntry boundFramebuffer(int target) {
+    requireFramebufferTarget(target);
+    StateValue<ResourceHandle> binding = target == GL_READ_FRAMEBUFFER
+        ? currentReadFramebuffer : currentDrawFramebuffer;
+    return binding.isKnown() ? framebuffer(binding.value()) : null;
+  }
+
   private FramebufferEntry framebuffer(ResourceHandle handle) {
     if (handle.contextGeneration() != contextGeneration
         || handle.kind() != ResourceKind.FRAMEBUFFER) {
@@ -1201,6 +1307,7 @@ public final class IrisGlStateTracker {
             contextGeneration));
     currentProgram = unknown("current program " + suffix);
     currentDrawFramebuffer = unknown("draw framebuffer binding " + suffix);
+    currentReadFramebuffer = unknown("read framebuffer binding " + suffix);
     globalBlendEnabled = unknown("global blend enable " + suffix);
     globalBlendRgbEquation = unknown("global RGB blend equation " + suffix);
     globalBlendAlphaEquation = unknown(
@@ -1303,12 +1410,20 @@ public final class IrisGlStateTracker {
     }
   }
 
-  private static void requireDrawFramebufferTarget(int target) {
-    if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER) {
+  private static void requireFramebufferTarget(int target) {
+    if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER
+        && target != GL_READ_FRAMEBUFFER) {
       throw new IllegalArgumentException(
           "unsupported framebuffer target 0x"
               + Integer.toHexString(target));
     }
+  }
+
+  private static void requireDrawFramebufferTarget(int target) {
+    if (target == GL_READ_FRAMEBUFFER) {
+      throw new IllegalArgumentException("read framebuffer is not drawable");
+    }
+    requireFramebufferTarget(target);
   }
 
   private static float finite(float value, String label) {
@@ -1371,6 +1486,10 @@ public final class IrisGlStateTracker {
     private final ResourceHandle handle;
     private String format;
     private StateValue<Integer> sampleCount;
+    private int width;
+    private int height;
+    private int depthOrLayers;
+    private int mipLevels;
 
     private TextureEntry(ResourceHandle handle, String format,
                          StateValue<Integer> sampleCount) {
@@ -1382,6 +1501,69 @@ public final class IrisGlStateTracker {
     private TextureAttachment attachment(int textureTarget, int mipLevel) {
       return new TextureAttachment(handle, format, sampleCount, textureTarget,
           mipLevel);
+    }
+
+    private TextureMetadata metadata() {
+      return new TextureMetadata(handle, format,
+          sampleCount.isKnown() ? sampleCount.value() : 0,
+          width, height, depthOrLayers, mipLevels);
+    }
+  }
+
+  public record TextureMetadata(ResourceHandle handle, String format,
+                                int sampleCount, int width, int height,
+                                int depthOrLayers, int mipLevels) {
+    public TextureMetadata {
+      Objects.requireNonNull(handle, "handle");
+      Objects.requireNonNull(format, "format");
+      if (handle.kind() != ResourceKind.TEXTURE || sampleCount < 0
+          || width < 0 || height < 0 || depthOrLayers < 0
+          || mipLevels < 0) {
+        throw new IllegalArgumentException("invalid texture metadata");
+      }
+    }
+
+    public boolean complete() {
+      return sampleCount > 0 && width > 0 && height > 0
+          && depthOrLayers > 0 && mipLevels > 0;
+    }
+  }
+
+  /** Immutable allocation metadata for one observed framebuffer attachment. */
+  public record FramebufferAttachmentMetadata(int attachment,
+                                               TextureMetadata texture) {
+    public FramebufferAttachmentMetadata {
+      if (attachment < 0) {
+        throw new IllegalArgumentException("negative framebuffer attachment");
+      }
+      Objects.requireNonNull(texture, "texture");
+    }
+  }
+
+  /** Snapshot of a named framebuffer's texture-backed attachments. */
+  public record FramebufferMetadata(ResourceHandle handle,
+                                    List<FramebufferAttachmentMetadata>
+                                        attachments,
+                                    boolean complete) {
+    public FramebufferMetadata {
+      Objects.requireNonNull(handle, "handle");
+      if (handle.kind() != ResourceKind.FRAMEBUFFER) {
+        throw new IllegalArgumentException("metadata is not a framebuffer");
+      }
+      attachments = List.copyOf(attachments);
+      int previous = -1;
+      for (FramebufferAttachmentMetadata attachment : attachments) {
+        Objects.requireNonNull(attachment, "attachment");
+        if (attachment.attachment() <= previous) {
+          throw new IllegalArgumentException(
+              "framebuffer attachments must be sorted and unique");
+        }
+        previous = attachment.attachment();
+      }
+      if (complete && attachments.isEmpty()) {
+        throw new IllegalArgumentException(
+            "complete framebuffer metadata has no attachments");
+      }
     }
   }
 

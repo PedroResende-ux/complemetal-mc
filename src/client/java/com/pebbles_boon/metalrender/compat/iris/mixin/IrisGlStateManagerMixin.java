@@ -1,19 +1,30 @@
 package com.pebbles_boon.metalrender.compat.iris.mixin;
 
 import com.mojang.blaze3d.opengl.GlStateManager;
+import com.pebbles_boon.metalrender.compat.iris.IrisExecutionCommand;
+import com.pebbles_boon.metalrender.compat.iris.IrisDynamicDrawStateTracker;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlStateTracker;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingTracker;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlTextureMirror;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingSnapshot;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlVertexArrayTracker;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlSamplerMirror;
 import com.pebbles_boon.metalrender.compat.iris.IrisPipelineStateCapture;
+import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture;
 import com.pebbles_boon.metalrender.compat.iris.IrisShaderCapture;
+import com.pebbles_boon.metalrender.compat.iris.IrisVisualParityCapture;
+import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+import java.nio.ByteBuffer;
 
 /**
- * Observes the Mojang OpenGL facade without changing or cancelling any call.
- * All hooks are constant-time state mutations or bounded queue offers.
+ * Observes the Mojang OpenGL facade. Calls remain untouched until the
+ * separately validated full-graph ownership gate arms one complete frame.
  */
 @Mixin(GlStateManager.class)
 public abstract class IrisGlStateManagerMixin {
@@ -27,6 +38,120 @@ public abstract class IrisGlStateManagerMixin {
 
   private static IrisGlResourceBindingTracker metalrender$resources() {
     return IrisGlResourceBindingTracker.global();
+  }
+
+  private static IrisDynamicDrawStateTracker metalrender$dynamic() {
+    return IrisDynamicDrawStateTracker.global();
+  }
+
+  private static IrisGlVertexArrayTracker metalrender$vertices() {
+    return IrisGlVertexArrayTracker.global();
+  }
+
+  @Inject(method = "_clear", at = @At("HEAD"), cancellable = true)
+  private static void metalrender$clear(int mask, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().legacyClearBoundFramebuffer(mask);
+    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      ci.cancel();
+    }
+  }
+
+  @Inject(method = "_glBindVertexArray", at = @At("TAIL"))
+  private static void metalrender$bindVertexArray(int vertexArray,
+      CallbackInfo ci) {
+    metalrender$vertices().bindVertexArray(vertexArray);
+  }
+
+  @Inject(method = "_glBindBuffer", at = @At("TAIL"))
+  private static void metalrender$bindBuffer(int target, int buffer,
+      CallbackInfo ci) {
+    metalrender$vertices().bindBuffer(target, buffer);
+  }
+
+  @Inject(method = "_glBufferData(ILjava/nio/ByteBuffer;I)V",
+      at = @At("RETURN"))
+  private static void metalrender$bufferData(int target, ByteBuffer bytes,
+      int usage, CallbackInfo ci) {
+    if (!IrisGlBufferMirror.isEnabled() || bytes == null) {
+      return;
+    }
+    int buffer = metalrender$vertices().boundBuffer(target);
+    int length = bytes.remaining();
+    if (buffer > 0 && length > 0
+        && IrisGlBufferMirror.global().allocate(buffer, length)) {
+      IrisGlBufferMirror.global().write(buffer, length, 0, length, bytes);
+    }
+  }
+
+  @Inject(method = "_glBufferData(IJI)V", at = @At("RETURN"))
+  private static void metalrender$bufferDataSize(int target, long size,
+      int usage, CallbackInfo ci) {
+    if (IrisGlBufferMirror.isEnabled()) {
+      IrisGlBufferMirror.global().allocate(
+          metalrender$vertices().boundBuffer(target), size);
+    }
+  }
+
+  @Inject(method = "_glBufferSubData(IJLjava/nio/ByteBuffer;)V",
+      at = @At("RETURN"))
+  private static void metalrender$bufferSubData(int target, long offset,
+      ByteBuffer bytes, CallbackInfo ci) {
+    if (!IrisGlBufferMirror.isEnabled() || bytes == null) {
+      return;
+    }
+    int buffer = metalrender$vertices().boundBuffer(target);
+    IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
+    mirror.write(buffer, mirror.size(buffer), offset, bytes.remaining(),
+        bytes);
+  }
+
+  @Inject(method = "_glDeleteBuffers", at = @At("TAIL"))
+  private static void metalrender$deleteBuffer(int buffer, CallbackInfo ci) {
+    metalrender$vertices().deleteBuffer(buffer);
+    IrisGlBufferMirror.global().delete(buffer);
+  }
+
+  @Inject(method = "_vertexAttribPointer", at = @At("TAIL"))
+  private static void metalrender$vertexAttribute(int location, int size,
+      int type, boolean normalized, int stride, long pointer,
+      CallbackInfo ci) {
+    metalrender$vertices().vertexAttribute(location, size, type, normalized,
+        stride, pointer, false);
+  }
+
+  @Inject(method = "_vertexAttribIPointer", at = @At("TAIL"))
+  private static void metalrender$integerVertexAttribute(int location,
+      int size, int type, int stride, long pointer, CallbackInfo ci) {
+    metalrender$vertices().vertexAttribute(location, size, type, false,
+        stride, pointer, true);
+  }
+
+  @Inject(method = "_enableVertexAttribArray", at = @At("TAIL"))
+  private static void metalrender$enableVertexAttribute(int location,
+      CallbackInfo ci) {
+    metalrender$vertices().enableAttribute(location);
+  }
+
+  @Inject(method = "_viewport", at = @At("TAIL"))
+  private static void metalrender$viewport(int x, int y, int width,
+      int height, CallbackInfo ci) {
+    metalrender$dynamic().viewport(x, y, width, height);
+  }
+
+  @Inject(method = "_enableScissorTest", at = @At("TAIL"))
+  private static void metalrender$enableScissor(CallbackInfo ci) {
+    metalrender$dynamic().scissorEnabled(true);
+  }
+
+  @Inject(method = "_disableScissorTest", at = @At("TAIL"))
+  private static void metalrender$disableScissor(CallbackInfo ci) {
+    metalrender$dynamic().scissorEnabled(false);
+  }
+
+  @Inject(method = "_scissorBox", at = @At("TAIL"))
+  private static void metalrender$scissor(int x, int y, int width,
+      int height, CallbackInfo ci) {
+    metalrender$dynamic().scissor(x, y, width, height);
   }
 
   @Inject(method = "_glUseProgram", at = @At("TAIL"))
@@ -187,6 +312,9 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_deleteTexture", at = @At("TAIL"))
   private static void metalrender$deleteTexture(int texture, CallbackInfo ci) {
     metalrender$state().deleteTexture(texture);
+    metalrender$resources().deleteTexture(texture);
+    IrisGlTextureMirror.global().delete(texture);
+    IrisGlSamplerMirror.global().deleteTexture(texture);
   }
 
   @Inject(method = "_activeTexture", at = @At("TAIL"))
@@ -199,15 +327,105 @@ public abstract class IrisGlStateManagerMixin {
     metalrender$resources().bindTexture(texture);
   }
 
-  @Inject(method = "_drawElements", at = @At("HEAD"))
-  private static void metalrender$drawElements(int mode, int count, int type,
-      long indices, CallbackInfo ci) {
-    metalrender$capture().draw(mode);
+  @Inject(method = "_texParameter", at = @At("TAIL"))
+  private static void metalrender$textureParameter(int target, int pname,
+      int value, CallbackInfo ci) {
+    IrisGlResourceBindingSnapshot.TextureUnitBinding binding =
+        metalrender$resources().activeTextureBinding(target);
+    if (binding != null && binding.texture() > 0) {
+      IrisGlSamplerMirror.global().textureParameteri(binding.texture(),
+          pname, value);
+    }
   }
 
-  @Inject(method = "_drawArrays", at = @At("HEAD"))
+  @Inject(method = "_drawElements", at = @At("HEAD"), cancellable = true)
+  private static void metalrender$drawElements(int mode, int count, int type,
+      long indices, CallbackInfo ci) {
+    IrisVisualParityCapture.global().beginDrawInvocation();
+    int bytes = switch (type) {
+      case 0x1401 -> 1;
+      case 0x1403 -> 2;
+      case 0x1405 -> 4;
+      default -> 0;
+    };
+    if (bytes == 0) {
+      metalrender$capture().draw(mode);
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-direct-index-type-unsupported")) {
+        IrisVisualParityCapture.global().endDrawInvocation();
+        ci.cancel();
+      }
+      return;
+    }
+    try {
+      var pending = metalrender$capture().captureDrawDirect(
+          new IrisExecutionCommand.DrawIndexed(
+              mode, indices, count, bytes, 0, 1, 0,
+              IrisExecutionCommand.Source.DIRECT_GL));
+      if (pending.isPresent()
+          && (IrisTranslationCoordinator.tryFullGraphCutover(
+              pending.orElseThrow())
+              || IrisTranslationCoordinator.tryFinalCutover(
+                  pending.orElseThrow()))) {
+        IrisVisualParityCapture.global().endDrawInvocation();
+        ci.cancel();
+      } else if (pending.isEmpty()
+          && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+              "graph-ownership-direct-indexed-unresolved")) {
+        IrisVisualParityCapture.global().endDrawInvocation();
+        ci.cancel();
+      }
+    } catch (IllegalArgumentException error) {
+      metalrender$capture().draw(mode);
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-direct-indexed-invalid")) {
+        IrisVisualParityCapture.global().endDrawInvocation();
+        ci.cancel();
+      }
+    }
+  }
+
+  @Inject(method = "_drawElements", at = @At("RETURN"))
+  private static void metalrender$drawElementsComplete(int mode, int count,
+      int type, long indices, CallbackInfo ci) {
+    IrisVisualParityCapture.global().endDrawInvocation();
+  }
+
+  @Inject(method = "_drawArrays", at = @At("HEAD"), cancellable = true)
   private static void metalrender$drawArrays(int mode, int first, int count,
       CallbackInfo ci) {
-    metalrender$capture().draw(mode);
+    IrisVisualParityCapture.global().beginDrawInvocation();
+    try {
+      var pending = metalrender$capture().captureDrawDirect(
+          new IrisExecutionCommand.DrawArrays(
+              mode, first, count, 1, 0,
+              IrisExecutionCommand.Source.DIRECT_GL));
+      if (pending.isPresent()
+          && (IrisTranslationCoordinator.tryFullGraphCutover(
+              pending.orElseThrow())
+              || IrisTranslationCoordinator.tryFinalCutover(
+                  pending.orElseThrow()))) {
+        IrisVisualParityCapture.global().endDrawInvocation();
+        ci.cancel();
+      } else if (pending.isEmpty()
+          && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+              "graph-ownership-direct-arrays-unresolved")) {
+        IrisVisualParityCapture.global().endDrawInvocation();
+        ci.cancel();
+      }
+    } catch (IllegalArgumentException error) {
+      metalrender$capture().draw(mode);
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-direct-arrays-invalid")) {
+        IrisVisualParityCapture.global().endDrawInvocation();
+        ci.cancel();
+      }
+    }
+  }
+
+  @Inject(method = "_drawArrays", at = @At("RETURN"))
+  private static void metalrender$drawArraysComplete(int mode, int first,
+      int count, CallbackInfo ci) {
+    IrisVisualParityCapture.global().endDrawInvocation();
   }
 }

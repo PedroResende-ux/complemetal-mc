@@ -1,11 +1,17 @@
 package com.pebbles_boon.metalrender.compat.iris.mixin;
 
+import com.pebbles_boon.metalrender.compat.iris.IrisExecutionCommand;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlFormat;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlGenericAttributeTracker;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingTracker;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlSamplerMirror;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlTextureMirror;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlStateTracker;
 import com.pebbles_boon.metalrender.compat.iris.IrisPipelineStateCapture;
 import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture;
+import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import org.joml.Vector3i;
 import org.spongepowered.asm.mixin.Mixin;
@@ -31,43 +37,199 @@ public abstract class IrisRenderSystemMixin {
     return IrisGlResourceBindingTracker.global();
   }
 
-  @Inject(method = "memoryBarrier", at = @At("RETURN"), require = 0,
+  private static com.pebbles_boon.metalrender.compat.iris.IrisGlVertexArrayTracker
+      metalrender$vertices() {
+    return com.pebbles_boon.metalrender.compat.iris
+        .IrisGlVertexArrayTracker.global();
+  }
+
+  @Inject(method = "clearColor", at = @At("HEAD"), require = 0,
       remap = false)
+  private static void metalrender$clearColor(float red, float green,
+      float blue, float alpha, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().legacyClearColor(red, green, blue, alpha);
+  }
+
+  @Inject(method = "vertexAttrib4f", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$genericVertexAttribute(int location,
+      float x, float y, float z, float w, CallbackInfo ci) {
+    IrisGlGenericAttributeTracker.global().vertexAttribute4f(location,
+        x, y, z, w);
+  }
+
+  @Inject(method = "bindBuffer", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$bindBuffer(int target, int buffer,
+      CallbackInfo ci) {
+    metalrender$vertices().bindBuffer(target, buffer);
+  }
+
+  @Inject(method = "bufferData", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$bufferData(int target, float[] values,
+      int usage, CallbackInfo ci) {
+    if (!com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
+        .isEnabled() || values == null || values.length == 0
+        || values.length > Integer.MAX_VALUE / Float.BYTES) {
+      return;
+    }
+    int buffer = metalrender$vertices().boundBuffer(target);
+    int bytes = values.length * Float.BYTES;
+    ByteBuffer encoded = ByteBuffer.allocate(bytes)
+        .order(ByteOrder.nativeOrder());
+    encoded.asFloatBuffer().put(values);
+    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
+        com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
+    if (mirror.allocate(buffer, bytes)) {
+      mirror.write(buffer, bytes, 0, bytes, encoded);
+    }
+  }
+
+  @Inject(method = "bufferStorage(I[FI)I", at = @At("RETURN"),
+      require = 0, remap = false)
+  private static void metalrender$bufferStorage(int target, float[] values,
+      int flags, CallbackInfoReturnable<Integer> callback) {
+    if (!com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
+        .isEnabled() || values == null || values.length == 0
+        || values.length > Integer.MAX_VALUE / Float.BYTES) {
+      return;
+    }
+    int buffer = callback.getReturnValue();
+    int bytes = values.length * Float.BYTES;
+    ByteBuffer encoded = ByteBuffer.allocate(bytes)
+        .order(ByteOrder.nativeOrder());
+    encoded.asFloatBuffer().put(values);
+    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
+        com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
+    if (mirror.allocate(buffer, bytes)) {
+      mirror.write(buffer, bytes, 0, bytes, encoded);
+    }
+  }
+
+  @Inject(method = "bufferStorage(IJI)V", at = @At("RETURN"),
+      require = 0, remap = false)
+  private static void metalrender$bufferStorageSize(int target, long size,
+      int flags, CallbackInfo ci) {
+    if (com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
+        .isEnabled()) {
+      com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global()
+          .allocate(metalrender$vertices().boundBuffer(target), size);
+    }
+  }
+
+  @Inject(method = "deleteBuffers", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$deleteBuffer(int buffer, CallbackInfo ci) {
+    metalrender$vertices().deleteBuffer(buffer);
+    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global()
+        .delete(buffer);
+  }
+
+  @Inject(method = "memoryBarrier", at = @At("HEAD"), require = 0,
+      remap = false, cancellable = true)
   private static void metalrender$memoryBarrier(int barriers,
       CallbackInfo ci) {
     IrisRenderGraphCapture.global().memoryBarrier(barriers);
+    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      ci.cancel();
+    }
   }
 
-  @Inject(method = "blitFramebuffer", at = @At("RETURN"), require = 0,
-      remap = false)
+  @Inject(method = "blitFramebuffer", at = @At("HEAD"), require = 0,
+      remap = false, cancellable = true)
   private static void metalrender$blitFramebuffer(int source, int destination,
-      int sourceX, int sourceY, int sourceWidth, int sourceHeight,
-      int destinationX, int destinationY, int destinationWidth,
-      int destinationHeight, int mask, int filter, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().blitFramebuffer(source, destination);
+      int sourceX0, int sourceY0, int sourceX1, int sourceY1,
+      int destinationX0, int destinationY0, int destinationX1,
+      int destinationY1, int mask, int filter, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().blitFramebuffer(source, destination,
+        sourceX0, sourceY0, sourceX1, sourceY1, destinationX0,
+        destinationY0, destinationX1, destinationY1, mask, filter);
+    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      ci.cancel();
+    }
   }
 
-  @Inject(method = "copyTexImage2D", at = @At("RETURN"), require = 0,
-      remap = false)
+  @Inject(method = "copyTexImage2D", at = @At("HEAD"), require = 0,
+      remap = false, cancellable = true)
   private static void metalrender$copyTexImage2D(int target, int level,
       int internalFormat, int x, int y, int width, int height, int border,
       CallbackInfo ci) {
-    IrisRenderGraphCapture.global().copyBoundTexture();
+    IrisRenderGraphCapture.global().copyBoundTexture(target, level,
+        internalFormat, x, y, width, height, border,
+        org.lwjgl.opengl.GL11C.glGetInteger(
+            org.lwjgl.opengl.GL11C.GL_READ_BUFFER));
+    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      ci.cancel();
+    }
   }
 
-  @Inject(method = "copyTexSubImage2D", at = @At("RETURN"), require = 0,
-      remap = false)
+  @Inject(method = "copyTexSubImage2D", at = @At("HEAD"), require = 0,
+      remap = false, cancellable = true)
   private static void metalrender$copyTexSubImage2D(int destination,
       int target, int level, int destinationX, int destinationY, int sourceX,
       int sourceY, int width, int height, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().copyTexture(destination);
+    IrisRenderGraphCapture.global().copyTexture(destination, target, level,
+        destinationX, destinationY, sourceX, sourceY, width, height,
+        org.lwjgl.opengl.GL11C.glGetInteger(
+            org.lwjgl.opengl.GL11C.GL_READ_BUFFER));
+    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      ci.cancel();
+    }
   }
 
-  @Inject(method = "generateMipmaps", at = @At("RETURN"), require = 0,
-      remap = false)
+  @Inject(method = "generateMipmaps", at = @At("HEAD"), require = 0,
+      remap = false, cancellable = true)
   private static void metalrender$generateMipmaps(int texture, int target,
       CallbackInfo ci) {
-    IrisRenderGraphCapture.global().generateMipmaps(texture);
+    IrisRenderGraphCapture.global().generateMipmaps(texture, target);
+    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      ci.cancel();
+    }
+  }
+
+  @Inject(method = "clearBufferfv", at = @At("HEAD"), require = 0,
+      remap = false, cancellable = true)
+  private static void metalrender$clearBufferFloat(int framebuffer,
+      int buffer, int drawBuffer, float[] values, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().clearNamedFramebufferFloat(framebuffer,
+        buffer, drawBuffer, values);
+    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      ci.cancel();
+    }
+  }
+
+  @Inject(method = "clearBufferiv", at = @At("HEAD"), require = 0,
+      remap = false, cancellable = true)
+  private static void metalrender$clearBufferSignedInt(int framebuffer,
+      int buffer, int drawBuffer, int[] values, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().clearNamedFramebufferSignedInt(
+        framebuffer, buffer, drawBuffer, values);
+    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      ci.cancel();
+    }
+  }
+
+  @Inject(method = "clearBufferuiv", at = @At("HEAD"), require = 0,
+      remap = false, cancellable = true)
+  private static void metalrender$clearBufferUnsignedInt(int framebuffer,
+      int buffer, int drawBuffer, int[] values, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().clearNamedFramebufferUnsignedInt(
+        framebuffer, buffer, drawBuffer, values);
+    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      ci.cancel();
+    }
+  }
+
+  @Inject(method = "clearBufferSubData", at = @At("HEAD"), require = 0,
+      remap = false, cancellable = true)
+  private static void metalrender$clearBufferSubData(int target,
+      int internalFormat, long offset, long size, int format, int type,
+      int[] values, CallbackInfo ci) {
+    if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+        "graph-ownership-buffer-clear-unimplemented")) {
+      ci.cancel();
+    }
   }
 
   @Inject(method = "createFramebuffer", at = @At("RETURN"),
@@ -86,9 +248,25 @@ public abstract class IrisRenderSystemMixin {
       int level, int internalFormat, int width, int height, int border,
       int format, int type, ByteBuffer pixels, CallbackInfo ci) {
     if (texture > 0 && level == 0) {
+      IrisGlSamplerMirror.global().defineTexture(texture);
       String cacheFormat = IrisGlFormat.cacheName(internalFormat)
           .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
-      metalrender$state().defineTexture(texture, cacheFormat, 1);
+      metalrender$state().defineTexture(texture, cacheFormat, 1,
+          width, height, 1, Math.max(1, level + 1));
+      if (com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
+          .isEnabled()) {
+        int bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat)
+            .orElse(0);
+        if (bytesPerPixel > 0 && IrisGlTextureMirror.global().define(texture,
+            cacheFormat, width, height, 1, Math.max(1, level + 1),
+            bytesPerPixel) && pixels != null
+            && IrisGlFormat.exactUploadBytesPerPixel(internalFormat, format,
+                type).orElse(0) == bytesPerPixel
+            && ((long) width * bytesPerPixel) % 4 == 0) {
+          IrisGlTextureMirror.global().write(texture, level, 0, 0, 0,
+              width, height, width, pixels);
+        }
+      }
     }
   }
 
@@ -140,11 +318,93 @@ public abstract class IrisRenderSystemMixin {
     metalrender$resources().bindTextureToUnit(target, unit, texture);
   }
 
+  @Inject(method = "createTexture", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$createTexture(int target,
+      CallbackInfoReturnable<Integer> callback) {
+    IrisGlSamplerMirror.global().defineTexture(callback.getReturnValue());
+  }
+
+  @Inject(method = "texParameteri", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$textureParameteri(int texture, int target,
+      int pname, int value, CallbackInfo ci) {
+    IrisGlSamplerMirror.global().textureParameteri(texture, pname, value);
+  }
+
+  @Inject(method = "texParameterf", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$textureParameterf(int texture, int target,
+      int pname, float value, CallbackInfo ci) {
+    IrisGlSamplerMirror.global().textureParameterf(texture, pname, value);
+  }
+
+  @Inject(method = "texParameteriv", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$textureParameteriv(int texture, int target,
+      int pname, int[] values, CallbackInfo ci) {
+    IrisGlSamplerMirror.global().textureParameteriv(texture, pname, values);
+  }
+
+  @Inject(method = "texParameterivDirect", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$textureParameterivDirect(int target,
+      int pname, int[] values, CallbackInfo ci) {
+    com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingSnapshot
+        .TextureUnitBinding binding = metalrender$resources()
+            .activeTextureBinding(target);
+    if (binding != null && binding.texture() > 0) {
+      IrisGlSamplerMirror.global().textureParameteriv(binding.texture(),
+          pname, values);
+    }
+  }
+
   @Inject(method = "bindSamplerToUnit", at = @At("RETURN"), require = 0,
       remap = false)
   private static void metalrender$bindSamplerToUnit(int unit, int sampler,
       CallbackInfo ci) {
     metalrender$resources().bindSamplerToUnit(unit, sampler);
+  }
+
+  @Inject(method = "genSampler", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$generateSampler(
+      CallbackInfoReturnable<Integer> callback) {
+    IrisGlSamplerMirror.global().defineSampler(callback.getReturnValue());
+  }
+
+  @Inject(method = "destroySampler", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$destroySampler(int sampler,
+      CallbackInfo ci) {
+    IrisGlSamplerMirror.global().deleteSampler(sampler);
+  }
+
+  @Inject(method = "unbindAllSamplers", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$unbindAllSamplers(CallbackInfo ci) {
+    metalrender$resources().unbindAllSamplers();
+  }
+
+  @Inject(method = "samplerParameteri", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$samplerParameteri(int sampler, int pname,
+      int value, CallbackInfo ci) {
+    IrisGlSamplerMirror.global().samplerParameteri(sampler, pname, value);
+  }
+
+  @Inject(method = "samplerParameterf", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$samplerParameterf(int sampler, int pname,
+      float value, CallbackInfo ci) {
+    IrisGlSamplerMirror.global().samplerParameterf(sampler, pname, value);
+  }
+
+  @Inject(method = "samplerParameteriv", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$samplerParameteriv(int sampler, int pname,
+      int[] values, CallbackInfo ci) {
+    IrisGlSamplerMirror.global().samplerParameteriv(sampler, pname, values);
   }
 
   @Inject(method = "bindImageTexture", at = @At("RETURN"), require = 0,
@@ -258,23 +518,41 @@ public abstract class IrisRenderSystemMixin {
   }
 
   @Inject(method = "dispatchCompute(III)V", at = @At("HEAD"), require = 0,
-      remap = false)
+      remap = false, cancellable = true)
   private static void metalrender$dispatchCompute(int x, int y, int z,
       CallbackInfo ci) {
-    metalrender$capture().dispatch();
+    try {
+      metalrender$capture().dispatch(
+          new IrisExecutionCommand.Dispatch(x, y, z));
+    } catch (IllegalArgumentException error) {
+      metalrender$capture().dispatch();
+    }
+    if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+        "graph-ownership-compute-dispatch-unimplemented")) {
+      ci.cancel();
+    }
   }
 
   @Inject(method = "dispatchCompute(Lorg/joml/Vector3i;)V",
-      at = @At("HEAD"), require = 0, remap = false)
+      at = @At("HEAD"), require = 0, remap = false, cancellable = true)
   private static void metalrender$dispatchComputeVector(Vector3i groups,
       CallbackInfo ci) {
-    metalrender$capture().dispatch();
+    metalrender$dispatchCompute(groups.x, groups.y, groups.z, ci);
   }
 
   @Inject(method = "dispatchComputeIndirect", at = @At("HEAD"), require = 0,
-      remap = false)
+      remap = false, cancellable = true)
   private static void metalrender$dispatchComputeIndirect(long offset,
       CallbackInfo ci) {
-    metalrender$capture().dispatch();
+    try {
+      metalrender$capture().dispatch(
+          new IrisExecutionCommand.IndirectDispatch(offset));
+    } catch (IllegalArgumentException error) {
+      metalrender$capture().dispatch();
+    }
+    if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+        "graph-ownership-indirect-dispatch-unimplemented")) {
+      ci.cancel();
+    }
   }
 }

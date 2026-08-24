@@ -211,6 +211,10 @@ public record IrisPipelineState(
         throw new IllegalArgumentException(
             "per-instance layouts require a positive step rate");
       }
+      if (stepFunction == StepFunction.CONSTANT && stepRate != 0) {
+        throw new IllegalArgumentException(
+            "constant layouts must use step rate zero");
+      }
     }
   }
 
@@ -396,7 +400,8 @@ public record IrisPipelineState(
 
   public enum StepFunction implements CacheNamed {
     PER_VERTEX("per-vertex"),
-    PER_INSTANCE("per-instance");
+    PER_INSTANCE("per-instance"),
+    CONSTANT("constant");
 
     private final String cacheName;
 

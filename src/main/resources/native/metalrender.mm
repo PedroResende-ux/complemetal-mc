@@ -8,11 +8,14 @@
 #endif
 #import <OpenGL/CGLIOSurface.h>
 #import <OpenGL/OpenGL.h>
-#import <OpenGL/gl.h>
+#import <OpenGL/gl3.h>
+#import <QuartzCore/QuartzCore.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -25,10 +28,13 @@
 #include <mach/mach_time.h>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <pthread/qos.h>
 #include <shared_mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #ifdef __aarch64__
@@ -83,6 +89,7 @@ static std::atomic<bool> g_metal4Supported{false};
 static std::atomic<bool> g_metal4ScaffoldActive{false};
 static std::atomic<bool> g_metal4RuntimeVerified{false};
 static std::atomic<bool> g_metal4ProbeAttempted{false};
+static std::atomic<bool> g_metal4ProbeInProgress{false};
 static std::atomic<bool> g_metal4DrawPathActive{false};
 // Keep long-lived references dynamically typed so merely loading the dylib on
 // macOS 14/15 cannot require a Metal 4 protocol. They are assigned and used as
@@ -422,6 +429,29 @@ static int g_allocatedRenderWidth = 0;
 static int g_allocatedRenderHeight = 0;
 static std::atomic<int> g_frameCount{0};
 static std::atomic<float> g_lastGpuMs{0.0f};
+// Metal 4 full-graph telemetry is deliberately independent from the base
+// renderer timer above. MTL4 commit feedback is observational only: shared
+// events remain the sole command-storage and resource-lifetime fence.
+static std::atomic<uint64_t> g_irisMetal4GraphGpuSamples{0};
+static std::atomic<uint64_t> g_irisMetal4GraphLastGpuNs{0};
+static std::atomic<uint64_t> g_irisMetal4GraphTotalGpuNs{0};
+static std::atomic<uint64_t> g_irisMetal4GraphMaxGpuNs{0};
+static std::atomic<uint64_t> g_irisMetal4GraphLastQueueNs{0};
+static std::atomic<uint64_t> g_irisMetal4GraphTotalQueueNs{0};
+static std::atomic<uint64_t> g_irisMetal4GraphMaxQueueNs{0};
+static std::atomic<uint64_t> g_irisMetal4GraphFeedbackErrors{0};
+static std::atomic<uint64_t> g_irisMetal4GraphCpuSamples{0};
+static std::atomic<uint64_t> g_irisMetal4GraphLastCpuNs{0};
+static std::atomic<uint64_t> g_irisMetal4GraphTotalCpuNs{0};
+static std::atomic<uint64_t> g_irisMetal4GraphMaxCpuNs{0};
+// Raw commit-feedback samples are disabled in normal gameplay. Exact-JAR QA
+// enables this bounded buffer explicitly so performance acceptance never has
+// to infer a distribution from process-lifetime totals or the last frame.
+static constexpr size_t kIrisMetal4GraphPerformanceSampleLimit = 36'000;
+static std::atomic<bool> g_irisMetal4GraphPerformanceSampling{false};
+static std::mutex g_irisMetal4GraphPerformanceMutex;
+static std::vector<uint64_t> g_irisMetal4GraphPerformanceSamples;
+static uint64_t g_irisMetal4GraphPerformanceDropped = 0;
 static std::mutex g_gpuTelemetryMutex;
 static uint64_t g_gpuTelemetryAccumulatedUs = 0;
 static uint32_t g_gpuTelemetryCompletedFrames = 0;
@@ -696,24 +726,119 @@ static void recreate_mega_vertex_buffer_if_empty() {
 }
 
 struct Metal4ProbeState {
-  dispatch_semaphore_t done;
+  id<MTLSharedEvent> completionEvent;
+  uint64_t completionValue = 1;
   std::atomic<bool> completed{false};
   std::atomic<bool> succeeded{false};
   id allocator;
 
   explicit Metal4ProbeState(id probeAllocator)
-      : done(dispatch_semaphore_create(0)),
+      : completionEvent([g_device newSharedEvent]),
         allocator([probeAllocator retain]) {}
 
   ~Metal4ProbeState() {
+    if (completionEvent)
+      [completionEvent release];
     if (allocator)
       [allocator release];
-#if !OS_OBJECT_USE_OBJC
-    if (done)
-      dispatch_release(done);
-#endif
   }
 };
+
+// Follow Apple's Metal 4 frame lifecycle directly: enqueue the command buffer,
+// enqueue a shared-event signal after it, wait for that GPU-timeline value,
+// then reset the allocator only once Metal says its storage is reusable.  A
+// feedback handler runs inside IOGPUMetalCommandBuffer::didComplete; using it
+// as a CPU lifetime fence allowed command-storage reset and block disposal to
+// overlap the submitter on macOS 26.  Shared events are the documented reuse
+// boundary and require no completion callback or captured C++ object.
+static bool metal4_commit_and_wait(
+    id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> commandBuffer,
+    const std::shared_ptr<Metal4ProbeState> &state, uint64_t timeoutMs)
+    API_AVAILABLE(macos(26.0)) {
+  if (!queue || !commandBuffer || !state || !state->completionEvent
+      || !state->allocator || timeoutMs == 0) {
+    return false;
+  }
+  id<MTL4CommandBuffer> buffers[] = {commandBuffer};
+  [queue commit:buffers count:1];
+  [queue signalEvent:state->completionEvent value:state->completionValue];
+  bool completed = [state->completionEvent
+      waitUntilSignaledValue:state->completionValue timeoutMS:timeoutMs];
+  if (completed) {
+    [(id<MTL4CommandAllocator>)state->allocator reset];
+  }
+  // Publish completion only after the allocator has crossed its documented
+  // reuse boundary.  Retirement code treats this flag as permission to drop
+  // every unretained Metal 4 resource referenced by the command buffer.
+  state->succeeded.store(completed, std::memory_order_release);
+  state->completed.store(completed, std::memory_order_release);
+  return completed;
+}
+
+static bool metal4_commit_without_wait(
+    id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> commandBuffer,
+    const std::shared_ptr<Metal4ProbeState> &state,
+    MTL4CommitOptions *options)
+    API_AVAILABLE(macos(26.0)) {
+  if (!queue || !commandBuffer || !state || !state->completionEvent ||
+      !state->allocator) {
+    return false;
+  }
+  id<MTL4CommandBuffer> buffers[] = {commandBuffer};
+  if (options) {
+    [queue commit:buffers count:1 options:options];
+  } else {
+    [queue commit:buffers count:1];
+  }
+  [queue signalEvent:state->completionEvent value:state->completionValue];
+  return true;
+}
+
+static bool iris_metal4_submission_completed(
+    const std::shared_ptr<Metal4ProbeState> &state)
+    API_AVAILABLE(macos(26.0)) {
+  if (!state)
+    return true;
+  if (state->completed.load(std::memory_order_acquire))
+    return true;
+  // A bounded synchronous wait can time out immediately before the GPU reaches
+  // the queued shared-event signal.  Recover that submission on a later entry
+  // instead of quarantining its unretained resources for the process lifetime.
+  if (!state->completionEvent ||
+      state->completionEvent.signaledValue < state->completionValue) {
+    return false;
+  }
+  if (state->allocator)
+    [(id<MTL4CommandAllocator>)state->allocator reset];
+  state->succeeded.store(true, std::memory_order_release);
+  state->completed.store(true, std::memory_order_release);
+  return true;
+}
+
+// Emergency lifetime fence for a command buffer that was committed before a
+// retirement container could be installed. The steady-state async path never
+// waits here: it preflights a bounded retirement slot and reserves all vector
+// storage before committing. If an allocation still fails, correctness wins
+// over frame latency and every referenced object remains alive until Metal's
+// shared-event boundary is observed.
+static bool iris_metal4_wait_for_committed_submission(
+    const std::shared_ptr<Metal4ProbeState> &state, uint64_t timeoutMs)
+    API_AVAILABLE(macos(26.0)) {
+  if (iris_metal4_submission_completed(state))
+    return true;
+  if (!state || !state->completionEvent || !state->allocator ||
+      timeoutMs == 0) {
+    return false;
+  }
+  bool completed = [state->completionEvent
+      waitUntilSignaledValue:state->completionValue timeoutMS:timeoutMs];
+  if (!completed)
+    return false;
+  [(id<MTL4CommandAllocator>)state->allocator reset];
+  state->succeeded.store(true, std::memory_order_release);
+  state->completed.store(true, std::memory_order_release);
+  return true;
+}
 
 static bool verify_metal4_runtime(id queueObject) {
   if (!queueObject || !g_device)
@@ -748,26 +873,8 @@ static bool verify_metal4_runtime(id queueObject) {
       [commandBuffer endCommandBuffer];
 
       auto state = std::make_shared<Metal4ProbeState>(probeAllocator);
-      options = [[MTL4CommitOptions alloc] init];
-      auto callbackState = state;
-      [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
-        bool ok = feedback != nil && feedback.error == nil;
-        callbackState->succeeded.store(ok, std::memory_order_release);
-        callbackState->completed.store(true, std::memory_order_release);
-        // The allocator may only be reset after the submitted GPU work is done.
-        id<MTL4CommandAllocator> completedAllocator =
-            (id<MTL4CommandAllocator>)callbackState->allocator;
-        [completedAllocator reset];
-        dispatch_semaphore_signal(callbackState->done);
-      }];
-
-      id<MTL4CommandBuffer> buffers[] = {commandBuffer};
-      [queue commit:buffers count:1 options:options];
-      long waitResult = dispatch_semaphore_wait(
-          state->done,
-          dispatch_time(DISPATCH_TIME_NOW, 2LL * NSEC_PER_SEC));
-      bool verified =
-          waitResult == 0 &&
+      bool verified = metal4_commit_and_wait(
+          queue, commandBuffer, state, 2'000) &&
           state->completed.load(std::memory_order_acquire) &&
           state->succeeded.load(std::memory_order_acquire);
 
@@ -803,16 +910,45 @@ static void configure_metal4_scaffold() {
                 [g_device respondsToSelector:@selector(newCommandBuffer)];
     g_metal4Supported.store(supported, std::memory_order_release);
     if (supported && g_metal4Requested.load(std::memory_order_acquire) &&
-        !g_metal4ProbeAttempted.exchange(true, std::memory_order_acq_rel)) {
-      id<MTL4CommandQueue> queue = [g_device newMTL4CommandQueue];
-      id<MTL4CommandAllocator> allocator =
-          [g_device newCommandAllocator];
-      bool verified = queue && allocator && verify_metal4_runtime(queue);
+        !g_metal4ProbeAttempted.load(std::memory_order_acquire)) {
+      // Publish the transient state before marking the attempt as started.
+      // nGetBackendMode is queried concurrently by the Iris translation
+      // worker; without this state it can observe requested+supported while
+      // the bounded probe is still running and misreport a terminal failure.
+      // The Java pipeline compiler intentionally memoizes terminal fallback,
+      // so that short window otherwise poisons the entire cold-cache run.
+      g_metal4ProbeInProgress.store(true, std::memory_order_release);
+      g_metal4ProbeAttempted.store(true, std::memory_order_release);
+      // A first no-op commit can miss its bounded completion window while the
+      // driver is cold or another API is compiling shaders. One timeout must
+      // not permanently downgrade an otherwise healthy Metal 4 runtime, so
+      // retry once with fresh queue/allocator objects. The total wait remains
+      // bounded and a second failure still selects the normal Metal 3 path.
+      id<MTL4CommandQueue> queue = nil;
+      id<MTL4CommandAllocator> allocator = nil;
+      bool verified = false;
+      for (int attempt = 0; attempt < 2 && !verified; attempt++) {
+        queue = [g_device newMTL4CommandQueue];
+        allocator = [g_device newCommandAllocator];
+        verified = queue && allocator && verify_metal4_runtime(queue);
+        if (!verified) {
+          if (queue)
+            [queue release];
+          if (allocator)
+            [allocator release];
+          queue = nil;
+          allocator = nil;
+          if (attempt == 0)
+            dbg("WARN: Metal 4 command-buffer probe retrying after bounded "
+                "first failure\n");
+        }
+      }
       if (verified) {
         g_metal4CommandQueue = queue;
         g_metal4CommandAllocator = allocator;
         g_metal4ScaffoldActive.store(true, std::memory_order_release);
         g_metal4RuntimeVerified.store(true, std::memory_order_release);
+        g_metal4ProbeInProgress.store(false, std::memory_order_release);
         dbg("Metal 4 runtime verified by command-buffer completion; rendering "
             "remains on the compatibility command stream\n");
       } else {
@@ -822,6 +958,7 @@ static void configure_metal4_scaffold() {
           [allocator release];
         g_metal4ScaffoldActive.store(false, std::memory_order_release);
         g_metal4RuntimeVerified.store(false, std::memory_order_release);
+        g_metal4ProbeInProgress.store(false, std::memory_order_release);
         dbg("WARN: Metal 4 command-buffer probe failed; using Metal 3 "
             "fallback\n");
       }
@@ -830,6 +967,7 @@ static void configure_metal4_scaffold() {
     g_metal4Supported.store(false, std::memory_order_release);
     g_metal4ScaffoldActive.store(false, std::memory_order_release);
     g_metal4RuntimeVerified.store(false, std::memory_order_release);
+    g_metal4ProbeInProgress.store(false, std::memory_order_release);
   }
 }
 
@@ -1371,31 +1509,713 @@ static void serialize_pipeline_archive_atomically() {
 }
 
 // Metal 4 uses MTL4Compiler + MTL4PipelineDataSetSerializer rather than
-// MTLBinaryArchive. Keep this context wholly separate from the current Metal 3
-// renderer. It is deliberately uncalled until translated Iris MSL pipelines
-// are actually created, and therefore does not imply a Metal 4 draw path.
+// MTLBinaryArchive. This cache creates and retains translated Iris pipeline
+// objects, but it is intentionally separate from every command encoder: Stage
+// 6 cannot submit a draw.
 static id g_irisMetal4PipelineSerializer = nil;
 static id g_irisMetal4Compiler = nil;
-static id g_irisMetal4LookupArchive = nil;
+static NSMutableArray *g_irisMetal4LookupArchives = nil;
 static NSString *g_irisMetal4ArchivePath = nil;
 static std::mutex g_irisMetal4PipelineCacheMutex;
+// MTL4 command submission and its short-lived resource setup are serialized
+// across Iris' translator and render threads.  The macOS 26 driver may route
+// small shared buffers through one device suballocator; allowing the shadow,
+// cutover and graph paths to churn that allocator concurrently is not a safe
+// ownership boundary.
+static std::mutex g_irisMetal4ExecutionMutex;
+static bool iris_metal4_retired_submission_slot_available()
+    API_AVAILABLE(macos(26.0));
+static bool g_irisMetal4PipelineCacheDirty = false;
+static bool g_irisMetal4ArchiveLoaded = false;
+static constexpr NSUInteger kIrisMetal4ArchiveSegmentLimit = 32;
+static std::atomic<uint64_t> g_irisMetal4PipelineAttemptCount{0};
+static std::atomic<uint64_t> g_irisMetal4PipelineCompileCount{0};
+static std::atomic<uint64_t> g_irisMetal4PipelineCacheHitCount{0};
+static std::atomic<uint64_t> g_irisMetal4PipelineFailureCount{0};
+static std::atomic<uint64_t> g_irisMetal4PipelineStaleRecoveryCount{0};
+static std::atomic<uint64_t> g_irisMetal4PipelineDrawAttemptCount{0};
+static thread_local std::vector<uint8_t> g_irisMetal4LastReplayRgba8;
+static thread_local std::vector<uint8_t> g_irisMetal4LastGraphFrameRgba8;
+static thread_local IOSurfaceRef g_irisMetal4PendingCutoverSurface = nullptr;
+static thread_local uint32_t g_irisMetal4PendingCutoverWidth = 0;
+static thread_local uint32_t g_irisMetal4PendingCutoverHeight = 0;
+static std::atomic<uint64_t> g_irisMetal4CutoverSurfaceSequence{1};
+static constexpr size_t kIrisMetal4CutoverBindingLimit = 3;
 
-[[maybe_unused]] static bool
-prepare_iris_metal4_pipeline_cache_for_translated_msl() {
+struct IrisMetal4GraphPresentation {
+  uint64_t token = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  IOSurfaceRef surface = nullptr;
+  std::shared_ptr<Metal4ProbeState> feedbackState;
+};
+
+static constexpr size_t kIrisMetal4GraphPresentationLimit = 3;
+static std::vector<IrisMetal4GraphPresentation>
+    g_irisMetal4GraphPresentations;
+
+struct IrisMetal4ReusableGraphSurface {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  IOSurfaceRef surface = nullptr;
+};
+
+static std::vector<IrisMetal4ReusableGraphSurface>
+    g_irisMetal4ReusableGraphSurfaces;
+
+static IOSurfaceRef iris_metal4_acquire_graph_surface(
+    uint32_t width, uint32_t height) {
+  auto found = std::find_if(g_irisMetal4ReusableGraphSurfaces.begin(),
+      g_irisMetal4ReusableGraphSurfaces.end(),
+      [&](const IrisMetal4ReusableGraphSurface &candidate) {
+        return candidate.surface && candidate.width == width &&
+               candidate.height == height;
+      });
+  if (found == g_irisMetal4ReusableGraphSurfaces.end())
+    return nullptr;
+  IOSurfaceRef result = found->surface;
+  found->surface = nullptr;
+  g_irisMetal4ReusableGraphSurfaces.erase(found);
+  return result;
+}
+
+static bool iris_metal4_recycle_graph_surface(
+    IOSurfaceRef surface, uint32_t width, uint32_t height) {
+  if (!surface || width == 0 || height == 0 ||
+      g_irisMetal4ReusableGraphSurfaces.size() >=
+          kIrisMetal4GraphPresentationLimit) {
+    return false;
+  }
+  try {
+    if (g_irisMetal4ReusableGraphSurfaces.capacity() <
+        kIrisMetal4GraphPresentationLimit) {
+      g_irisMetal4ReusableGraphSurfaces.reserve(
+          kIrisMetal4GraphPresentationLimit);
+    }
+    g_irisMetal4ReusableGraphSurfaces.push_back({width, height, surface});
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+static void reset_iris_metal4_graph_surface_pool() {
+  for (IrisMetal4ReusableGraphSurface &slot :
+       g_irisMetal4ReusableGraphSurfaces) {
+    if (slot.surface)
+      CFRelease(slot.surface);
+  }
+  g_irisMetal4ReusableGraphSurfaces.clear();
+}
+
+static void iris_metal4_atomic_max(std::atomic<uint64_t> &destination,
+                                   uint64_t value) {
+  uint64_t current = destination.load(std::memory_order_relaxed);
+  while (current < value && !destination.compare_exchange_weak(
+      current, value, std::memory_order_relaxed,
+      std::memory_order_relaxed)) {
+  }
+}
+
+static uint64_t iris_metal4_seconds_to_ns(CFTimeInterval seconds) {
+  if (!std::isfinite(seconds) || seconds <= 0.0)
+    return 0;
+  constexpr double kMaximum =
+      (double)std::numeric_limits<uint64_t>::max();
+  double nanoseconds = seconds * 1'000'000'000.0;
+  if (nanoseconds >= kMaximum)
+    return std::numeric_limits<uint64_t>::max();
+  return (uint64_t)nanoseconds;
+}
+
+static MTL4CommitOptions *iris_metal4_graph_timing_options()
+    API_AVAILABLE(macos(26.0)) {
+  MTL4CommitOptions *options = [[MTL4CommitOptions alloc] init];
+  if (!options)
+    return nil;
+  CFTimeInterval submittedAt = CACurrentMediaTime();
+  // Commit options are one-shot: Metal consumes the registered handler for a
+  // single commit. The handler captures no C++ ownership state and only
+  // updates lock-free counters, so delayed feedback cannot race allocator or
+  // resource destruction.
+  [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+    NSError *error = feedback.error;
+    if (error) {
+      g_irisMetal4GraphFeedbackErrors.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+    CFTimeInterval start = feedback.GPUStartTime;
+    CFTimeInterval end = feedback.GPUEndTime;
+    uint64_t elapsedNs = iris_metal4_seconds_to_ns(end - start);
+    if (elapsedNs == 0)
+      return;
+    g_irisMetal4GraphLastGpuNs.store(elapsedNs,
+                                     std::memory_order_relaxed);
+    g_irisMetal4GraphTotalGpuNs.fetch_add(elapsedNs,
+                                          std::memory_order_relaxed);
+    iris_metal4_atomic_max(g_irisMetal4GraphMaxGpuNs, elapsedNs);
+    uint64_t queueNs = iris_metal4_seconds_to_ns(start - submittedAt);
+    g_irisMetal4GraphLastQueueNs.store(queueNs,
+                                       std::memory_order_relaxed);
+    g_irisMetal4GraphTotalQueueNs.fetch_add(queueNs,
+                                            std::memory_order_relaxed);
+    iris_metal4_atomic_max(g_irisMetal4GraphMaxQueueNs, queueNs);
+    if (g_irisMetal4GraphPerformanceSampling.load(
+            std::memory_order_acquire)) {
+      std::lock_guard<std::mutex> lock(
+          g_irisMetal4GraphPerformanceMutex);
+      if (!g_irisMetal4GraphPerformanceSampling.load(
+              std::memory_order_relaxed)) {
+        // A reset disabled sampling while this feedback callback waited.
+      } else if (g_irisMetal4GraphPerformanceSamples.size() <
+          kIrisMetal4GraphPerformanceSampleLimit) {
+        g_irisMetal4GraphPerformanceSamples.push_back(elapsedNs);
+      } else {
+        g_irisMetal4GraphPerformanceDropped++;
+      }
+    }
+    g_irisMetal4GraphGpuSamples.fetch_add(1, std::memory_order_release);
+  }];
+  return options;
+}
+
+class IrisMetal4GraphCpuTimer {
+ public:
+  explicit IrisMetal4GraphCpuTimer(bool enabled)
+      : enabled_(enabled), startedAt_(enabled ? CACurrentMediaTime() : 0.0) {}
+
+  ~IrisMetal4GraphCpuTimer() {
+    if (!enabled_)
+      return;
+    uint64_t elapsedNs = iris_metal4_seconds_to_ns(
+        CACurrentMediaTime() - startedAt_);
+    if (elapsedNs == 0)
+      return;
+    g_irisMetal4GraphLastCpuNs.store(elapsedNs,
+                                     std::memory_order_relaxed);
+    g_irisMetal4GraphTotalCpuNs.fetch_add(elapsedNs,
+                                          std::memory_order_relaxed);
+    iris_metal4_atomic_max(g_irisMetal4GraphMaxCpuNs, elapsedNs);
+    g_irisMetal4GraphCpuSamples.fetch_add(1, std::memory_order_release);
+  }
+
+ private:
+  bool enabled_;
+  CFTimeInterval startedAt_;
+};
+
+struct IrisMetal4GraphCpuProfile {
+  uint64_t samples = 0;
+  uint64_t parseNs = 0;
+  uint64_t inputsNs = 0;
+  uint64_t drawsNs = 0;
+  uint64_t setupNs = 0;
+  uint64_t presentationNs = 0;
+  uint64_t residencyCreateNs = 0;
+  uint64_t residencyPopulateNs = 0;
+  uint64_t residencyCommitNs = 0;
+  uint64_t commandNs = 0;
+  uint64_t encodeNs = 0;
+  uint64_t commitNs = 0;
+  uint64_t retireNs = 0;
+  uint64_t residencyRawAllocations = 0;
+  uint64_t residencyUniqueAllocations = 0;
+  uint64_t drawOperations = 0;
+  uint64_t drawPasses = 0;
+  uint64_t barrierCalls = 0;
+};
+
+static IrisMetal4GraphCpuProfile g_irisMetal4GraphCpuProfile;
+static std::mutex g_irisMetal4GraphCpuProfileMutex;
+
+static void iris_metal4_record_graph_cpu_profile(
+    CFTimeInterval started, CFTimeInterval parsed,
+    CFTimeInterval inputsReady, CFTimeInterval drawsReady,
+    CFTimeInterval presentationReady, CFTimeInterval residencyCreated,
+    CFTimeInterval residencyPopulated, CFTimeInterval residencyCommitted,
+    CFTimeInterval setupReady, CFTimeInterval encoded,
+    CFTimeInterval committed, CFTimeInterval retired,
+    uint64_t residencyRawAllocations,
+    uint64_t residencyUniqueAllocations,
+    uint64_t drawOperations, uint64_t drawPasses,
+    uint64_t barrierCalls) {
+  if (!(started > 0.0 && parsed >= started && inputsReady >= parsed &&
+        drawsReady >= inputsReady && presentationReady >= drawsReady &&
+        residencyCreated >= presentationReady &&
+        residencyPopulated >= residencyCreated &&
+        residencyCommitted >= residencyPopulated &&
+        setupReady >= residencyCommitted && encoded >= setupReady &&
+        committed >= encoded && retired >= committed)) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_irisMetal4GraphCpuProfileMutex);
+  IrisMetal4GraphCpuProfile &profile = g_irisMetal4GraphCpuProfile;
+  profile.samples++;
+  profile.parseNs += iris_metal4_seconds_to_ns(parsed - started);
+  profile.inputsNs += iris_metal4_seconds_to_ns(inputsReady - parsed);
+  profile.drawsNs += iris_metal4_seconds_to_ns(drawsReady - inputsReady);
+  profile.setupNs += iris_metal4_seconds_to_ns(setupReady - drawsReady);
+  profile.presentationNs += iris_metal4_seconds_to_ns(
+      presentationReady - drawsReady);
+  profile.residencyCreateNs += iris_metal4_seconds_to_ns(
+      residencyCreated - presentationReady);
+  profile.residencyPopulateNs += iris_metal4_seconds_to_ns(
+      residencyPopulated - residencyCreated);
+  profile.residencyCommitNs += iris_metal4_seconds_to_ns(
+      residencyCommitted - residencyPopulated);
+  profile.commandNs += iris_metal4_seconds_to_ns(
+      setupReady - residencyCommitted);
+  profile.encodeNs += iris_metal4_seconds_to_ns(encoded - setupReady);
+  profile.commitNs += iris_metal4_seconds_to_ns(committed - encoded);
+  profile.retireNs += iris_metal4_seconds_to_ns(retired - committed);
+  profile.residencyRawAllocations += residencyRawAllocations;
+  profile.residencyUniqueAllocations += residencyUniqueAllocations;
+  profile.drawOperations += drawOperations;
+  profile.drawPasses += drawPasses;
+  profile.barrierCalls += barrierCalls;
+}
+
+static void reset_iris_metal4_graph_presentations() {
+  for (IrisMetal4GraphPresentation &presentation :
+       g_irisMetal4GraphPresentations) {
+    if (presentation.surface)
+      CFRelease(presentation.surface);
+  }
+  g_irisMetal4GraphPresentations.clear();
+  reset_iris_metal4_graph_surface_pool();
+}
+
+struct IrisMetal4CutoverGlBinding {
+  IOSurfaceRef surface = nullptr;
+  GLsync completionFence = nullptr;
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
+static thread_local std::unordered_map<GLuint, IrisMetal4CutoverGlBinding>
+    g_irisMetal4CutoverGlBindings;
+
+static constexpr size_t kIrisMetal4InputHandoffLimit = 72;
+static constexpr uint64_t kIrisMetal4InputHandoffByteLimit =
+    256ULL * 1024ULL * 1024ULL;
+static constexpr size_t kIrisMetal4InputSurfaceHandoffLimit = 256;
+static constexpr uint64_t kIrisMetal4InputSurfaceByteLimit =
+    512ULL * 1024ULL * 1024ULL;
+struct IrisMetal4InputHandoff {
+  uint64_t token = 0;
+  uint64_t sourceGeneration = 0;
+  uint64_t captureSerial = 0;
+  uint64_t allocationBytes = 0;
+  uint32_t kind = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  GLuint sourceTexture = 0;
+  GLuint rectangleTexture = 0;
+  GLuint readFramebuffer = 0;
+  GLuint drawFramebuffer = 0;
+  GLsync copyFence = nullptr;
+  bool copyReady = false;
+  bool leased = false;
+  IOSurfaceRef surface = nullptr;
+  id<MTLTexture> metalTexture = nil;
+  std::shared_ptr<Metal4ProbeState> inFlightFeedback;
+};
+
+enum class IrisMetal4InputHandoffReadiness {
+  READY,
+  MISSING_FENCE,
+  FENCE_TIMEOUT,
+};
+
+static IrisMetal4InputHandoffReadiness
+iris_metal4_ensure_input_handoff_ready(IrisMetal4InputHandoff &handoff) {
+  if (handoff.kind == 3 || handoff.copyReady)
+    return IrisMetal4InputHandoffReadiness::READY;
+  if (!handoff.copyFence)
+    return IrisMetal4InputHandoffReadiness::MISSING_FENCE;
+  GLenum copyStatus = glClientWaitSync(handoff.copyFence,
+      GL_SYNC_FLUSH_COMMANDS_BIT, 5ULL * NSEC_PER_SEC);
+  if (copyStatus != GL_ALREADY_SIGNALED &&
+      copyStatus != GL_CONDITION_SATISFIED) {
+    return IrisMetal4InputHandoffReadiness::FENCE_TIMEOUT;
+  }
+  glDeleteSync(handoff.copyFence);
+  handoff.copyFence = nullptr;
+  // Multiple draws in one MGF9 frame may sample the same IOSurface snapshot.
+  // The fence is a one-time transition into READY, not a per-draw permit.
+  handoff.copyReady = true;
+  return IrisMetal4InputHandoffReadiness::READY;
+}
+// Immutable resident uploads are generation keyed by the GL texture name.
+// Dynamic IOSurface captures use a separate token-keyed ring so a translator
+// worker can consume frame N while the render thread starts capturing frame
+// N+1 without either thread observing an overwritten surface.
+static std::unordered_map<GLuint, IrisMetal4InputHandoff>
+    g_irisMetal4InputHandoffs;
+static std::unordered_map<uint64_t, IrisMetal4InputHandoff>
+    g_irisMetal4InputSurfaceHandoffs;
+static std::unordered_map<GLuint, uint64_t>
+    g_irisMetal4InputSurfaceCaptureSequences;
+static uint64_t g_irisMetal4InputHandoffBytes = 0;
+static uint64_t g_irisMetal4InputSurfaceBytes = 0;
+static std::atomic<uint64_t> g_irisMetal4InputHandoffSequence{1};
+
+static IrisMetal4InputHandoff *iris_metal4_find_input_handoff(
+    GLuint sourceTexture, uint64_t token) {
+  auto resident = g_irisMetal4InputHandoffs.find(sourceTexture);
+  if (resident != g_irisMetal4InputHandoffs.end() &&
+      resident->second.token == token) {
+    return &resident->second;
+  }
+  auto surface = g_irisMetal4InputSurfaceHandoffs.find(token);
+  if (surface != g_irisMetal4InputSurfaceHandoffs.end() &&
+      surface->second.sourceTexture == sourceTexture) {
+    return &surface->second;
+  }
+  return nullptr;
+}
+
+static bool iris_metal4_track_input_surface_lease(
+    IrisMetal4InputHandoff &handoff, std::vector<uint64_t> &leases) {
+  if (handoff.kind == 3)
+    return true;
+  if (!handoff.leased)
+    return false;
+  if (std::find(leases.begin(), leases.end(), handoff.token) ==
+      leases.end()) {
+    leases.push_back(handoff.token);
+  }
+  return true;
+}
+
+static void iris_metal4_finish_input_surface_leases(
+    const std::vector<uint64_t> &leases,
+    const std::shared_ptr<Metal4ProbeState> &feedback) {
+  for (uint64_t token : leases) {
+    auto found = g_irisMetal4InputSurfaceHandoffs.find(token);
+    if (found == g_irisMetal4InputSurfaceHandoffs.end())
+      continue;
+    found->second.leased = false;
+    found->second.inFlightFeedback = feedback;
+  }
+}
+
+static constexpr size_t kIrisMetal4ResidentBufferLimit = 256;
+static constexpr uint64_t kIrisMetal4ResidentBufferByteLimit =
+    64ULL * 1024ULL * 1024ULL;
+struct IrisMetal4ResidentBuffer {
+  uint64_t token = 0;
+  uint32_t byteLength = 0;
+  id<MTLBuffer> buffer = nil;
+};
+static std::unordered_map<std::string,
+    IrisMetal4ResidentBuffer> g_irisMetal4ResidentBuffers;
+static std::unordered_map<uint64_t, IrisMetal4ResidentBuffer>
+    g_irisMetal4ResidentBuffersByToken;
+static uint64_t g_irisMetal4ResidentBufferBytes = 0;
+static std::atomic<uint64_t> g_irisMetal4ResidentBufferSequence{1};
+
+static id<MTLBuffer> iris_metal4_resident_buffer(
+    uint64_t token, uint32_t byteLength) {
+  auto indexed = g_irisMetal4ResidentBuffersByToken.find(token);
+  if (indexed != g_irisMetal4ResidentBuffersByToken.end() &&
+      indexed->second.byteLength == byteLength && indexed->second.buffer) {
+    return indexed->second.buffer;
+  }
+  // Preserve fail-open compatibility with caches created before the index was
+  // populated. Normal Stage 9 frames take the O(1) branch above.
+  for (const auto &resident : g_irisMetal4ResidentBuffers) {
+    if (resident.second.token == token &&
+        resident.second.byteLength == byteLength &&
+        resident.second.buffer) {
+      return resident.second.buffer;
+    }
+  }
+  return nil;
+}
+
+static constexpr size_t kIrisMetal4GraphTextureLimit = 512;
+static constexpr uint64_t kIrisMetal4GraphTextureByteLimit =
+    2ULL * 1024ULL * 1024ULL * 1024ULL;
+static constexpr uint64_t kIrisMetal4GraphTextureSingleByteLimit =
+    512ULL * 1024ULL * 1024ULL;
+
+struct IrisMetal4GraphTextureKey {
+  uint64_t contextGeneration = 0;
+  uint32_t glName = 0;
+  uint64_t resourceGeneration = 0;
+
+  bool operator==(const IrisMetal4GraphTextureKey &other) const {
+    return contextGeneration == other.contextGeneration &&
+           glName == other.glName &&
+           resourceGeneration == other.resourceGeneration;
+  }
+};
+
+struct IrisMetal4GraphTextureKeyHash {
+  size_t operator()(const IrisMetal4GraphTextureKey &key) const {
+    uint64_t hash = key.contextGeneration ^
+        (key.resourceGeneration + 0x9e3779b97f4a7c15ULL +
+         (key.contextGeneration << 6) + (key.contextGeneration >> 2));
+    hash ^= (uint64_t)key.glName + 0x9e3779b97f4a7c15ULL +
+            (hash << 6) + (hash >> 2);
+    return (size_t)hash;
+  }
+};
+
+struct IrisMetal4GraphTexture {
+  uint64_t token = 0;
+  MTLPixelFormat pixelFormat = MTLPixelFormatInvalid;
+  uint32_t sampleCount = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t depthOrLayers = 0;
+  uint32_t mipLevels = 0;
+  uint32_t usage = 0;
+  uint64_t allocatedBytes = 0;
+  id<MTLTexture> texture = nil;
+};
+
+static std::unordered_map<IrisMetal4GraphTextureKey,
+    IrisMetal4GraphTexture, IrisMetal4GraphTextureKeyHash>
+    g_irisMetal4GraphTextures;
+static uint64_t g_irisMetal4GraphTextureBytes = 0;
+static std::mutex g_irisMetal4GraphTextureMutex;
+static std::atomic<uint64_t> g_irisMetal4GraphTextureSequence{1};
+
+static void reset_iris_metal4_graph_resources() {
+  reset_iris_metal4_graph_presentations();
+  g_irisMetal4GraphPerformanceSampling.store(false,
+                                              std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> performanceLock(
+        g_irisMetal4GraphPerformanceMutex);
+    g_irisMetal4GraphPerformanceSamples.clear();
+    g_irisMetal4GraphPerformanceDropped = 0;
+  }
+  std::lock_guard<std::mutex> lock(g_irisMetal4GraphTextureMutex);
+  for (auto &entry : g_irisMetal4GraphTextures) {
+    if (entry.second.texture)
+      [entry.second.texture release];
+  }
+  g_irisMetal4GraphTextures.clear();
+  g_irisMetal4GraphTextureBytes = 0;
+}
+
+struct IrisMetal4PipelineEntry {
+  id<MTLRenderPipelineState> render = nil;
+  id<MTLComputePipelineState> compute = nil;
+  id<MTLFunction> vertexFunction = nil;
+  id<MTLFunction> fragmentFunction = nil;
+  id<MTLFunction> computeFunction = nil;
+  id<MTLDepthStencilState> depthStencil = nil;
+  std::vector<MTLPixelFormat> colorFormats;
+  MTLPixelFormat depthFormat = MTLPixelFormatInvalid;
+  MTLPixelFormat stencilFormat = MTLPixelFormatInvalid;
+  NSUInteger rasterSampleCount = 1;
+  MTLCullMode cullMode = MTLCullModeNone;
+  MTLWinding frontFacingWinding = MTLWindingCounterClockwise;
+  MTLTriangleFillMode triangleFillMode = MTLTriangleFillModeFill;
+  MTLDepthClipMode depthClipMode = MTLDepthClipModeClip;
+  NSUInteger sampleMask = ~(NSUInteger)0;
+  float depthBias = 0.0f;
+  float slopeScale = 0.0f;
+  float depthBiasClamp = 0.0f;
+  uint32_t polygonOffsetMask = 0;
+  uint32_t frontStencilReference = 0;
+  uint32_t backStencilReference = 0;
+  uint32_t topology = 8;
+  uint32_t restartMode = 0;
+  uint32_t patchControlPoints = 0;
+};
+static std::unordered_map<std::string, IrisMetal4PipelineEntry>
+    g_irisMetal4Pipelines;
+static std::unordered_map<std::string, id<MTLLibrary>>
+    g_irisMetal4Libraries;
+static std::atomic<uint64_t> g_irisMetal4ArgumentEncoderGeneration{1};
+// Retain the exact descriptors used to populate the Metal 4 serializer.  A
+// successfully written archive is not considered complete until every one of
+// these descriptors can be reconstructed from the read-only archive API.
+// This also gives us a bounded way to repair a driver archive that accepted a
+// flush but omitted an individual pipeline binary.
+static NSMutableArray *g_irisMetal4RenderArchiveDescriptors = nil;
+static NSMutableArray *g_irisMetal4ComputeArchiveDescriptors = nil;
+
+static NSString *iris_metal4_archive_integrity_path(NSString *path) {
+  return [path stringByAppendingString:@".integrity"];
+}
+
+static NSString *iris_metal4_archive_segment_path(NSString *basePath,
+                                                   NSUInteger index) {
+  if (!basePath || index == 0 || index > kIrisMetal4ArchiveSegmentLimit)
+    return nil;
+  return [basePath stringByAppendingFormat:@".segment-%02lu",
+      (unsigned long)index];
+}
+
+static bool iris_metal4_archive_signature(NSString *path,
+                                          NSString **signature) {
+  if (!path || !signature)
+    return false;
+  NSError *attributeError = nil;
+  NSDictionary *attributes = [[NSFileManager defaultManager]
+      attributesOfItemAtPath:path error:&attributeError];
+  unsigned long long length = attributes.fileSize;
+  if (attributeError || length < 64 || length > 1024ULL * 1024ULL * 1024ULL)
+    return false;
+  NSError *readError = nil;
+  NSData *data = [NSData dataWithContentsOfFile:path
+                                       options:NSDataReadingMappedIfSafe
+                                         error:&readError];
+  if (!data || readError || data.length != length)
+    return false;
+  const uint8_t *bytes = (const uint8_t *)data.bytes;
+  if (!bytes || bytes[0] != 0xcb || bytes[1] != 0xfe ||
+      bytes[2] != 0xba || bytes[3] != 0xbe)
+    return false;
+  uint64_t hash = 1469598103934665603ULL;
+  for (NSUInteger index = 0; index < data.length; index++) {
+    hash ^= bytes[index];
+    hash *= 1099511628211ULL;
+  }
+  *signature = [NSString stringWithFormat:@"v1:%llu:%016llx\n", length,
+      (unsigned long long)hash];
+  return true;
+}
+
+static bool iris_metal4_archive_integrity_matches(NSString *path) {
+  NSString *actual = nil;
+  if (!iris_metal4_archive_signature(path, &actual))
+    return false;
+  NSError *error = nil;
+  NSString *expected = [NSString
+      stringWithContentsOfFile:iris_metal4_archive_integrity_path(path)
+                      encoding:NSASCIIStringEncoding error:&error];
+  return expected && !error && [expected isEqualToString:actual];
+}
+
+static bool write_iris_metal4_archive_integrity(NSString *path) {
+  NSString *signature = nil;
+  if (!iris_metal4_archive_signature(path, &signature))
+    return false;
+  NSError *error = nil;
+  BOOL written = [signature
+      writeToFile:iris_metal4_archive_integrity_path(path)
+        atomically:YES encoding:NSASCIIStringEncoding error:&error];
+  if (!written)
+    pipeline_archive_warning("Metal 4 archive integrity write failed", error);
+  return written;
+}
+
+static void reset_iris_metal4_pipeline_cache_locked() {
+  g_irisMetal4ArgumentEncoderGeneration.fetch_add(
+      1, std::memory_order_acq_rel);
+  for (auto &entry : g_irisMetal4Pipelines) {
+    if (entry.second.render)
+      [entry.second.render release];
+    if (entry.second.compute)
+      [entry.second.compute release];
+    if (entry.second.vertexFunction)
+      [entry.second.vertexFunction release];
+    if (entry.second.fragmentFunction)
+      [entry.second.fragmentFunction release];
+    if (entry.second.computeFunction)
+      [entry.second.computeFunction release];
+    if (entry.second.depthStencil)
+      [entry.second.depthStencil release];
+  }
+  g_irisMetal4Pipelines.clear();
+  for (auto &library : g_irisMetal4Libraries) {
+    if (library.second)
+      [library.second release];
+  }
+  g_irisMetal4Libraries.clear();
+  if (g_irisMetal4RenderArchiveDescriptors) {
+    [g_irisMetal4RenderArchiveDescriptors release];
+    g_irisMetal4RenderArchiveDescriptors = nil;
+  }
+  if (g_irisMetal4ComputeArchiveDescriptors) {
+    [g_irisMetal4ComputeArchiveDescriptors release];
+    g_irisMetal4ComputeArchiveDescriptors = nil;
+  }
+  if (g_irisMetal4LookupArchives) {
+    [g_irisMetal4LookupArchives release];
+    g_irisMetal4LookupArchives = nil;
+  }
+  if (g_irisMetal4Compiler) {
+    [g_irisMetal4Compiler release];
+    g_irisMetal4Compiler = nil;
+  }
+  if (g_irisMetal4PipelineSerializer) {
+    [g_irisMetal4PipelineSerializer release];
+    g_irisMetal4PipelineSerializer = nil;
+  }
+  if (g_irisMetal4ArchivePath) {
+    [g_irisMetal4ArchivePath release];
+    g_irisMetal4ArchivePath = nil;
+  }
+  g_irisMetal4PipelineCacheDirty = false;
+  g_irisMetal4ArchiveLoaded = false;
+  g_irisMetal4PipelineAttemptCount.store(0, std::memory_order_relaxed);
+  g_irisMetal4PipelineCompileCount.store(0, std::memory_order_relaxed);
+  g_irisMetal4PipelineCacheHitCount.store(0, std::memory_order_relaxed);
+  g_irisMetal4PipelineFailureCount.store(0, std::memory_order_relaxed);
+  g_irisMetal4PipelineStaleRecoveryCount.store(0,
+                                               std::memory_order_relaxed);
+  g_irisMetal4PipelineDrawAttemptCount.store(0,
+                                              std::memory_order_relaxed);
+}
+
+static bool quarantine_stale_iris_metal4_archive_locked(NSString *path) {
+  if (!path || ![[NSFileManager defaultManager] fileExistsAtPath:path])
+    return true;
+  NSString *rejected = [path stringByAppendingString:@".rejected"];
+  [[NSFileManager defaultManager] removeItemAtPath:rejected error:nil];
+  NSError *moveError = nil;
+  BOOL moved = [[NSFileManager defaultManager] moveItemAtPath:path
+                                                       toPath:rejected
+                                                        error:&moveError];
+  if (!moved) {
+    pipeline_archive_warning("Metal 4 stale archive quarantine failed",
+                             moveError);
+    return false;
+  }
+  NSString *integrity = iris_metal4_archive_integrity_path(path);
+  if ([[NSFileManager defaultManager] fileExistsAtPath:integrity]) {
+    NSString *rejectedIntegrity =
+        iris_metal4_archive_integrity_path(rejected);
+    [[NSFileManager defaultManager] removeItemAtPath:rejectedIntegrity
+                                               error:nil];
+    [[NSFileManager defaultManager] moveItemAtPath:integrity
+                                            toPath:rejectedIntegrity
+                                             error:nil];
+  }
+  g_irisMetal4PipelineStaleRecoveryCount.fetch_add(
+      1, std::memory_order_relaxed);
+  return true;
+}
+
+// Must be called while g_irisMetal4PipelineCacheMutex is held.
+static int prepare_iris_metal4_pipeline_cache_for_translated_msl_locked(
+    NSString *archivePath) {
   if (!g_device ||
       !g_metal4RuntimeVerified.load(std::memory_order_acquire))
-    return false;
+    return 0;
   if (@available(macOS 26.0, *)) {
-    std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
-    if (g_irisMetal4Compiler && g_irisMetal4PipelineSerializer)
-      return true;
+    if (!archivePath || ![archivePath isAbsolutePath])
+      return -1;
+    if (g_irisMetal4Compiler && g_irisMetal4PipelineSerializer &&
+        [g_irisMetal4ArchivePath isEqualToString:archivePath])
+      return g_irisMetal4ArchiveLoaded ? 2 : 1;
+
+    reset_iris_metal4_pipeline_cache_locked();
 
     if (![g_device
             respondsToSelector:
                 @selector(newPipelineDataSetSerializerWithDescriptor:)] ||
         ![g_device respondsToSelector:@selector(newCompilerWithDescriptor:
                                                        error:)]) {
-      return false;
+      return 0;
     }
 
     MTL4PipelineDataSetSerializerDescriptor *serializerDescriptor =
@@ -1407,7 +2227,7 @@ prepare_iris_metal4_pipeline_cache_for_translated_msl() {
             newPipelineDataSetSerializerWithDescriptor:serializerDescriptor];
     [serializerDescriptor release];
     if (!serializer)
-      return false;
+      return -1;
 
     MTL4CompilerDescriptor *compilerDescriptor =
         [[MTL4CompilerDescriptor alloc] init];
@@ -1424,52 +2244,109 @@ prepare_iris_metal4_pipeline_cache_for_translated_msl() {
                                "failed",
                                compilerError);
       [serializer release];
-      return false;
+      return -1;
     }
 
-    NSArray *cacheDirectories = NSSearchPathForDirectoriesInDomains(
-        NSCachesDirectory, NSUserDomainMask, YES);
-    NSString *cacheDirectory =
-        cacheDirectories.count > 0 ? cacheDirectories[0]
-                                   : NSTemporaryDirectory();
-    g_irisMetal4ArchivePath = [[cacheDirectory
-        stringByAppendingPathComponent:
-            @"metalrender_iris_pipeline_cache.mtl4archive"] copy];
-    if ([[NSFileManager defaultManager]
-            fileExistsAtPath:g_irisMetal4ArchivePath]) {
-      NSError *archiveError = nil;
-      id<MTL4Archive> lookupArchive =
-          [g_device
-              newArchiveWithURL:
-                  [NSURL fileURLWithPath:g_irisMetal4ArchivePath]
-                           error:&archiveError];
-      if (lookupArchive) {
-        g_irisMetal4LookupArchive = lookupArchive;
+    g_irisMetal4ArchivePath = [archivePath copy];
+    bool staleRecovered = false;
+    bool fatalArchiveFailure = false;
+    NSMutableArray *lookupArchives = [[NSMutableArray alloc]
+        initWithCapacity:kIrisMetal4ArchiveSegmentLimit + 1];
+    NSMutableArray *archivePaths = [NSMutableArray arrayWithObject:
+        g_irisMetal4ArchivePath];
+    for (NSUInteger index = 1;
+         index <= kIrisMetal4ArchiveSegmentLimit; index++) {
+      [archivePaths addObject:iris_metal4_archive_segment_path(
+          g_irisMetal4ArchivePath, index)];
+    }
+    for (NSString *candidatePath in archivePaths) {
+      if (![[NSFileManager defaultManager]
+              fileExistsAtPath:candidatePath]) {
+        continue;
+      }
+      if (!iris_metal4_archive_integrity_matches(candidatePath)) {
+        pipeline_archive_warning(
+            "Metal 4 translated-pipeline archive failed integrity preflight; "
+            "quarantining without entering the driver", "integrity mismatch");
+        bool recovered = quarantine_stale_iris_metal4_archive_locked(
+            candidatePath);
+        staleRecovered |= recovered;
+        fatalArchiveFailure |= !recovered;
       } else {
-        // Preserve the on-disk archive. Future translated pipeline builds can
-        // proceed with an empty lookup set and later atomically replace it.
-        pipeline_archive_warning("Metal 4 translated-pipeline archive load "
-                                 "failed; continuing empty",
-                                 archiveError);
+        NSError *archiveError = nil;
+        id<MTL4Archive> lookupArchive =
+            [g_device
+                newArchiveWithURL:
+                    [NSURL fileURLWithPath:candidatePath]
+                             error:&archiveError];
+        if (lookupArchive) {
+          [lookupArchives addObject:lookupArchive];
+          [lookupArchive release];
+        } else {
+          pipeline_archive_warning("Metal 4 translated-pipeline archive load "
+                                   "failed; quarantining stale cache",
+                                   archiveError);
+          bool recovered = quarantine_stale_iris_metal4_archive_locked(
+              candidatePath);
+          staleRecovered |= recovered;
+          fatalArchiveFailure |= !recovered;
+        }
       }
     }
+    if (fatalArchiveFailure) {
+      pipeline_archive_warning("Metal 4 translated-pipeline archive load "
+                               "preflight/quarantine failed", "fatal");
+      [lookupArchives release];
+      [compiler release];
+      [serializer release];
+      [g_irisMetal4ArchivePath release];
+      g_irisMetal4ArchivePath = nil;
+      return -1;
+    }
+    g_irisMetal4LookupArchives = lookupArchives;
+    g_irisMetal4ArchiveLoaded = lookupArchives.count > 0;
 
     g_irisMetal4PipelineSerializer = serializer;
     g_irisMetal4Compiler = compiler;
-    return true;
+    return staleRecovered ? 3 : (g_irisMetal4ArchiveLoaded ? 2 : 1);
   }
-  return false;
+  return 0;
 }
 
-[[maybe_unused]] static bool
-serialize_iris_metal4_pipeline_cache_after_translated_builds() {
+// Must be called while g_irisMetal4PipelineCacheMutex is held.
+static bool serialize_iris_metal4_pipeline_cache_after_translated_builds_locked() {
   if (@available(macOS 26.0, *)) {
-    std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
     if (!g_irisMetal4PipelineSerializer || !g_irisMetal4ArchivePath)
       return false;
+    if (!g_irisMetal4PipelineCacheDirty) {
+      return g_irisMetal4ArchiveLoaded;
+    }
+
+    NSString *outputPath = nil;
+    if (![[NSFileManager defaultManager]
+            fileExistsAtPath:g_irisMetal4ArchivePath]) {
+      outputPath = g_irisMetal4ArchivePath;
+    } else {
+      for (NSUInteger index = 1;
+           index <= kIrisMetal4ArchiveSegmentLimit; index++) {
+        NSString *candidate = iris_metal4_archive_segment_path(
+            g_irisMetal4ArchivePath, index);
+        if (![[NSFileManager defaultManager]
+                fileExistsAtPath:candidate]) {
+          outputPath = candidate;
+          break;
+        }
+      }
+    }
+    if (!outputPath) {
+      pipeline_archive_warning(
+          "Metal 4 translated-pipeline archive segment limit reached",
+          "cache full");
+      return false;
+    }
 
     NSString *temporaryPath = [NSString
-        stringWithFormat:@"%@.tmp.%@", g_irisMetal4ArchivePath,
+        stringWithFormat:@"%@.tmp.%@", outputPath,
                          [[NSUUID UUID] UUIDString]];
     NSError *serializationError = nil;
     BOOL serialized =
@@ -1488,14 +2365,119 @@ serialize_iris_metal4_pipeline_cache_after_translated_builds() {
 
     int renameResult =
         rename([temporaryPath fileSystemRepresentation],
-               [g_irisMetal4ArchivePath fileSystemRepresentation]);
+               [outputPath fileSystemRepresentation]);
     if (renameResult != 0) {
-      pipeline_archive_warning("Metal 4 translated-pipeline atomic replace "
-                               "failed",
+      pipeline_archive_warning("Metal 4 translated-pipeline atomic segment "
+                               "publish failed",
                                std::strerror(errno));
       [[NSFileManager defaultManager] removeItemAtPath:temporaryPath
                                                 error:nil];
       return false;
+    }
+    NSError *validationError = nil;
+    id<MTL4Archive> replacement = [g_device
+        newArchiveWithURL:[NSURL fileURLWithPath:outputPath]
+                    error:&validationError];
+    if (!replacement) {
+      pipeline_archive_warning("Metal 4 translated-pipeline segment "
+                               "validation failed",
+                               validationError);
+      quarantine_stale_iris_metal4_archive_locked(
+          outputPath);
+      return false;
+    }
+    if (!write_iris_metal4_archive_integrity(outputPath)) {
+      [replacement release];
+      quarantine_stale_iris_metal4_archive_locked(outputPath);
+      return false;
+    }
+    if (!g_irisMetal4LookupArchives) {
+      g_irisMetal4LookupArchives = [[NSMutableArray alloc] init];
+    }
+    [g_irisMetal4LookupArchives addObject:replacement];
+    [replacement release];
+    g_irisMetal4ArchiveLoaded = true;
+    g_irisMetal4PipelineCacheDirty = false;
+
+    // Validate the published archive through the same read-only lookup API
+    // used on the next launch.  Metal 4 archives are opaque, so a successful
+    // serialize call alone cannot prove that every harvested pipeline is
+    // present.  If a descriptor is missing, recreate only that pipeline with
+    // the serializer still attached and publish a bounded repair segment.
+    NSUInteger repaired = 0;
+    auto archiveContains = [&](id descriptor, bool compute) {
+      for (id archive in g_irisMetal4LookupArchives) {
+        NSError *lookupError = nil;
+        id pipeline = compute
+            ? (id)[(id<MTL4Archive>)archive
+                newComputePipelineStateWithDescriptor:
+                    (MTL4ComputePipelineDescriptor *)descriptor
+                                                 error:&lookupError]
+            : (id)[(id<MTL4Archive>)archive
+                newRenderPipelineStateWithDescriptor:
+                    (MTL4RenderPipelineDescriptor *)descriptor
+                                                error:&lookupError];
+        if (pipeline) {
+          [pipeline release];
+          return true;
+        }
+      }
+      return false;
+    };
+    auto captureMissing = [&](id descriptor, bool compute) {
+      MTL4CompilerTaskOptions *taskOptions =
+          [[MTL4CompilerTaskOptions alloc] init];
+      if (g_irisMetal4LookupArchives.count > 0)
+        taskOptions.lookupArchives = g_irisMetal4LookupArchives;
+      NSError *compileError = nil;
+      id pipeline = compute
+          ? (id)[(id<MTL4Compiler>)g_irisMetal4Compiler
+              newComputePipelineStateWithDescriptor:
+                  (MTL4ComputePipelineDescriptor *)descriptor
+                               compilerTaskOptions:taskOptions
+                                             error:&compileError]
+          : (id)[(id<MTL4Compiler>)g_irisMetal4Compiler
+              newRenderPipelineStateWithDescriptor:
+                  (MTL4RenderPipelineDescriptor *)descriptor
+                              compilerTaskOptions:taskOptions
+                                            error:&compileError];
+      [taskOptions release];
+      if (!pipeline) {
+        pipeline_archive_warning(
+            "Metal 4 archive repair pipeline build failed", compileError);
+        return false;
+      }
+      [pipeline release];
+      repaired++;
+      return true;
+    };
+    for (id descriptor in g_irisMetal4RenderArchiveDescriptors) {
+      if (!archiveContains(descriptor, false) &&
+          !captureMissing(descriptor, false)) {
+        return false;
+      }
+    }
+    for (id descriptor in g_irisMetal4ComputeArchiveDescriptors) {
+      if (!archiveContains(descriptor, true) &&
+          !captureMissing(descriptor, true)) {
+        return false;
+      }
+    }
+    if (repaired > 0) {
+      static thread_local NSUInteger repairDepth = 0;
+      if (repairDepth >= 2) {
+        pipeline_archive_warning(
+            "Metal 4 archive remained incomplete after repair", "fatal");
+        return false;
+      }
+      dbg("Metal 4 archive verification captured %lu missing pipeline(s) "
+          "into a repair segment\n", (unsigned long)repaired);
+      g_irisMetal4PipelineCacheDirty = true;
+      repairDepth++;
+      bool repairPublished =
+          serialize_iris_metal4_pipeline_cache_after_translated_builds_locked();
+      repairDepth--;
+      return repairPublished;
     }
     return true;
   }
@@ -2509,7 +3491,14 @@ static void ensure_offscreen() {
     }
   }
   g_hizViewsValid = 0;
-  NSUInteger bytesPerRow = ((outputW * 4) + 15) & ~15;
+  // CGL and Metal share the same IOSurface allocation, so the row stride
+  // must satisfy the strictest device in the system.  Hard-coded 16/64-byte
+  // rounding is insufficient on Apple Silicon configurations where
+  // kIOSurfaceBytesPerRow currently requires 128-byte alignment; an
+  // undersized allocation lets a GPU row write corrupt the following heap
+  // block.
+  size_t bytesPerRow = IOSurfaceAlignProperty(
+      kIOSurfaceBytesPerRow, (size_t)outputW * 4u);
 
   for (int s = 0; s < 3; s++) {
     NSDictionary *surfaceProperties = @{
@@ -2517,7 +3506,7 @@ static void ensure_offscreen() {
       (id)kIOSurfaceHeight : @(outputH),
       (id)kIOSurfaceBytesPerElement : @4,
       (id)kIOSurfaceBytesPerRow : @(bytesPerRow),
-      (id)kIOSurfaceAllocSize : @(bytesPerRow * outputH),
+      (id)kIOSurfaceAllocSize : @(bytesPerRow * (size_t)outputH),
       (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
     };
     g_tbIOSurface[s] =
@@ -2958,6 +3947,7460 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nValidateIrisMslLib
   }
 }
 
+namespace {
+constexpr jint kIrisMetal4PipelineFailed = -1;
+constexpr jint kIrisMetal4PipelineUnsupported = 0;
+constexpr jint kIrisMetal4PipelineCompiled = 1;
+constexpr jint kIrisMetal4PipelineCacheHit = 2;
+constexpr jint kIrisMetal4PipelineDeferred = 3;
+constexpr uint32_t kIrisMetal4DescriptorMagic = 0x4d525036;
+constexpr uint32_t kIrisMetal4DescriptorSchema = 1;
+constexpr jsize kIrisMetal4MaximumDescriptorBytes = 1024 * 1024;
+
+class IrisPipelineByteReader {
+public:
+  IrisPipelineByteReader(const uint8_t *bytes, size_t size)
+      : bytes_(bytes), size_(size) {}
+
+  bool u8(uint8_t &value) {
+    if (!ok_ || offset_ >= size_)
+      return fail();
+    value = bytes_[offset_++];
+    return true;
+  }
+
+  bool boolean(bool &value) {
+    uint8_t encoded = 0;
+    if (!u8(encoded) || encoded > 1)
+      return fail();
+    value = encoded != 0;
+    return true;
+  }
+
+  bool u32(uint32_t &value) {
+    if (!ok_ || size_ - offset_ < 4)
+      return fail();
+    value = ((uint32_t)bytes_[offset_] << 24) |
+            ((uint32_t)bytes_[offset_ + 1] << 16) |
+            ((uint32_t)bytes_[offset_ + 2] << 8) |
+            (uint32_t)bytes_[offset_ + 3];
+    offset_ += 4;
+    return true;
+  }
+
+  bool u64(uint64_t &value) {
+    uint32_t high = 0;
+    uint32_t low = 0;
+    if (!u32(high) || !u32(low))
+      return false;
+    value = ((uint64_t)high << 32) | low;
+    return true;
+  }
+
+  bool bytes(size_t length, std::vector<uint8_t> &value) {
+    if (!ok_ || length > size_ - offset_)
+      return fail();
+    try {
+      value.assign(bytes_ + offset_, bytes_ + offset_ + length);
+    } catch (...) {
+      return fail();
+    }
+    offset_ += length;
+    return true;
+  }
+
+  bool bytesView(size_t length, const uint8_t *&value) {
+    if (!ok_ || length > size_ - offset_)
+      return fail();
+    value = bytes_ + offset_;
+    offset_ += length;
+    return true;
+  }
+
+  bool string(std::string &value) {
+    uint32_t length = 0;
+    if (!u32(length) || length == 0 || length > 128 ||
+        length > size_ - offset_)
+      return fail();
+    value.assign((const char *)bytes_ + offset_, (size_t)length);
+    offset_ += length;
+    for (char character : value) {
+      bool safe = (character >= 'a' && character <= 'z') ||
+                  (character >= '0' && character <= '9') ||
+                  character == '.' || character == '_' || character == '-';
+      if (!safe)
+        return fail();
+    }
+    return true;
+  }
+
+  bool done() const { return ok_ && offset_ == size_; }
+  size_t remaining() const { return ok_ ? size_ - offset_ : 0; }
+
+private:
+  bool fail() {
+    ok_ = false;
+    return false;
+  }
+  const uint8_t *bytes_;
+  size_t size_;
+  size_t offset_ = 0;
+  bool ok_ = true;
+};
+
+struct IrisPipelineVertexBuffer {
+  uint32_t index = 0;
+  uint32_t stride = 0;
+  uint32_t stepFunction = 0;
+  uint32_t stepRate = 0;
+};
+struct IrisPipelineVertexAttribute {
+  uint32_t location = 0;
+  uint32_t buffer = 0;
+  uint32_t offset = 0;
+  std::string format;
+};
+struct IrisPipelineBlendEquation {
+  uint32_t operation = 0;
+  uint32_t source = 0;
+  uint32_t destination = 0;
+};
+struct IrisPipelineColorAttachment {
+  uint32_t slot = 0;
+  std::string format;
+  uint32_t writeMask = 0;
+  bool blendEnabled = false;
+  IrisPipelineBlendEquation rgb;
+  IrisPipelineBlendEquation alpha;
+};
+struct IrisPipelineStencilFace {
+  uint32_t compare = 0;
+  uint32_t stencilFail = 0;
+  uint32_t depthFail = 0;
+  uint32_t pass = 0;
+  uint32_t readMask = 0;
+  uint32_t writeMask = 0;
+  uint32_t reference = 0;
+};
+struct IrisPipelineFunctionConstant {
+  uint32_t stage = 0;
+  uint32_t index = 0;
+  uint32_t type = 0;
+  uint64_t bits = 0;
+};
+struct IrisParsedPipelineDescriptor {
+  uint32_t passKind = 0;
+  std::vector<IrisPipelineVertexBuffer> buffers;
+  std::vector<IrisPipelineVertexAttribute> attributes;
+  std::vector<IrisPipelineColorAttachment> colors;
+  bool hasDepthFormat = false;
+  std::string depthFormat;
+  bool hasStencilFormat = false;
+  std::string stencilFormat;
+  uint32_t rasterSampleCount = 1;
+  uint64_t sampleMask = UINT64_MAX;
+  bool sampleCoverageEnabled = false;
+  uint32_t sampleCoverageBits = 0;
+  bool sampleCoverageInvert = false;
+  bool alphaToCoverage = false;
+  bool alphaToOne = false;
+  bool depthTest = false;
+  uint32_t depthCompare = 7;
+  bool depthWrite = false;
+  bool stencilEnabled = false;
+  IrisPipelineStencilFace stencilFront;
+  IrisPipelineStencilFace stencilBack;
+  bool rasterizationEnabled = true;
+  uint32_t cullMode = 0;
+  uint32_t frontFace = 1;
+  uint32_t frontFill = 0;
+  uint32_t backFill = 0;
+  uint32_t depthClip = 0;
+  uint32_t polygonOffsetMask = 0;
+  uint32_t depthBiasBits = 0;
+  uint32_t slopeScaleBits = 0;
+  uint32_t depthBiasClampBits = 0;
+  uint32_t topology = 8;
+  uint32_t restartMode = 0;
+  uint32_t patchControlPoints = 0;
+  std::vector<IrisPipelineFunctionConstant> constants;
+};
+
+static bool read_bounded_count(IrisPipelineByteReader &reader,
+                               uint32_t maximum, uint32_t &count) {
+  return reader.u32(count) && count <= maximum;
+}
+
+static bool read_blend_equation(IrisPipelineByteReader &reader,
+                                IrisPipelineBlendEquation &equation) {
+  return reader.u32(equation.operation) && equation.operation <= 4 &&
+         reader.u32(equation.source) && equation.source <= 18 &&
+         reader.u32(equation.destination) && equation.destination <= 18;
+}
+
+static bool read_stencil_face(IrisPipelineByteReader &reader,
+                              IrisPipelineStencilFace &face) {
+  return reader.u32(face.compare) && face.compare <= 7 &&
+         reader.u32(face.stencilFail) && face.stencilFail <= 7 &&
+         reader.u32(face.depthFail) && face.depthFail <= 7 &&
+         reader.u32(face.pass) && face.pass <= 7 &&
+         reader.u32(face.readMask) && reader.u32(face.writeMask) &&
+         reader.u32(face.reference);
+}
+
+static bool parse_iris_metal4_pipeline_descriptor(
+    const std::vector<jbyte> &bytes, IrisParsedPipelineDescriptor &result) {
+  IrisPipelineByteReader reader((const uint8_t *)bytes.data(), bytes.size());
+  uint32_t magic = 0;
+  uint32_t schema = 0;
+  if (!reader.u32(magic) || magic != kIrisMetal4DescriptorMagic ||
+      !reader.u32(schema) || schema != kIrisMetal4DescriptorSchema ||
+      !reader.u32(result.passKind) || result.passKind > 2)
+    return false;
+
+  uint32_t count = 0;
+  if (!read_bounded_count(reader, 31, count))
+    return false;
+  result.buffers.resize(count);
+  for (auto &buffer : result.buffers) {
+    if (!reader.u32(buffer.index) || buffer.index >= 31 ||
+        !reader.u32(buffer.stride) || buffer.stride == 0 ||
+        buffer.stride > 65536 || !reader.u32(buffer.stepFunction) ||
+        buffer.stepFunction > 2 || !reader.u32(buffer.stepRate) ||
+        (buffer.stepFunction == 0 && buffer.stepRate != 0) ||
+        (buffer.stepFunction == 1 && buffer.stepRate == 0) ||
+        (buffer.stepFunction == 2 && buffer.stepRate != 0))
+      return false;
+  }
+  if (!read_bounded_count(reader, 31, count))
+    return false;
+  result.attributes.resize(count);
+  for (auto &attribute : result.attributes) {
+    if (!reader.u32(attribute.location) || attribute.location >= 31 ||
+        !reader.u32(attribute.buffer) || attribute.buffer >= 31 ||
+        !reader.u32(attribute.offset) ||
+        !reader.string(attribute.format))
+      return false;
+  }
+  if (!read_bounded_count(reader, 8, count))
+    return false;
+  result.colors.resize(count);
+  for (auto &color : result.colors) {
+    if (!reader.u32(color.slot) || color.slot >= 8 ||
+        !reader.string(color.format) || !reader.u32(color.writeMask) ||
+        (color.writeMask & ~0xfu) != 0 ||
+        !reader.boolean(color.blendEnabled) ||
+        !read_blend_equation(reader, color.rgb) ||
+        !read_blend_equation(reader, color.alpha))
+      return false;
+  }
+  if (!reader.boolean(result.hasDepthFormat) ||
+      (result.hasDepthFormat && !reader.string(result.depthFormat)) ||
+      !reader.boolean(result.hasStencilFormat) ||
+      (result.hasStencilFormat && !reader.string(result.stencilFormat)) ||
+      !reader.u32(result.rasterSampleCount) ||
+      result.rasterSampleCount == 0 || result.rasterSampleCount > 64 ||
+      !reader.u64(result.sampleMask) ||
+      !reader.boolean(result.sampleCoverageEnabled) ||
+      !reader.u32(result.sampleCoverageBits) ||
+      !reader.boolean(result.sampleCoverageInvert) ||
+      !reader.boolean(result.alphaToCoverage) ||
+      !reader.boolean(result.alphaToOne) ||
+      !reader.boolean(result.depthTest) ||
+      !reader.u32(result.depthCompare) || result.depthCompare > 7 ||
+      !reader.boolean(result.depthWrite) ||
+      !reader.boolean(result.stencilEnabled) ||
+      !read_stencil_face(reader, result.stencilFront) ||
+      !read_stencil_face(reader, result.stencilBack) ||
+      !reader.boolean(result.rasterizationEnabled) ||
+      !reader.u32(result.cullMode) || result.cullMode > 3 ||
+      !reader.u32(result.frontFace) || result.frontFace > 1 ||
+      !reader.u32(result.frontFill) || result.frontFill > 2 ||
+      !reader.u32(result.backFill) || result.backFill > 2 ||
+      !reader.u32(result.depthClip) || result.depthClip > 1 ||
+      !reader.u32(result.polygonOffsetMask) ||
+      (result.polygonOffsetMask & ~0x7u) != 0 ||
+      !reader.u32(result.depthBiasBits) ||
+      !reader.u32(result.slopeScaleBits) ||
+      !reader.u32(result.depthBiasClampBits) ||
+      !reader.u32(result.topology) || result.topology > 8 ||
+      !reader.u32(result.restartMode) || result.restartMode > 3 ||
+      !reader.u32(result.patchControlPoints))
+    return false;
+
+  if (!read_bounded_count(reader, 256, count))
+    return false;
+  result.constants.resize(count);
+  for (auto &constant : result.constants) {
+    if (!reader.u32(constant.stage) || constant.stage > 5 ||
+        !reader.u32(constant.index) || !reader.u32(constant.type) ||
+        constant.type > 6 || !reader.u64(constant.bits))
+      return false;
+  }
+  if (!reader.done())
+    return false;
+  if (result.passKind == 2) {
+    return result.buffers.empty() && result.attributes.empty() &&
+           result.colors.empty() && !result.hasDepthFormat &&
+           !result.hasStencilFormat && result.topology == 8;
+  }
+  return result.topology != 8;
+}
+
+constexpr uint32_t kIrisShadowReplayMagic = 0x4d525837;
+constexpr uint32_t kIrisShadowReplaySchema = 8;
+constexpr jsize kIrisShadowReplayMaximumPacketBytes = 384 * 1024 * 1024;
+constexpr uint32_t kIrisShadowReplayMaximumExtent = 4096;
+constexpr uint32_t kIrisShadowReplayMaximumBuffers = 2048;
+constexpr uint64_t kIrisShadowReplayMaximumBufferBytes = 128ULL * 1024 * 1024;
+constexpr uint32_t kIrisShadowReplayMaximumTextures = 256;
+constexpr uint64_t kIrisShadowReplayMaximumTextureBytes = 256ULL * 1024 * 1024;
+constexpr uint32_t kIrisShadowReplayMaximumArguments = 8192;
+constexpr uint64_t kIrisShadowReplayMaximumInlineBytes = 1ULL * 1024 * 1024;
+
+struct IrisShadowRect {
+  int32_t x = 0;
+  int32_t y = 0;
+  int32_t width = 0;
+  int32_t height = 0;
+};
+
+struct IrisShadowDraw {
+  uint32_t kind = 0;
+  uint32_t primitiveMode = 0;
+  int32_t firstVertex = 0;
+  uint32_t vertexCount = 0;
+  uint32_t instanceCount = 0;
+  uint32_t baseInstance = 0;
+  uint32_t indexElementBytes = 0;
+  struct Indexed {
+    uint64_t offset = 0;
+    uint32_t count = 0;
+    int32_t baseVertex = 0;
+  };
+  std::vector<Indexed> indexed;
+};
+
+struct IrisShadowTexture {
+  uint32_t glName = 0;
+  std::string format;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t layer = 0;
+  uint32_t mipLevel = 0;
+  uint32_t bytesPerPixel = 0;
+  uint32_t storageKind = 0;
+  uint64_t sharedHandle = 0;
+  std::vector<uint8_t> bytes;
+};
+
+struct IrisShadowBuffer {
+  uint32_t storageKind = 0;
+  uint32_t byteLength = 0;
+  uint64_t sharedHandle = 0;
+  std::vector<uint8_t> bytes;
+};
+
+struct IrisShadowSampler {
+  uint32_t minFilter = 0;
+  uint32_t magFilter = 0;
+  uint32_t wrapS = 0;
+  uint32_t wrapT = 0;
+  uint32_t wrapR = 0;
+  uint32_t compareMode = 0;
+  uint32_t compareFunc = 0;
+  uint32_t baseLevel = 0;
+  uint32_t maxLevel = 0;
+  uint32_t minLodBits = 0;
+  uint32_t maxLodBits = 0;
+  uint32_t lodBiasBits = 0;
+  uint32_t maxAnisotropyBits = 0;
+  bool integerBorderColor = false;
+  uint32_t borderColor[4] = {0, 0, 0, 0};
+};
+
+struct IrisShadowArgument {
+  uint32_t argumentBufferIndex = 0;
+  uint32_t id = 0;
+  uint32_t kind = 0;
+  uint32_t reference = 0;
+  uint32_t auxiliary = 0;
+  std::vector<uint8_t> inlineBytes;
+  IrisShadowSampler sampler;
+};
+
+struct IrisShadowStageArguments {
+  uint32_t stage = 0;
+  std::vector<IrisShadowArgument> arguments;
+};
+
+struct IrisShadowReplayPacket {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  IrisShadowRect viewport;
+  bool scissorEnabled = false;
+  IrisShadowRect scissor;
+  IrisShadowDraw draw;
+  std::vector<IrisShadowBuffer> buffers;
+  std::vector<std::pair<uint32_t, uint32_t>> vertexBuffers;
+  int32_t indexBufferImage = -1;
+  std::vector<IrisShadowTexture> textures;
+  std::vector<IrisShadowStageArguments> stages;
+};
+
+static bool iris_shadow_read_i32(IrisPipelineByteReader &reader,
+                                 int32_t &value) {
+  uint32_t encoded = 0;
+  if (!reader.u32(encoded))
+    return false;
+  value = (int32_t)encoded;
+  return true;
+}
+
+static bool iris_shadow_read_rect(IrisPipelineByteReader &reader,
+                                  IrisShadowRect &rect) {
+  return iris_shadow_read_i32(reader, rect.x) &&
+         iris_shadow_read_i32(reader, rect.y) &&
+         iris_shadow_read_i32(reader, rect.width) &&
+         iris_shadow_read_i32(reader, rect.height);
+}
+
+static bool iris_shadow_add_bounded(uint64_t &total, uint64_t value,
+                                    uint64_t maximum) {
+  if (value > maximum || total > maximum - value)
+    return false;
+  total += value;
+  return true;
+}
+
+static bool iris_shadow_read_sampler(IrisPipelineByteReader &reader,
+                                     IrisShadowSampler &sampler) {
+  if (!reader.u32(sampler.minFilter) || !reader.u32(sampler.magFilter) ||
+      !reader.u32(sampler.wrapS) || !reader.u32(sampler.wrapT) ||
+      !reader.u32(sampler.wrapR) || !reader.u32(sampler.compareMode) ||
+      !reader.u32(sampler.compareFunc) || !reader.u32(sampler.baseLevel) ||
+      !reader.u32(sampler.maxLevel) ||
+      !reader.u32(sampler.minLodBits) ||
+      !reader.u32(sampler.maxLodBits) ||
+      !reader.u32(sampler.lodBiasBits) ||
+      !reader.u32(sampler.maxAnisotropyBits) ||
+      !reader.boolean(sampler.integerBorderColor))
+    return false;
+  for (uint32_t &component : sampler.borderColor) {
+    if (!reader.u32(component))
+      return false;
+  }
+  return true;
+}
+
+static bool parse_iris_shadow_replay_packet_data(
+    const uint8_t *bytes, size_t byteCount,
+    IrisShadowReplayPacket &result, bool allowExternalTextures) {
+  IrisPipelineByteReader reader(bytes, byteCount);
+  uint32_t magic = 0;
+  uint32_t schema = 0;
+  if (!reader.u32(magic) || magic != kIrisShadowReplayMagic ||
+      !reader.u32(schema) || schema != kIrisShadowReplaySchema ||
+      !reader.u32(result.width) || result.width == 0 ||
+      result.width > kIrisShadowReplayMaximumExtent ||
+      !reader.u32(result.height) || result.height == 0 ||
+      result.height > kIrisShadowReplayMaximumExtent ||
+      !iris_shadow_read_rect(reader, result.viewport) ||
+      result.viewport.width <= 0 || result.viewport.height <= 0 ||
+      !reader.boolean(result.scissorEnabled) ||
+      !iris_shadow_read_rect(reader, result.scissor) ||
+      (result.scissorEnabled &&
+       (result.scissor.width <= 0 || result.scissor.height <= 0)))
+    return false;
+
+  if (!reader.u32(result.draw.kind) || result.draw.kind < 1 ||
+      result.draw.kind > 3 || !reader.u32(result.draw.primitiveMode))
+    return false;
+  if (result.draw.kind == 1) {
+    if (!iris_shadow_read_i32(reader, result.draw.firstVertex) ||
+        result.draw.firstVertex < 0 || !reader.u32(result.draw.vertexCount) ||
+        result.draw.vertexCount == 0 ||
+        !reader.u32(result.draw.instanceCount) ||
+        result.draw.instanceCount == 0 ||
+        !reader.u32(result.draw.baseInstance))
+      return false;
+  } else if (result.draw.kind == 2) {
+    IrisShadowDraw::Indexed indexed;
+    if (!reader.u64(indexed.offset) || !reader.u32(indexed.count) ||
+        indexed.count == 0 || !reader.u32(result.draw.indexElementBytes) ||
+        (result.draw.indexElementBytes != 2 &&
+         result.draw.indexElementBytes != 4) ||
+        !iris_shadow_read_i32(reader, indexed.baseVertex) ||
+        !reader.u32(result.draw.instanceCount) ||
+        result.draw.instanceCount == 0 ||
+        !reader.u32(result.draw.baseInstance))
+      return false;
+    result.draw.indexed.push_back(indexed);
+  } else {
+    uint32_t count = 0;
+    if (!reader.u32(result.draw.indexElementBytes) ||
+        (result.draw.indexElementBytes != 2 &&
+         result.draw.indexElementBytes != 4) ||
+        !read_bounded_count(reader, 65536, count) || count == 0)
+      return false;
+    try {
+      result.draw.indexed.resize(count);
+    } catch (...) {
+      return false;
+    }
+    for (auto &indexed : result.draw.indexed) {
+      if (!reader.u64(indexed.offset) || !reader.u32(indexed.count) ||
+          indexed.count == 0 ||
+          !iris_shadow_read_i32(reader, indexed.baseVertex))
+        return false;
+    }
+    result.draw.instanceCount = 1;
+  }
+
+  uint32_t count = 0;
+  uint64_t totalBufferBytes = 0;
+  if (!read_bounded_count(reader, kIrisShadowReplayMaximumBuffers, count))
+    return false;
+  try {
+    result.buffers.resize(count);
+  } catch (...) {
+    return false;
+  }
+  for (auto &buffer : result.buffers) {
+    if (!reader.u32(buffer.storageKind) || buffer.storageKind < 1 ||
+        buffer.storageKind > (allowExternalTextures ? 3u : 2u) ||
+        !reader.u32(buffer.byteLength) ||
+        buffer.byteLength == 0 ||
+        !iris_shadow_add_bounded(totalBufferBytes, buffer.byteLength,
+                                 kIrisShadowReplayMaximumBufferBytes)) {
+      return false;
+    }
+    if (buffer.storageKind == 1) {
+      if (!reader.bytes(buffer.byteLength, buffer.bytes))
+        return false;
+    } else if (!reader.u64(buffer.sharedHandle) ||
+               buffer.sharedHandle == 0) {
+      return false;
+    }
+  }
+
+  if (!read_bounded_count(reader, 31, count))
+    return false;
+  try {
+    result.vertexBuffers.resize(count);
+  } catch (...) {
+    return false;
+  }
+  bool occupiedVertexSlots[31] = {};
+  for (auto &binding : result.vertexBuffers) {
+    if (!reader.u32(binding.first) || binding.first >= 31 ||
+        occupiedVertexSlots[binding.first] || !reader.u32(binding.second) ||
+        binding.second >= result.buffers.size())
+      return false;
+    occupiedVertexSlots[binding.first] = true;
+  }
+  if (!iris_shadow_read_i32(reader, result.indexBufferImage) ||
+      result.indexBufferImage < -1 ||
+      (result.indexBufferImage >= 0 &&
+       (size_t)result.indexBufferImage >= result.buffers.size()) ||
+      ((result.draw.kind == 2 || result.draw.kind == 3) &&
+       result.indexBufferImage < 0))
+    return false;
+
+  uint64_t totalTextureBytes = 0;
+  if (!read_bounded_count(reader, kIrisShadowReplayMaximumTextures, count))
+    return false;
+  try {
+    result.textures.resize(count);
+  } catch (...) {
+    return false;
+  }
+  std::unordered_map<uint32_t, bool> textureNames;
+  for (auto &texture : result.textures) {
+    if (!reader.u32(texture.glName) || texture.glName == 0 ||
+        !textureNames.emplace(texture.glName, true).second ||
+        !reader.string(texture.format) || !reader.u32(texture.width) ||
+        texture.width == 0 || texture.width > 16384 ||
+        !reader.u32(texture.height) || texture.height == 0 ||
+        texture.height > 16384 || !reader.u32(texture.layer) ||
+        !reader.u32(texture.mipLevel) ||
+        !reader.u32(texture.bytesPerPixel) ||
+        texture.bytesPerPixel == 0 || texture.bytesPerPixel > 16 ||
+        !reader.u32(texture.storageKind) || texture.storageKind < 1 ||
+        texture.storageKind > (allowExternalTextures ? 4u : 2u))
+      return false;
+    uint64_t expected = (uint64_t)texture.width * texture.height;
+    if (expected > UINT64_MAX / texture.bytesPerPixel)
+      return false;
+    expected *= texture.bytesPerPixel;
+    if (texture.storageKind == 1) {
+      uint32_t length = 0;
+      if (!reader.u32(length) || expected != length ||
+          !iris_shadow_add_bounded(totalTextureBytes, length,
+                                   kIrisShadowReplayMaximumTextureBytes) ||
+          !reader.bytes(length, texture.bytes)) {
+        return false;
+      }
+    } else if (texture.storageKind == 2) {
+      if (!reader.u64(texture.sharedHandle) ||
+          texture.sharedHandle == 0 || texture.layer != 0 ||
+          texture.mipLevel != 0 ||
+          !iris_shadow_add_bounded(totalTextureBytes, expected,
+                                   kIrisShadowReplayMaximumTextureBytes)) {
+        return false;
+      }
+    } else if (texture.storageKind == 4) {
+      if (!reader.u64(texture.sharedHandle) ||
+          texture.sharedHandle == 0 ||
+          !iris_shadow_add_bounded(totalTextureBytes, expected,
+                                   kIrisShadowReplayMaximumTextureBytes)) {
+        return false;
+      }
+    } else if (!iris_shadow_add_bounded(
+                   totalTextureBytes, expected,
+                   kIrisShadowReplayMaximumTextureBytes)) {
+      return false;
+    }
+  }
+
+  if (!read_bounded_count(reader, 2, count))
+    return false;
+  try {
+    result.stages.resize(count);
+  } catch (...) {
+    return false;
+  }
+  bool occupiedStages[6] = {};
+  uint32_t totalArguments = 0;
+  uint64_t totalInlineBytes = 0;
+  for (auto &stage : result.stages) {
+    uint32_t argumentCount = 0;
+    if (!reader.u32(stage.stage) ||
+        (stage.stage != 0 && stage.stage != 4) ||
+        occupiedStages[stage.stage] ||
+        !read_bounded_count(reader, kIrisShadowReplayMaximumArguments,
+                            argumentCount) ||
+        totalArguments > kIrisShadowReplayMaximumArguments - argumentCount)
+      return false;
+    occupiedStages[stage.stage] = true;
+    totalArguments += argumentCount;
+    try {
+      stage.arguments.resize(argumentCount);
+    } catch (...) {
+      return false;
+    }
+    std::unordered_map<uint64_t, bool> occupiedIds;
+    for (auto &argument : stage.arguments) {
+      if (!reader.u32(argument.argumentBufferIndex) ||
+          argument.argumentBufferIndex >= 31 || !reader.u32(argument.id) ||
+          argument.id > 65535 ||
+          !occupiedIds.emplace(
+              ((uint64_t)argument.argumentBufferIndex << 32) | argument.id,
+              true).second ||
+          !reader.u32(argument.kind) || argument.kind < 1 ||
+          argument.kind > 7)
+        return false;
+      if (argument.kind == 1) {
+        uint32_t length = 0;
+        if (!reader.u32(length) || length == 0 ||
+            !iris_shadow_add_bounded(totalInlineBytes, length,
+                                     kIrisShadowReplayMaximumInlineBytes) ||
+            !reader.bytes(length, argument.inlineBytes))
+          return false;
+      } else if (argument.kind == 2 || argument.kind == 3) {
+        if (!reader.u32(argument.reference) ||
+            (argument.kind == 2 &&
+             argument.reference >= result.buffers.size()) ||
+            (argument.kind == 3 &&
+             textureNames.find(argument.reference) == textureNames.end()))
+          return false;
+      } else if (argument.kind == 7) {
+        if (!reader.u32(argument.reference) ||
+            argument.reference >= result.buffers.size() ||
+            !reader.u32(argument.auxiliary) || argument.auxiliary == 0)
+          return false;
+      } else if (argument.kind == 5 &&
+                 !iris_shadow_read_sampler(reader, argument.sampler)) {
+        return false;
+      }
+    }
+  }
+  return reader.done();
+}
+
+static bool parse_iris_shadow_replay_packet(
+    const std::vector<jbyte> &bytes, IrisShadowReplayPacket &result) {
+  return parse_iris_shadow_replay_packet_data(
+      (const uint8_t *)bytes.data(), bytes.size(), result, false);
+}
+
+static bool parse_iris_shadow_replay_packet(
+    const std::vector<uint8_t> &bytes, IrisShadowReplayPacket &result) {
+  return parse_iris_shadow_replay_packet_data(bytes.data(), bytes.size(),
+                                               result, false);
+}
+
+static bool parse_iris_shadow_graph_replay_packet(
+    const std::vector<uint8_t> &bytes, IrisShadowReplayPacket &result) {
+  return parse_iris_shadow_replay_packet_data(bytes.data(), bytes.size(),
+                                               result, true);
+}
+
+static bool parse_iris_shadow_graph_replay_packet(
+    const uint8_t *bytes, size_t byteCount,
+    IrisShadowReplayPacket &result) {
+  return parse_iris_shadow_replay_packet_data(bytes, byteCount, result,
+                                               true);
+}
+
+static MTLPixelFormat iris_metal_pixel_format(const std::string &name) {
+#define IRIS_PIXEL(n, value)                                                   \
+  if (name == n)                                                              \
+    return value
+  IRIS_PIXEL("r8-unorm", MTLPixelFormatR8Unorm);
+  IRIS_PIXEL("r8-snorm", MTLPixelFormatR8Snorm);
+  IRIS_PIXEL("rg8-unorm", MTLPixelFormatRG8Unorm);
+  IRIS_PIXEL("rg8-snorm", MTLPixelFormatRG8Snorm);
+  IRIS_PIXEL("rgb8-unorm", MTLPixelFormatRGBA8Unorm);
+  IRIS_PIXEL("rgb8-snorm", MTLPixelFormatRGBA8Snorm);
+  IRIS_PIXEL("rgba8-unorm", MTLPixelFormatRGBA8Unorm);
+  IRIS_PIXEL("rgba8-snorm", MTLPixelFormatRGBA8Snorm);
+  IRIS_PIXEL("r16-unorm", MTLPixelFormatR16Unorm);
+  IRIS_PIXEL("r16-snorm", MTLPixelFormatR16Snorm);
+  IRIS_PIXEL("rg16-unorm", MTLPixelFormatRG16Unorm);
+  IRIS_PIXEL("rg16-snorm", MTLPixelFormatRG16Snorm);
+  IRIS_PIXEL("rgb16-unorm", MTLPixelFormatRGBA16Unorm);
+  IRIS_PIXEL("rgb16-snorm", MTLPixelFormatRGBA16Snorm);
+  IRIS_PIXEL("rgba16-unorm", MTLPixelFormatRGBA16Unorm);
+  IRIS_PIXEL("rgba16-snorm", MTLPixelFormatRGBA16Snorm);
+  IRIS_PIXEL("r16-float", MTLPixelFormatR16Float);
+  IRIS_PIXEL("rg16-float", MTLPixelFormatRG16Float);
+  IRIS_PIXEL("rgb16-float", MTLPixelFormatRGBA16Float);
+  IRIS_PIXEL("rgba16-float", MTLPixelFormatRGBA16Float);
+  IRIS_PIXEL("r32-float", MTLPixelFormatR32Float);
+  IRIS_PIXEL("rg32-float", MTLPixelFormatRG32Float);
+  IRIS_PIXEL("rgb32-float", MTLPixelFormatRGBA32Float);
+  IRIS_PIXEL("rgba32-float", MTLPixelFormatRGBA32Float);
+  IRIS_PIXEL("r8-sint", MTLPixelFormatR8Sint);
+  IRIS_PIXEL("r8-uint", MTLPixelFormatR8Uint);
+  IRIS_PIXEL("rg8-sint", MTLPixelFormatRG8Sint);
+  IRIS_PIXEL("rg8-uint", MTLPixelFormatRG8Uint);
+  IRIS_PIXEL("rgb8-sint", MTLPixelFormatRGBA8Sint);
+  IRIS_PIXEL("rgb8-uint", MTLPixelFormatRGBA8Uint);
+  IRIS_PIXEL("rgba8-sint", MTLPixelFormatRGBA8Sint);
+  IRIS_PIXEL("rgba8-uint", MTLPixelFormatRGBA8Uint);
+  IRIS_PIXEL("r16-sint", MTLPixelFormatR16Sint);
+  IRIS_PIXEL("r16-uint", MTLPixelFormatR16Uint);
+  IRIS_PIXEL("rg16-sint", MTLPixelFormatRG16Sint);
+  IRIS_PIXEL("rg16-uint", MTLPixelFormatRG16Uint);
+  IRIS_PIXEL("rgb16-sint", MTLPixelFormatRGBA16Sint);
+  IRIS_PIXEL("rgb16-uint", MTLPixelFormatRGBA16Uint);
+  IRIS_PIXEL("rgba16-sint", MTLPixelFormatRGBA16Sint);
+  IRIS_PIXEL("rgba16-uint", MTLPixelFormatRGBA16Uint);
+  IRIS_PIXEL("r32-sint", MTLPixelFormatR32Sint);
+  IRIS_PIXEL("r32-uint", MTLPixelFormatR32Uint);
+  IRIS_PIXEL("rg32-sint", MTLPixelFormatRG32Sint);
+  IRIS_PIXEL("rg32-uint", MTLPixelFormatRG32Uint);
+  IRIS_PIXEL("rgb32-sint", MTLPixelFormatRGBA32Sint);
+  IRIS_PIXEL("rgb32-uint", MTLPixelFormatRGBA32Uint);
+  IRIS_PIXEL("rgba32-sint", MTLPixelFormatRGBA32Sint);
+  IRIS_PIXEL("rgba32-uint", MTLPixelFormatRGBA32Uint);
+  IRIS_PIXEL("rgb10a2-unorm", MTLPixelFormatRGB10A2Unorm);
+  IRIS_PIXEL("rgb10a2-uint", MTLPixelFormatRGB10A2Uint);
+  IRIS_PIXEL("rg11b10-float", MTLPixelFormatRG11B10Float);
+  IRIS_PIXEL("rgb9e5-float", MTLPixelFormatRGB9E5Float);
+  IRIS_PIXEL("d16-unorm", MTLPixelFormatDepth16Unorm);
+  IRIS_PIXEL("d24-unorm-s8-uint", MTLPixelFormatDepth24Unorm_Stencil8);
+  IRIS_PIXEL("d32-float", MTLPixelFormatDepth32Float);
+  IRIS_PIXEL("d32-float-s8-uint", MTLPixelFormatDepth32Float_Stencil8);
+  IRIS_PIXEL("s8-uint", MTLPixelFormatStencil8);
+#undef IRIS_PIXEL
+  return MTLPixelFormatInvalid;
+}
+
+static bool iris_metal4_graph_descriptor_matches(
+    const IrisMetal4GraphTexture &entry, MTLPixelFormat format,
+    uint32_t sampleCount, uint32_t width, uint32_t height,
+    uint32_t depthOrLayers, uint32_t mipLevels, uint32_t usage) {
+  return entry.texture && entry.pixelFormat == format &&
+         entry.sampleCount == sampleCount && entry.width == width &&
+         entry.height == height && entry.depthOrLayers == depthOrLayers &&
+         entry.mipLevels == mipLevels && entry.usage == usage;
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nEnsureIrisMetal4GraphTexture(
+    JNIEnv *env, jclass, jlong contextGeneration, jint glTexture,
+    jlong resourceGeneration, jstring formatValue, jint sampleCount,
+    jint width, jint height, jint depthOrLayers, jint mipLevels,
+    jint usage) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  @autoreleasepool {
+    constexpr uint32_t kShaderRead = 1u;
+    constexpr uint32_t kShaderWrite = 1u << 1;
+    constexpr uint32_t kRenderTarget = 1u << 2;
+    constexpr uint32_t kTransferDestination = 1u << 3;
+    constexpr uint32_t kKnownUsage = kShaderRead | kShaderWrite |
+                                     kRenderTarget | kTransferDestination;
+    if (!g_device || !g_metal4CommandQueue ||
+        !g_metal4RuntimeVerified.load(std::memory_order_acquire) ||
+        contextGeneration <= 0 || glTexture <= 0 ||
+        resourceGeneration <= 0 || !formatValue ||
+        sampleCount <= 0 || sampleCount > 16 || width <= 0 || height <= 0 ||
+        width > 16384 || height > 16384 || depthOrLayers != 1 ||
+        mipLevels <= 0 || mipLevels > 15 || usage <= 0 ||
+        ((uint32_t)usage & ~kKnownUsage) != 0 ||
+        ((uint32_t)usage & (kShaderWrite | kRenderTarget |
+                            kTransferDestination)) == 0) {
+      return 0;
+    }
+    uint32_t maximumMipLevels = 1;
+    uint32_t maximumDimension = (uint32_t)std::max(width, height);
+    while (maximumDimension > 1) {
+      maximumDimension >>= 1;
+      maximumMipLevels++;
+    }
+    if ((uint32_t)mipLevels > maximumMipLevels ||
+        (sampleCount > 1 && mipLevels != 1) ||
+        ![g_device supportsTextureSampleCount:(NSUInteger)sampleCount]) {
+      return 0;
+    }
+
+    jsize formatLength = env->GetStringUTFLength(formatValue);
+    if (formatLength <= 0 || formatLength > 128)
+      return 0;
+    const char *formatUtf8 = env->GetStringUTFChars(formatValue, nullptr);
+    if (!formatUtf8)
+      return 0;
+    std::string formatName(formatUtf8, (size_t)formatLength);
+    env->ReleaseStringUTFChars(formatValue, formatUtf8);
+    MTLPixelFormat pixelFormat = iris_metal_pixel_format(formatName);
+    if (pixelFormat == MTLPixelFormatInvalid)
+      return 0;
+
+    IrisMetal4GraphTextureKey key{
+        (uint64_t)contextGeneration, (uint32_t)glTexture,
+        (uint64_t)resourceGeneration};
+    std::lock_guard<std::mutex> lock(g_irisMetal4GraphTextureMutex);
+    auto existing = g_irisMetal4GraphTextures.find(key);
+    if (existing != g_irisMetal4GraphTextures.end() &&
+        iris_metal4_graph_descriptor_matches(existing->second, pixelFormat,
+            (uint32_t)sampleCount, (uint32_t)width, (uint32_t)height,
+            (uint32_t)depthOrLayers, (uint32_t)mipLevels,
+            (uint32_t)usage)) {
+      return (jlong)existing->second.token;
+    }
+    if (existing == g_irisMetal4GraphTextures.end() &&
+        g_irisMetal4GraphTextures.size() >=
+            kIrisMetal4GraphTextureLimit) {
+      return 0;
+    }
+
+    @try {
+      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+          texture2DDescriptorWithPixelFormat:pixelFormat
+                                       width:(NSUInteger)width
+                                      height:(NSUInteger)height
+                                   mipmapped:mipLevels > 1];
+      descriptor.textureType = sampleCount > 1
+          ? MTLTextureType2DMultisample : MTLTextureType2D;
+      descriptor.sampleCount = (NSUInteger)sampleCount;
+      descriptor.mipmapLevelCount = (NSUInteger)mipLevels;
+      descriptor.storageMode = MTLStorageModePrivate;
+      descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
+      MTLTextureUsage metalUsage = MTLTextureUsageUnknown;
+      if (((uint32_t)usage & kShaderRead) != 0)
+        metalUsage |= MTLTextureUsageShaderRead;
+      if (((uint32_t)usage & kShaderWrite) != 0)
+        metalUsage |= MTLTextureUsageShaderWrite;
+      if (((uint32_t)usage & kRenderTarget) != 0)
+        metalUsage |= MTLTextureUsageRenderTarget;
+      descriptor.usage = metalUsage;
+
+      MTLSizeAndAlign sizeAndAlign =
+          [g_device heapTextureSizeAndAlignWithDescriptor:descriptor];
+      uint64_t allocationBytes = (uint64_t)sizeAndAlign.size;
+      uint64_t replacedBytes = existing == g_irisMetal4GraphTextures.end()
+          ? 0 : existing->second.allocatedBytes;
+      uint64_t retainedBytes =
+          g_irisMetal4GraphTextureBytes >= replacedBytes
+              ? g_irisMetal4GraphTextureBytes - replacedBytes
+              : 0;
+      if (allocationBytes == 0 ||
+          allocationBytes > kIrisMetal4GraphTextureSingleByteLimit ||
+          retainedBytes > kIrisMetal4GraphTextureByteLimit -
+              allocationBytes) {
+        return 0;
+      }
+      id<MTLTexture> texture =
+          [g_device newTextureWithDescriptor:descriptor];
+      if (!texture)
+        return 0;
+
+      IrisMetal4GraphTexture replacement;
+      replacement.token = g_irisMetal4GraphTextureSequence.fetch_add(
+          1, std::memory_order_relaxed);
+      if (replacement.token == 0) {
+        replacement.token = g_irisMetal4GraphTextureSequence.fetch_add(
+            1, std::memory_order_relaxed);
+      }
+      replacement.pixelFormat = pixelFormat;
+      replacement.sampleCount = (uint32_t)sampleCount;
+      replacement.width = (uint32_t)width;
+      replacement.height = (uint32_t)height;
+      replacement.depthOrLayers = (uint32_t)depthOrLayers;
+      replacement.mipLevels = (uint32_t)mipLevels;
+      replacement.usage = (uint32_t)usage;
+      replacement.allocatedBytes = allocationBytes;
+      replacement.texture = texture;
+      if (existing == g_irisMetal4GraphTextures.end()) {
+        g_irisMetal4GraphTextures.emplace(key, replacement);
+      } else {
+        if (existing->second.texture)
+          [existing->second.texture release];
+        existing->second = replacement;
+      }
+      g_irisMetal4GraphTextureBytes = retainedBytes + allocationBytes;
+      return (jlong)replacement.token;
+    } @catch (NSException *exception) {
+      dbg("WARN: Iris graph texture allocation raised %s: %s\n",
+          exception.name.UTF8String ?: "NSException",
+          exception.reason.UTF8String ?: "unknown reason");
+      return 0;
+    }
+  }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4GraphTextureCount(
+    JNIEnv *, jclass) {
+  std::lock_guard<std::mutex> lock(g_irisMetal4GraphTextureMutex);
+  return (jint)g_irisMetal4GraphTextures.size();
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4GraphTextureBytes(
+    JNIEnv *, jclass) {
+  std::lock_guard<std::mutex> lock(g_irisMetal4GraphTextureMutex);
+  return (jlong)g_irisMetal4GraphTextureBytes;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nResetIrisMetal4GraphResources(
+    JNIEnv *, jclass) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  @autoreleasepool {
+    reset_iris_metal4_graph_resources();
+  }
+}
+
+constexpr uint32_t kIrisMetal4GraphFrameMagic = 0x4d474639;
+constexpr uint32_t kIrisMetal4GraphFrameSchema = 4;
+constexpr jsize kIrisMetal4GraphFrameMaximumPacketBytes =
+    384 * 1024 * 1024;
+constexpr jlong kIrisGraphReasonDrawPipelineUnavailable = 8;
+constexpr jlong kIrisGraphReasonDrawPipelineStateMismatch = 9;
+constexpr jlong kIrisGraphReasonDrawColorSlotMismatch = 10;
+constexpr jlong kIrisGraphReasonDrawColorTargetMismatch = 11;
+constexpr jlong kIrisGraphReasonDrawColorCoverageMismatch = 12;
+constexpr jlong kIrisGraphReasonDrawDepthStencilPresenceMismatch = 13;
+constexpr jlong kIrisGraphReasonDrawDepthTargetMismatch = 14;
+constexpr jlong kIrisGraphReasonDrawStencilTargetMismatch = 15;
+constexpr jlong kIrisGraphReasonDrawDepthStencilAliasMismatch = 16;
+constexpr jlong kIrisGraphReasonDrawBufferResidencyMismatch = 17;
+constexpr jlong kIrisGraphReasonDrawTextureOverrideMismatch = 18;
+constexpr jlong kIrisGraphReasonDrawSharedTextureMismatch = 19;
+constexpr jlong kIrisGraphReasonDrawSharedTextureFenceTimeout = 20;
+constexpr jlong kIrisGraphReasonDrawTextureUploadUnsupported = 21;
+constexpr jlong kIrisGraphReasonDrawUnusedTextureOverride = 22;
+constexpr jlong kIrisGraphReasonDrawArgumentBindingUnsupported = 23;
+constexpr jlong kIrisGraphReasonDrawIndexBufferMissing = 24;
+constexpr jlong kIrisGraphReasonDrawIndexRangeInvalid = 25;
+constexpr jlong kIrisGraphReasonDrawTextureSubresourceUnsupported = 26;
+constexpr jlong kIrisGraphReasonDrawTextureFormatUnsupported = 27;
+constexpr jlong kIrisGraphReasonDrawTextureByteBudgetExceeded = 28;
+constexpr jlong kIrisGraphReasonReadbackTextureMissing = 29;
+constexpr jlong kIrisGraphReasonReadbackMultisampleUnsupported = 30;
+constexpr jlong kIrisGraphReasonReadbackFormatUnsupported = 31;
+constexpr jlong kIrisGraphReasonReadbackRowSizeUnsupported = 32;
+constexpr jlong kIrisGraphReasonReadbackByteSizeUnsupported = 33;
+constexpr jlong kIrisGraphReasonClearRegionUnsupported = 34;
+constexpr jlong kIrisGraphReasonClearTextureMissing = 35;
+constexpr jlong kIrisGraphReasonClearColorFormatUnsupported = 36;
+constexpr jlong kIrisGraphReasonClearDepthFormatUnsupported = 37;
+constexpr jlong kIrisGraphReasonClearStencilFormatUnsupported = 38;
+constexpr jlong kIrisGraphReasonCopyTextureMissing = 39;
+constexpr jlong kIrisGraphReasonCopyFormatMismatch = 40;
+constexpr jlong kIrisGraphReasonCopyMultisampleUnsupported = 41;
+constexpr jlong kIrisGraphReasonCopyMipLevelUnsupported = 42;
+constexpr jlong kIrisGraphReasonCopyBoundsUnsupported = 43;
+constexpr jlong kIrisGraphReasonMipmapTextureMissing = 44;
+constexpr jlong kIrisGraphReasonMipmapLevelsUnavailable = 45;
+constexpr jlong kIrisGraphReasonMipmapMultisampleUnsupported = 46;
+constexpr jlong kIrisGraphReasonPresentationTextureMissing = 47;
+constexpr jlong kIrisGraphReasonPresentationMultisampleUnsupported = 48;
+constexpr jlong kIrisGraphReasonPresentationFormatUnsupported = 49;
+constexpr jlong kIrisGraphReasonPresentationSizeUnsupported = 50;
+constexpr jlong kIrisGraphReasonPresentationQueueFull = 51;
+constexpr jlong kIrisGraphReasonFrameInputResidentMissing = 52;
+constexpr jlong kIrisGraphReasonDrawExternalBufferIndexMismatch = 53;
+constexpr jlong kIrisGraphReasonDrawExternalBufferMissing = 54;
+constexpr jlong kIrisGraphReasonDrawExternalBufferLengthMismatch = 55;
+constexpr jlong kIrisGraphReasonDrawExternalTextureIndexMismatch = 56;
+constexpr jlong kIrisGraphReasonDrawExternalTextureMissing = 57;
+constexpr jlong kIrisGraphReasonDrawExternalTextureMetadataMismatch = 58;
+
+struct IrisMetal4GraphFrameResource {
+  uint32_t resourceId = 0;
+  uint64_t token = 0;
+};
+
+struct IrisMetal4GraphFrameInputBuffer {
+  uint32_t storageKind = 0;
+  uint32_t byteLength = 0;
+  uint64_t sharedHandle = 0;
+  std::vector<uint8_t> bytes;
+  const uint8_t *borrowedBytes = nullptr;
+};
+
+struct IrisMetal4GraphFramePreparedInputTexture {
+  uint32_t glName = 0;
+  std::string format;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t layer = 0;
+  uint32_t mipLevel = 0;
+  uint32_t bytesPerPixel = 0;
+  id<MTLTexture> texture = nil;
+};
+
+struct IrisMetal4GraphFrameOperation {
+  uint32_t kind = 0;
+  uint32_t firstResource = 0;
+  uint32_t secondResource = 0;
+  uint32_t aspect = 0;
+  uint32_t valueKind = 0;
+  std::vector<uint64_t> rawValues;
+  bool hasRegion = false;
+  int32_t x = 0;
+  int32_t y = 0;
+  int32_t width = 0;
+  int32_t height = 0;
+  uint32_t sourceLevel = 0;
+  uint32_t destinationLevel = 0;
+  int32_t destinationX = 0;
+  int32_t destinationY = 0;
+  uint32_t barrierBits = 0;
+  std::string pipelineKey;
+  std::vector<uint8_t> replayPacket;
+  const uint8_t *borrowedReplayPacket = nullptr;
+  uint32_t replayPacketLength = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> colorTargets;
+  int32_t depthResource = -1;
+  int32_t stencilResource = -1;
+  std::unordered_map<uint32_t, uint32_t> textureOverrides;
+};
+
+static constexpr NSUInteger kIrisMetal4FrameArenaChunkBytes =
+    2ULL * 1024ULL * 1024ULL;
+static constexpr NSUInteger kIrisMetal4FrameArenaMaximumAllocationBytes =
+    32ULL * 1024ULL * 1024ULL;
+static constexpr size_t kIrisMetal4FrameArenaMaximumChunks = 16;
+static constexpr size_t kIrisMetal4FrameArenaPoolMaximumBuffers = 32;
+static constexpr uint64_t kIrisMetal4FrameArenaPoolMaximumBytes =
+    64ULL * 1024ULL * 1024ULL;
+
+class IrisMetal4FrameArenaBufferPool {
+ public:
+  id<MTLBuffer> acquire(NSUInteger length) {
+    auto found = available_.find(length);
+    if (found != available_.end() && !found->second.empty()) {
+      id<MTLBuffer> buffer = found->second.back();
+      found->second.pop_back();
+      pooledBuffers_--;
+      pooledBytes_ -= (uint64_t)length;
+      return buffer;
+    }
+    return [g_device newBufferWithLength:length
+                                 options:MTLResourceStorageModeShared];
+  }
+
+  void recycle(id<MTLBuffer> buffer) {
+    if (!buffer)
+      return;
+    uint64_t length = (uint64_t)buffer.length;
+    if (length == 0 || pooledBuffers_ >=
+            kIrisMetal4FrameArenaPoolMaximumBuffers ||
+        length > kIrisMetal4FrameArenaPoolMaximumBytes ||
+        pooledBytes_ > kIrisMetal4FrameArenaPoolMaximumBytes - length) {
+      [buffer release];
+      return;
+    }
+    try {
+      available_[(NSUInteger)length].push_back(buffer);
+      pooledBuffers_++;
+      pooledBytes_ += length;
+    } catch (...) {
+      [buffer release];
+    }
+  }
+
+  ~IrisMetal4FrameArenaBufferPool() {
+    for (auto &bucket : available_) {
+      for (id<MTLBuffer> buffer : bucket.second)
+        [buffer release];
+    }
+  }
+
+ private:
+  std::unordered_map<NSUInteger, std::vector<id<MTLBuffer>>> available_;
+  size_t pooledBuffers_ = 0;
+  uint64_t pooledBytes_ = 0;
+};
+
+static thread_local IrisMetal4FrameArenaBufferPool
+    g_irisMetal4FrameArenaBufferPool;
+
+struct IrisMetal4FrameArenaChunk {
+  id<MTLBuffer> buffer = nil;
+  NSUInteger used = 0;
+};
+
+class IrisMetal4FrameBufferArena {
+ public:
+  struct Slice {
+    id<MTLBuffer> buffer = nil;
+    NSUInteger offset = 0;
+  };
+
+  bool allocate(NSUInteger length, NSUInteger alignment, Slice &slice) {
+    slice = Slice{};
+    if (length == 0 || length > kIrisMetal4FrameArenaMaximumAllocationBytes)
+      return false;
+    alignment = std::max((NSUInteger)1, alignment);
+    auto alignedOffset = [&](NSUInteger value) -> NSUInteger {
+      NSUInteger remainder = value % alignment;
+      if (remainder == 0)
+        return value;
+      NSUInteger padding = alignment - remainder;
+      return value > NSUIntegerMax - padding ? NSUIntegerMax
+                                             : value + padding;
+    };
+    if (!chunks_.empty()) {
+      IrisMetal4FrameArenaChunk &chunk = chunks_.back();
+      NSUInteger offset = alignedOffset(chunk.used);
+      if (offset != NSUIntegerMax && offset <= chunk.buffer.length &&
+          length <= chunk.buffer.length - offset) {
+        chunk.used = offset + length;
+        slice = {chunk.buffer, offset};
+        return true;
+      }
+    }
+    if (chunks_.size() >= kIrisMetal4FrameArenaMaximumChunks)
+      return false;
+    NSUInteger capacity = std::max(kIrisMetal4FrameArenaChunkBytes, length);
+    constexpr NSUInteger pageAlignment = 4096;
+    NSUInteger pageRemainder = capacity % pageAlignment;
+    if (pageRemainder != 0) {
+      NSUInteger padding = pageAlignment - pageRemainder;
+      if (capacity > NSUIntegerMax - padding)
+        return false;
+      capacity += padding;
+    }
+    id<MTLBuffer> buffer = g_irisMetal4FrameArenaBufferPool.acquire(
+        capacity);
+    if (!buffer)
+      return false;
+    try {
+      chunks_.push_back({buffer, length});
+    } catch (...) {
+      g_irisMetal4FrameArenaBufferPool.recycle(buffer);
+      return false;
+    }
+    slice = {buffer, 0};
+    return true;
+  }
+
+  size_t bufferCount() const { return chunks_.size(); }
+
+  void appendResidencyAllocations(
+      std::vector<id<MTLAllocation>> &allocations) const
+      API_AVAILABLE(macos(26.0)) {
+    for (const IrisMetal4FrameArenaChunk &chunk : chunks_) {
+      if (chunk.buffer)
+        allocations.push_back((id<MTLAllocation>)chunk.buffer);
+    }
+  }
+
+  std::vector<IrisMetal4FrameArenaChunk> takeChunks() {
+    return std::move(chunks_);
+  }
+
+  void abandon() { chunks_.clear(); }
+
+  ~IrisMetal4FrameBufferArena() {
+    for (IrisMetal4FrameArenaChunk &chunk : chunks_)
+      g_irisMetal4FrameArenaBufferPool.recycle(chunk.buffer);
+  }
+
+ private:
+  std::vector<IrisMetal4FrameArenaChunk> chunks_;
+};
+
+// Draw preparation is implemented next to the proven MRX7 replay helpers
+// below. Keep the graph executor above that implementation so the ABI parser
+// remains adjacent to its JNI entry point, while exposing only an opaque
+// prepared-draw lifetime here.
+struct IrisMetal4GraphPreparedDraw;
+static bool iris_graph_prepare_input_textures(
+    const std::vector<IrisShadowTexture> &inputs,
+    std::vector<IrisMetal4GraphFramePreparedInputTexture> &textures,
+    jlong &reason) API_AVAILABLE(macos(26.0));
+static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
+    const IrisMetal4GraphFrameOperation &operation,
+    const std::unordered_map<uint32_t, id<MTLTexture>> &graphTextures,
+    const std::vector<id<MTLBuffer>> &graphInputBuffers,
+    const std::vector<IrisMetal4GraphFramePreparedInputTexture>
+        &graphInputTextures,
+    IrisMetal4FrameBufferArena *frameArena,
+    std::vector<uint64_t> &inputSurfaceLeases,
+    int &outcome, jlong &reason) API_AVAILABLE(macos(26.0));
+static NSUInteger iris_graph_prepared_draw_allocation_count(
+    const IrisMetal4GraphPreparedDraw *draw) API_AVAILABLE(macos(26.0));
+static void iris_graph_prepared_draw_append_residency_allocations(
+    const IrisMetal4GraphPreparedDraw *draw,
+    std::vector<id<MTLAllocation>> &allocations)
+    API_AVAILABLE(macos(26.0));
+static bool iris_graph_prepared_draw_can_share_pass(
+    const IrisMetal4GraphPreparedDraw *first,
+    const IrisMetal4GraphPreparedDraw *next) API_AVAILABLE(macos(26.0));
+static int iris_graph_encode_prepared_draw_run(
+    std::vector<IrisMetal4GraphPreparedDraw *> &draws,
+    size_t begin, size_t end,
+    id<MTL4CommandBuffer> commandBuffer, bool applyBarrier,
+    MTLStages graphStages,
+    const IrisMetal4GraphFrameOperation &drawOperation,
+    const std::vector<const IrisMetal4GraphFrameOperation *> &loadClears,
+    jlong &reason) API_AVAILABLE(macos(26.0));
+static void iris_graph_destroy_prepared_draw(
+    IrisMetal4GraphPreparedDraw *draw) API_AVAILABLE(macos(26.0));
+
+struct IrisMetal4GraphFramePacket {
+  uint64_t contextGeneration = 0;
+  int32_t readbackResourceId = -1;
+  int32_t presentationResourceId = -1;
+  std::vector<IrisMetal4GraphFrameResource> resources;
+  std::vector<IrisMetal4GraphFrameInputBuffer> inputBuffers;
+  std::vector<IrisShadowTexture> inputTextures;
+  std::vector<IrisMetal4GraphFrameOperation> operations;
+};
+
+static bool iris_graph_read_i32(IrisPipelineByteReader &reader,
+                                int32_t &value) {
+  uint32_t encoded = 0;
+  if (!reader.u32(encoded))
+    return false;
+  value = (int32_t)encoded;
+  return true;
+}
+
+static bool parse_iris_metal4_graph_frame(
+    const uint8_t *bytes, size_t byteLength,
+    IrisMetal4GraphFramePacket &result, bool borrowPayloads) {
+  if (!bytes || byteLength == 0)
+    return false;
+  IrisPipelineByteReader reader(bytes, byteLength);
+  uint32_t magic = 0;
+  uint32_t schema = 0;
+  uint32_t count = 0;
+  if (!reader.u32(magic) || magic != kIrisMetal4GraphFrameMagic ||
+      !reader.u32(schema) || schema != kIrisMetal4GraphFrameSchema ||
+      !reader.u64(result.contextGeneration) ||
+      result.contextGeneration == 0 ||
+      !iris_graph_read_i32(reader, result.readbackResourceId) ||
+      result.readbackResourceId < -1 ||
+      !iris_graph_read_i32(reader, result.presentationResourceId) ||
+      result.presentationResourceId < -1 ||
+      (result.readbackResourceId >= 0 &&
+       result.presentationResourceId >= 0) || !reader.u32(count) ||
+      count == 0 || count > kIrisMetal4GraphTextureLimit) {
+    return false;
+  }
+  try {
+    result.resources.resize(count);
+  } catch (...) {
+    return false;
+  }
+  static thread_local std::unordered_set<uint32_t> resourceIds;
+  static thread_local std::unordered_set<uint64_t> resourceTokens;
+  resourceIds.clear();
+  resourceTokens.clear();
+  resourceIds.reserve(count);
+  resourceTokens.reserve(count);
+  for (auto &resource : result.resources) {
+    if (!reader.u32(resource.resourceId) || resource.resourceId >= 16384 ||
+        !reader.u64(resource.token) || resource.token == 0 ||
+        !resourceIds.emplace(resource.resourceId).second ||
+        !resourceTokens.emplace(resource.token).second) {
+      return false;
+    }
+  }
+  if (result.readbackResourceId >= 0 &&
+      resourceIds.find((uint32_t)result.readbackResourceId) ==
+          resourceIds.end()) {
+    return false;
+  }
+  if (result.presentationResourceId >= 0 &&
+      resourceIds.find((uint32_t)result.presentationResourceId) ==
+          resourceIds.end()) {
+    return false;
+  }
+  uint64_t totalInputBufferBytes = 0;
+  if (!read_bounded_count(reader, kIrisShadowReplayMaximumBuffers, count)) {
+    return false;
+  }
+  try {
+    result.inputBuffers.resize(count);
+  } catch (...) {
+    return false;
+  }
+  for (auto &buffer : result.inputBuffers) {
+    buffer.borrowedBytes = nullptr;
+    buffer.bytes.clear();
+    if (!reader.u32(buffer.storageKind) || buffer.storageKind < 1 ||
+        buffer.storageKind > 2 || !reader.u32(buffer.byteLength) ||
+        buffer.byteLength == 0 ||
+        !iris_shadow_add_bounded(totalInputBufferBytes, buffer.byteLength,
+                                 kIrisShadowReplayMaximumBufferBytes)) {
+      return false;
+    }
+    if (buffer.storageKind == 1) {
+      bool read = borrowPayloads
+          ? reader.bytesView(buffer.byteLength, buffer.borrowedBytes)
+          : reader.bytes(buffer.byteLength, buffer.bytes);
+      if (!read) {
+        return false;
+      }
+    } else if (!reader.u64(buffer.sharedHandle) ||
+               buffer.sharedHandle == 0) {
+      return false;
+    }
+  }
+  uint64_t totalInputTextureBytes = 0;
+  if (!read_bounded_count(reader, kIrisShadowReplayMaximumTextures,
+                          count)) {
+    return false;
+  }
+  try {
+    result.inputTextures.resize(count);
+  } catch (...) {
+    return false;
+  }
+  static thread_local std::unordered_set<uint32_t> inputTextureNames;
+  inputTextureNames.clear();
+  inputTextureNames.reserve(count);
+  for (auto &texture : result.inputTextures) {
+    if (!reader.u32(texture.glName) || texture.glName == 0 ||
+        !inputTextureNames.emplace(texture.glName).second ||
+        !reader.string(texture.format) || !reader.u32(texture.width) ||
+        texture.width == 0 || texture.width > 16384 ||
+        !reader.u32(texture.height) || texture.height == 0 ||
+        texture.height > 16384 || !reader.u32(texture.layer) ||
+        !reader.u32(texture.mipLevel) ||
+        !reader.u32(texture.bytesPerPixel) ||
+        texture.bytesPerPixel == 0 || texture.bytesPerPixel > 16 ||
+        !reader.u32(texture.storageKind) || texture.storageKind != 1) {
+      return false;
+    }
+    uint64_t expected = (uint64_t)texture.width * texture.height;
+    if (expected > UINT64_MAX / texture.bytesPerPixel)
+      return false;
+    expected *= texture.bytesPerPixel;
+    uint32_t length = 0;
+    if (!reader.u32(length) || expected != length ||
+        !iris_shadow_add_bounded(totalInputTextureBytes, length,
+                                 kIrisShadowReplayMaximumTextureBytes) ||
+        !reader.bytes(length, texture.bytes)) {
+      return false;
+    }
+  }
+  if (!reader.u32(count) || count == 0 || count > 262144) {
+    return false;
+  }
+  try {
+    result.operations.resize(count);
+  } catch (...) {
+    return false;
+  }
+  for (auto &operation : result.operations) {
+    operation.rawValues.clear();
+    operation.pipelineKey.clear();
+    operation.replayPacket.clear();
+    operation.borrowedReplayPacket = nullptr;
+    operation.replayPacketLength = 0;
+    operation.colorTargets.clear();
+    operation.depthResource = -1;
+    operation.stencilResource = -1;
+    operation.textureOverrides.clear();
+    if (!reader.u32(operation.kind) || operation.kind < 1 ||
+        operation.kind > 5) {
+      return false;
+    }
+    if (operation.kind == 1) {
+      uint32_t valueCount = 0;
+      if (!reader.u32(operation.firstResource) ||
+          resourceIds.find(operation.firstResource) == resourceIds.end() ||
+          !reader.u32(operation.aspect) || operation.aspect > 3 ||
+          !reader.u32(operation.valueKind) || operation.valueKind > 3 ||
+          !reader.u32(valueCount) || valueCount == 0 || valueCount > 4) {
+        return false;
+      }
+      uint32_t expected = operation.aspect == 0 ? 4 :
+          (operation.aspect == 3 ? 2 : 1);
+      if (valueCount != expected ||
+          (operation.aspect == 0 && operation.valueKind == 1) ||
+          (operation.aspect == 1 && operation.valueKind > 1) ||
+          (operation.aspect == 2 && operation.valueKind < 2) ||
+          (operation.aspect == 3 && operation.valueKind > 1)) {
+        return false;
+      }
+      try {
+        operation.rawValues.resize(valueCount);
+      } catch (...) {
+        return false;
+      }
+      for (uint64_t &value : operation.rawValues) {
+        if (!reader.u64(value))
+          return false;
+      }
+      if (!reader.boolean(operation.hasRegion))
+        return false;
+      if (operation.hasRegion &&
+          (!iris_graph_read_i32(reader, operation.x) ||
+           !iris_graph_read_i32(reader, operation.y) ||
+           !iris_graph_read_i32(reader, operation.width) ||
+           !iris_graph_read_i32(reader, operation.height) ||
+           operation.width <= 0 || operation.height <= 0)) {
+        return false;
+      }
+    } else if (operation.kind == 2) {
+      if (!reader.u32(operation.barrierBits) ||
+          operation.barrierBits > INT32_MAX) {
+        return false;
+      }
+    } else if (operation.kind == 3) {
+      if (!reader.u32(operation.firstResource) ||
+          !reader.u32(operation.secondResource) ||
+          operation.firstResource == operation.secondResource ||
+          resourceIds.find(operation.firstResource) == resourceIds.end() ||
+          resourceIds.find(operation.secondResource) == resourceIds.end() ||
+          !reader.u32(operation.sourceLevel) ||
+          !reader.u32(operation.destinationLevel) ||
+          !iris_graph_read_i32(reader, operation.x) || operation.x < 0 ||
+          !iris_graph_read_i32(reader, operation.y) || operation.y < 0 ||
+          !iris_graph_read_i32(reader, operation.destinationX) ||
+          operation.destinationX < 0 ||
+          !iris_graph_read_i32(reader, operation.destinationY) ||
+          operation.destinationY < 0 ||
+          !iris_graph_read_i32(reader, operation.width) ||
+          operation.width <= 0 ||
+          !iris_graph_read_i32(reader, operation.height) ||
+          operation.height <= 0) {
+        return false;
+      }
+    } else if (operation.kind == 4) {
+      if (!reader.u32(operation.firstResource) ||
+          resourceIds.find(operation.firstResource) ==
+              resourceIds.end()) {
+        return false;
+      }
+    } else {
+      uint32_t packetLength = 0;
+      uint32_t targetCount = 0;
+      uint32_t overrideCount = 0;
+      if (!reader.string(operation.pipelineKey) ||
+          operation.pipelineKey.size() != 64 ||
+          !reader.u32(packetLength) || packetLength == 0 ||
+          packetLength > (uint32_t)kIrisShadowReplayMaximumPacketBytes ||
+          !(borrowPayloads
+              ? reader.bytesView(packetLength,
+                  operation.borrowedReplayPacket)
+              : reader.bytes(packetLength, operation.replayPacket)) ||
+          !reader.u32(targetCount) || targetCount > 8) {
+        return false;
+      }
+      operation.replayPacketLength = packetLength;
+      for (char value : operation.pipelineKey) {
+        if (!((value >= '0' && value <= '9') ||
+              (value >= 'a' && value <= 'f'))) {
+          return false;
+        }
+      }
+      try {
+        operation.colorTargets.resize(targetCount);
+      } catch (...) {
+        return false;
+      }
+      bool occupiedSlots[8] = {};
+      for (auto &target : operation.colorTargets) {
+        if (!reader.u32(target.first) || target.first >= 8 ||
+            occupiedSlots[target.first] || !reader.u32(target.second) ||
+            resourceIds.find(target.second) == resourceIds.end()) {
+          return false;
+        }
+        occupiedSlots[target.first] = true;
+      }
+      if (!iris_graph_read_i32(reader, operation.depthResource) ||
+          operation.depthResource < -1 ||
+          (operation.depthResource >= 0 &&
+           resourceIds.find((uint32_t)operation.depthResource) ==
+               resourceIds.end()) ||
+          !iris_graph_read_i32(reader, operation.stencilResource) ||
+          operation.stencilResource < -1 ||
+          (operation.stencilResource >= 0 &&
+           resourceIds.find((uint32_t)operation.stencilResource) ==
+               resourceIds.end()) ||
+          (operation.colorTargets.empty() &&
+           operation.depthResource < 0 && operation.stencilResource < 0) ||
+          !reader.u32(overrideCount) || overrideCount > 256) {
+        return false;
+      }
+      for (uint32_t index = 0; index < overrideCount; index++) {
+        uint32_t glName = 0;
+        uint32_t resourceId = 0;
+        if (!reader.u32(glName) || glName == 0 ||
+            !reader.u32(resourceId) ||
+            resourceIds.find(resourceId) == resourceIds.end() ||
+            !operation.textureOverrides.emplace(glName,
+                                                 resourceId).second) {
+          return false;
+        }
+      }
+    }
+  }
+  return reader.done();
+}
+
+struct IrisMetal4GraphFrameRetainedResource {
+  uint32_t resourceId = 0;
+  id<MTLTexture> texture = nil;
+};
+
+static bool iris_graph_retire_submission(
+    std::vector<IrisMetal4GraphPreparedDraw *> &preparedDraws,
+    std::vector<IrisMetal4GraphFrameRetainedResource> &retained,
+    IrisMetal4FrameBufferArena &frameArena,
+    std::vector<id> &encodedObjects, id<MTLBuffer> &readback,
+    id<MTLResidencySet> &residency,
+    id<MTL4CommandAllocator> &allocator,
+    id<MTL4CommandBuffer> &commandBuffer, MTL4CommitOptions *&options,
+    const std::shared_ptr<Metal4ProbeState> &feedbackState)
+    API_AVAILABLE(macos(26.0));
+
+static jlongArray iris_graph_frame_result(
+    JNIEnv *env, jlong status, jlong steps, jlong clears,
+    jlong transfers, jlong barriers, jlong hash, jlong reason) {
+  jlong values[] = {status, steps, clears, transfers, barriers, hash, reason};
+  jlongArray result = env->NewLongArray(7);
+  if (!result)
+    return nullptr;
+  env->SetLongArrayRegion(result, 0, 7, values);
+  return env->ExceptionCheck() ? nullptr : result;
+}
+
+static bool iris_graph_frame_color_format(MTLPixelFormat format) {
+  switch (format) {
+  case MTLPixelFormatDepth16Unorm:
+  case MTLPixelFormatDepth32Float:
+  case MTLPixelFormatStencil8:
+  case MTLPixelFormatDepth24Unorm_Stencil8:
+  case MTLPixelFormatDepth32Float_Stencil8:
+    return false;
+  default:
+    return format != MTLPixelFormatInvalid;
+  }
+}
+
+static bool iris_graph_frame_depth_format(MTLPixelFormat format) {
+  return format == MTLPixelFormatDepth16Unorm ||
+         format == MTLPixelFormatDepth32Float ||
+         format == MTLPixelFormatDepth24Unorm_Stencil8 ||
+         format == MTLPixelFormatDepth32Float_Stencil8;
+}
+
+static bool iris_graph_frame_stencil_format(MTLPixelFormat format) {
+  return format == MTLPixelFormatStencil8 ||
+         format == MTLPixelFormatDepth24Unorm_Stencil8 ||
+         format == MTLPixelFormatDepth32Float_Stencil8;
+}
+
+static bool iris_graph_frame_bytes_per_pixel(MTLPixelFormat format,
+                                             uint32_t &bytes) {
+  switch (format) {
+  case MTLPixelFormatR8Unorm:
+  case MTLPixelFormatR8Snorm:
+  case MTLPixelFormatR8Uint:
+  case MTLPixelFormatR8Sint: bytes = 1; return true;
+  case MTLPixelFormatRG8Unorm:
+  case MTLPixelFormatRG8Snorm:
+  case MTLPixelFormatRG8Uint:
+  case MTLPixelFormatRG8Sint:
+  case MTLPixelFormatR16Unorm:
+  case MTLPixelFormatR16Snorm:
+  case MTLPixelFormatR16Uint:
+  case MTLPixelFormatR16Sint:
+  case MTLPixelFormatR16Float: bytes = 2; return true;
+  case MTLPixelFormatRGBA8Unorm:
+  case MTLPixelFormatRGBA8Unorm_sRGB:
+  case MTLPixelFormatRGBA8Snorm:
+  case MTLPixelFormatRGBA8Uint:
+  case MTLPixelFormatRGBA8Sint:
+  case MTLPixelFormatBGRA8Unorm:
+  case MTLPixelFormatBGRA8Unorm_sRGB:
+  case MTLPixelFormatRG16Unorm:
+  case MTLPixelFormatRG16Snorm:
+  case MTLPixelFormatRG16Uint:
+  case MTLPixelFormatRG16Sint:
+  case MTLPixelFormatRG16Float:
+  case MTLPixelFormatR32Uint:
+  case MTLPixelFormatR32Sint:
+  case MTLPixelFormatR32Float:
+  case MTLPixelFormatRGB10A2Unorm:
+  case MTLPixelFormatRGB10A2Uint:
+  case MTLPixelFormatRG11B10Float:
+  case MTLPixelFormatRGB9E5Float: bytes = 4; return true;
+  case MTLPixelFormatRGBA16Unorm:
+  case MTLPixelFormatRGBA16Snorm:
+  case MTLPixelFormatRGBA16Uint:
+  case MTLPixelFormatRGBA16Sint:
+  case MTLPixelFormatRGBA16Float:
+  case MTLPixelFormatRG32Uint:
+  case MTLPixelFormatRG32Sint:
+  case MTLPixelFormatRG32Float: bytes = 8; return true;
+  case MTLPixelFormatRGBA32Uint:
+  case MTLPixelFormatRGBA32Sint:
+  case MTLPixelFormatRGBA32Float: bytes = 16; return true;
+  default: return false;
+  }
+}
+
+static double iris_graph_frame_clear_component(uint32_t valueKind,
+                                                uint64_t raw) {
+  if (valueKind == 0) {
+    uint32_t bits = (uint32_t)raw;
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return (double)value;
+  }
+  if (valueKind == 1) {
+    double value = 0.0;
+    std::memcpy(&value, &raw, sizeof(value));
+    return value;
+  }
+  if (valueKind == 2)
+    return (double)(int32_t)(uint32_t)raw;
+  return (double)(uint32_t)raw;
+}
+
+static uint64_t iris_graph_frame_fnv1a64(const uint8_t *bytes,
+                                         size_t length) {
+  uint64_t hash = 1469598103934665603ULL;
+  for (size_t index = 0; index < length; index++) {
+    hash ^= bytes[index];
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+static float iris_graph_decode_unsigned_float(uint32_t bits,
+                                               uint32_t mantissaBits) {
+  uint32_t exponent = bits >> mantissaBits;
+  uint32_t mantissa = bits & ((1u << mantissaBits) - 1u);
+  if (exponent == 0)
+    return std::ldexp((float)mantissa, 1 - 15 - (int)mantissaBits);
+  if (exponent == 31)
+    return mantissa == 0 ? INFINITY : NAN;
+  return std::ldexp(1.0f + (float)mantissa /
+      (float)(1u << mantissaBits), (int)exponent - 15);
+}
+
+static uint8_t iris_graph_float_to_unorm8(float value) {
+  if (std::isnan(value) || value <= 0.0f)
+    return 0;
+  if (!std::isfinite(value) || value >= 1.0f)
+    return 255;
+  return (uint8_t)std::lround(value * 255.0f);
+}
+
+// Exact-JAR diagnostics expose graph readbacks through one RGBA8 JNI getter.
+// RG11B10F is decoded only after the GPU submission retires; render resources
+// and shader sampling remain in their native packed HDR format.
+static bool iris_graph_readback_rgba8(id<MTLTexture> texture,
+                                      const uint8_t *bytes,
+                                      size_t length,
+                                      NSUInteger width,
+                                      NSUInteger height,
+                                      std::vector<uint8_t> &output) {
+  if (!texture || !bytes || width == 0 || height == 0 ||
+      width > SIZE_MAX / height || width * height > SIZE_MAX / 4)
+    return false;
+  size_t pixels = width * height;
+  if (length != pixels * 4)
+    return false;
+  try {
+    output.resize(pixels * 4);
+  } catch (...) {
+    output.clear();
+    return false;
+  }
+  if (texture.pixelFormat == MTLPixelFormatRGBA8Unorm) {
+    std::memcpy(output.data(), bytes, length);
+    return true;
+  }
+  if (texture.pixelFormat != MTLPixelFormatRG11B10Float) {
+    output.clear();
+    return false;
+  }
+  for (size_t pixel = 0; pixel < pixels; ++pixel) {
+    uint32_t packed = 0;
+    std::memcpy(&packed, bytes + pixel * 4, sizeof(packed));
+    float red = iris_graph_decode_unsigned_float(packed & 0x7ffu, 6);
+    float green = iris_graph_decode_unsigned_float(
+        (packed >> 11) & 0x7ffu, 6);
+    float blue = iris_graph_decode_unsigned_float(
+        (packed >> 22) & 0x3ffu, 5);
+    output[pixel * 4] = iris_graph_float_to_unorm8(red);
+    output[pixel * 4 + 1] = iris_graph_float_to_unorm8(green);
+    output[pixel * 4 + 2] = iris_graph_float_to_unorm8(blue);
+    output[pixel * 4 + 3] = 255;
+  }
+  return true;
+}
+
+static jlongArray run_iris_metal4_graph_frame(
+    JNIEnv *env, jobject packetValue, jint directPacketLength,
+    jint diagnosticReadbackMipLevel, bool requirePresentation,
+    bool directPacket) {
+  IrisMetal4GraphCpuTimer cpuTimer(requirePresentation);
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  @autoreleasepool {
+    g_irisMetal4LastGraphFrameRgba8.clear();
+    if (!g_device || !g_metal4CommandQueue ||
+        !g_metal4RuntimeVerified.load(std::memory_order_acquire)) {
+      return iris_graph_frame_result(env, 0, 0, 0, 0, 0, 0, 1);
+    }
+    if (!packetValue || diagnosticReadbackMipLevel < 0 ||
+        diagnosticReadbackMipLevel > 30)
+      return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 0);
+    if (@available(macOS 26.0, *)) {
+      CFTimeInterval profileStarted = CACurrentMediaTime();
+      CFTimeInterval profileParsed = 0.0;
+      CFTimeInterval profileInputsReady = 0.0;
+      CFTimeInterval profileDrawsReady = 0.0;
+      CFTimeInterval profilePresentationReady = 0.0;
+      CFTimeInterval profileResidencyCreated = 0.0;
+      CFTimeInterval profileResidencyPopulated = 0.0;
+      CFTimeInterval profileResidencyCommitted = 0.0;
+      CFTimeInterval profileSetupReady = 0.0;
+      CFTimeInterval profileEncoded = 0.0;
+      CFTimeInterval profileCommitted = 0.0;
+      uint64_t profileResidencyRawAllocations = 0;
+      uint64_t profileResidencyUniqueAllocations = 0;
+      uint64_t profileDrawOperations = 0;
+      uint64_t profileDrawPasses = 0;
+      uint64_t profileBarrierCalls = 0;
+      jsize packetLength = 0;
+      const uint8_t *packetBytes = nullptr;
+      jbyte *criticalPacketBytes = nullptr;
+      jbyteArray packetArray = nullptr;
+      if (directPacket) {
+        jlong directCapacity = env->GetDirectBufferCapacity(packetValue);
+        void *directAddress = env->GetDirectBufferAddress(packetValue);
+        if (!directAddress || directPacketLength <= 0 ||
+            directCapacity < directPacketLength) {
+          return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 0);
+        }
+        packetLength = directPacketLength;
+        packetBytes = static_cast<const uint8_t *>(directAddress);
+      } else {
+        packetArray = static_cast<jbyteArray>(packetValue);
+        packetLength = env->GetArrayLength(packetArray);
+      }
+      if (packetLength <= 0 ||
+          packetLength > kIrisMetal4GraphFrameMaximumPacketBytes) {
+        return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 0);
+      }
+      static thread_local IrisMetal4GraphFramePacket packet;
+      if (!directPacket) {
+        criticalPacketBytes = static_cast<jbyte *>(
+            env->GetPrimitiveArrayCritical(packetArray, nullptr));
+        if (!criticalPacketBytes)
+          return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 0);
+        packetBytes = reinterpret_cast<const uint8_t *>(
+            criticalPacketBytes);
+      }
+      bool parsed = parse_iris_metal4_graph_frame(
+          packetBytes, (size_t)packetLength, packet, directPacket);
+      if (criticalPacketBytes) {
+        env->ReleasePrimitiveArrayCritical(packetArray,
+            criticalPacketBytes, JNI_ABORT);
+      }
+      if (!parsed)
+        return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 0);
+      if ((requirePresentation && packet.presentationResourceId < 0) ||
+          (!requirePresentation && packet.presentationResourceId >= 0)) {
+        return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 0);
+      }
+      if (requirePresentation && g_irisMetal4GraphPresentations.size() >=
+              kIrisMetal4GraphPresentationLimit) {
+        return iris_graph_frame_result(env, 0, 0, 0, 0, 0, 0,
+            kIrisGraphReasonPresentationQueueFull);
+      }
+      if (!iris_metal4_retired_submission_slot_available())
+        return iris_graph_frame_result(env, 0, 0, 0, 0, 0, 0, 7);
+      profileParsed = CACurrentMediaTime();
+
+      std::vector<IrisMetal4GraphFrameRetainedResource> retained;
+      std::unordered_map<uint32_t, size_t> resourceIndex;
+      {
+        std::lock_guard<std::mutex> lock(g_irisMetal4GraphTextureMutex);
+        try {
+          retained.reserve(packet.resources.size());
+        } catch (...) {
+          return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 5);
+        }
+        for (const auto &resource : packet.resources) {
+          id<MTLTexture> texture = nil;
+          for (const auto &candidate : g_irisMetal4GraphTextures) {
+            if (candidate.first.contextGeneration ==
+                    packet.contextGeneration &&
+                candidate.second.token == resource.token &&
+                candidate.second.texture) {
+              texture = [candidate.second.texture retain];
+              break;
+            }
+          }
+          if (!texture) {
+            for (auto &value : retained)
+              [value.texture release];
+            return iris_graph_frame_result(env, 0, 0, 0, 0, 0, 0, 2);
+          }
+          resourceIndex.emplace(resource.resourceId, retained.size());
+          retained.push_back({resource.resourceId, texture});
+        }
+      }
+      auto releaseRetained = [&]() {
+        for (auto &resource : retained) {
+          if (resource.texture)
+            [resource.texture release];
+        }
+      };
+      auto textureFor = [&](uint32_t resourceId) -> id<MTLTexture> {
+        auto found = resourceIndex.find(resourceId);
+        return found == resourceIndex.end()
+            ? nil : retained[found->second].texture;
+      };
+      std::unordered_map<uint32_t, id<MTLTexture>> graphTextures;
+      try {
+        graphTextures.reserve(retained.size());
+        for (const auto &resource : retained)
+          graphTextures.emplace(resource.resourceId, resource.texture);
+      } catch (...) {
+        releaseRetained();
+        return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 5);
+      }
+      std::vector<id<MTLBuffer>> graphInputBuffers;
+      try {
+        graphInputBuffers.reserve(packet.inputBuffers.size());
+      } catch (...) {
+        releaseRetained();
+        return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 5);
+      }
+      auto releaseGraphInputBuffers = [&]() {
+        for (id<MTLBuffer> buffer : graphInputBuffers) {
+          if (buffer)
+            [buffer release];
+        }
+        graphInputBuffers.clear();
+      };
+      for (const auto &input : packet.inputBuffers) {
+        id<MTLBuffer> buffer = nil;
+        if (input.storageKind == 2) {
+          id<MTLBuffer> resident = iris_metal4_resident_buffer(
+              input.sharedHandle, input.byteLength);
+          if (resident)
+            buffer = [resident retain];
+          if (!buffer) {
+            dbg("WARN: Iris graph frame resident input missing token=%llu "
+                "bytes=%u residentCount=%zu residentBytes=%llu\n",
+                (unsigned long long)input.sharedHandle,
+                input.byteLength, g_irisMetal4ResidentBuffers.size(),
+                (unsigned long long)g_irisMetal4ResidentBufferBytes);
+            releaseGraphInputBuffers();
+            releaseRetained();
+            return iris_graph_frame_result(env, 0, 0, 0, 0, 0, 0,
+                kIrisGraphReasonFrameInputResidentMissing);
+          }
+        } else {
+          buffer = [g_device newBufferWithLength:input.byteLength
+                                          options:MTLResourceStorageModeShared];
+          if (buffer) {
+            const uint8_t *source = input.borrowedBytes
+                ? input.borrowedBytes : input.bytes.data();
+            std::memcpy(buffer.contents, source, input.byteLength);
+          }
+        }
+        if (!buffer) {
+          releaseGraphInputBuffers();
+          releaseRetained();
+          return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 5);
+        }
+        graphInputBuffers.push_back(buffer);
+      }
+      std::vector<IrisMetal4GraphFramePreparedInputTexture>
+          graphInputTextures;
+      auto releaseGraphInputTextures = [&]() {
+        for (auto &input : graphInputTextures) {
+          if (input.texture)
+            [input.texture release];
+        }
+        graphInputTextures.clear();
+      };
+      jlong graphInputTextureReason = 0;
+      if (!iris_graph_prepare_input_textures(packet.inputTextures,
+              graphInputTextures, graphInputTextureReason)) {
+        releaseGraphInputTextures();
+        releaseGraphInputBuffers();
+        releaseRetained();
+        return iris_graph_frame_result(env, 0, 0, 0, 0, 0, 0,
+            graphInputTextureReason != 0 ? graphInputTextureReason
+                                         : (jlong)5);
+      }
+      profileInputsReady = CACurrentMediaTime();
+      auto releaseGraphInputs = [&]() {
+        releaseGraphInputTextures();
+        releaseGraphInputBuffers();
+      };
+      IrisMetal4FrameBufferArena frameArgumentArena;
+      std::vector<uint64_t> inputSurfaceLeases;
+      std::vector<IrisMetal4GraphPreparedDraw *> preparedDraws(
+          packet.operations.size(), nullptr);
+      auto releasePreparedDraws = [&]() {
+        for (IrisMetal4GraphPreparedDraw *draw : preparedDraws) {
+          if (draw)
+            iris_graph_destroy_prepared_draw(draw);
+        }
+      };
+      std::vector<id> encodedObjects;
+      try {
+        encodedObjects.reserve(packet.operations.size());
+      } catch (...) {
+        releasePreparedDraws();
+        releaseGraphInputs();
+        releaseRetained();
+        return iris_graph_frame_result(env, -1, 0, 0, 0, 0, 0, 5);
+      }
+      auto releaseEncodedObjects = [&]() {
+        for (id object : encodedObjects) {
+          if (object)
+            [object release];
+        }
+        encodedObjects.clear();
+      };
+
+      id<MTL4CommandAllocator> allocator = nil;
+      id<MTL4CommandBuffer> commandBuffer = nil;
+      id<MTLResidencySet> residency = nil;
+      id<MTLBuffer> readback = nil;
+      id<MTLTexture> presentationTexture = nil;
+      IOSurfaceRef presentationSurface = nullptr;
+      MTL4CommitOptions *options = nil;
+      jlong status = -1;
+      jlong reason = 0;
+      jlong clears = 0;
+      jlong transfers = 0;
+      jlong barriers = 0;
+      uint64_t outputHash = 0;
+      NSUInteger readbackRowBytes = 0;
+      NSUInteger readbackLength = 0;
+      NSUInteger readbackWidth = 0;
+      NSUInteger readbackHeight = 0;
+      bool graphReadbackCaptureFailed = false;
+      bool submissionCommitted = false;
+      bool presentationQueued = false;
+      bool presentationTextureRetained = false;
+      uint64_t presentationToken = 0;
+      uint32_t presentationWidth = 0;
+      uint32_t presentationHeight = 0;
+      std::shared_ptr<Metal4ProbeState> submissionState;
+      @try {
+        NSUInteger preparedAllocationCount = 0;
+        for (size_t operationIndex = 0;
+             operationIndex < packet.operations.size(); operationIndex++) {
+          const auto &operation = packet.operations[operationIndex];
+          if (operation.kind != 5)
+            continue;
+          int outcome = -1;
+          jlong drawReason = 0;
+          IrisMetal4GraphPreparedDraw *draw = iris_graph_prepare_draw(
+              operation, graphTextures, graphInputBuffers,
+              graphInputTextures, &frameArgumentArena,
+              inputSurfaceLeases, outcome, drawReason);
+          if (!draw) {
+            dbg("WARN: Iris graph draw preparation rejected operation=%zu "
+                "reason=%lld pipeline=%.12s\n", operationIndex,
+                (long long)drawReason, operation.pipelineKey.c_str());
+            status = outcome == 0 ? 0 : -1;
+            reason = drawReason != 0 ? drawReason
+                                     : (outcome == 0 ? 6 : 5);
+            @throw [NSException
+                exceptionWithName:outcome == 0
+                    ? @"MetalRenderGraphUnsupported"
+                    : @"MetalRenderGraphSetup"
+                           reason:@"graph draw preparation failed"
+                         userInfo:nil];
+          }
+          preparedDraws[operationIndex] = draw;
+          NSUInteger allocationCount =
+              iris_graph_prepared_draw_allocation_count(draw);
+          if (preparedAllocationCount > NSUIntegerMax - allocationCount) {
+            status = -1;
+            reason = 5;
+            @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                           reason:@"draw residency overflow"
+                                         userInfo:nil];
+          }
+          preparedAllocationCount += allocationCount;
+        }
+        profileDrawsReady = CACurrentMediaTime();
+        id<MTLTexture> readbackTexture = packet.readbackResourceId >= 0
+            ? textureFor((uint32_t)packet.readbackResourceId) : nil;
+        if (packet.readbackResourceId >= 0) {
+          uint32_t bytesPerPixel = 0;
+          if (!readbackTexture) {
+            status = 0;
+            reason = kIrisGraphReasonReadbackTextureMissing;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph readback texture missing"
+                         userInfo:nil];
+          }
+          if (readbackTexture.sampleCount != 1) {
+            status = 0;
+            reason = kIrisGraphReasonReadbackMultisampleUnsupported;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph readback multisample unsupported"
+                         userInfo:nil];
+          }
+          if ((NSUInteger)diagnosticReadbackMipLevel >=
+              readbackTexture.mipmapLevelCount) {
+            status = 0;
+            reason = kIrisGraphReasonReadbackFormatUnsupported;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph readback mip level unavailable"
+                         userInfo:nil];
+          }
+          if (!iris_graph_frame_bytes_per_pixel(
+                  readbackTexture.pixelFormat, bytesPerPixel)) {
+            status = 0;
+            reason = kIrisGraphReasonReadbackFormatUnsupported;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph readback format unsupported"
+                         userInfo:nil];
+          }
+          readbackWidth = std::max((NSUInteger)1,
+              readbackTexture.width >> diagnosticReadbackMipLevel);
+          readbackHeight = std::max((NSUInteger)1,
+              readbackTexture.height >> diagnosticReadbackMipLevel);
+          if (readbackWidth > SIZE_MAX / bytesPerPixel) {
+            status = 0;
+            reason = kIrisGraphReasonReadbackRowSizeUnsupported;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph readback row size unsupported"
+                         userInfo:nil];
+          }
+          readbackRowBytes = readbackWidth * bytesPerPixel;
+          if (readbackHeight > SIZE_MAX / readbackRowBytes) {
+            status = 0;
+            reason = kIrisGraphReasonReadbackByteSizeUnsupported;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph readback size unsupported"
+                         userInfo:nil];
+          }
+          readbackLength = readbackRowBytes * readbackHeight;
+          readback = [g_device newBufferWithLength:readbackLength
+                                           options:MTLResourceStorageModeShared];
+          if (!readback)
+            @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                           reason:@"readback allocation failed"
+                                         userInfo:nil];
+        }
+
+        if (packet.presentationResourceId >= 0) {
+          id<MTLTexture> source = textureFor(
+              (uint32_t)packet.presentationResourceId);
+          if (!source) {
+            status = 0;
+            reason = kIrisGraphReasonPresentationTextureMissing;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph presentation texture missing"
+                         userInfo:nil];
+          }
+          if (source.sampleCount != 1) {
+            status = 0;
+            reason = kIrisGraphReasonPresentationMultisampleUnsupported;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph presentation multisample unsupported"
+                         userInfo:nil];
+          }
+          if (source.pixelFormat != MTLPixelFormatRGBA8Unorm ||
+              source.textureType != MTLTextureType2D || source.depth != 1 ||
+              source.arrayLength != 1) {
+            status = 0;
+            reason = kIrisGraphReasonPresentationFormatUnsupported;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph presentation format unsupported"
+                         userInfo:nil];
+          }
+          if (source.width == 0 || source.height == 0 ||
+              source.width > UINT32_MAX || source.height > UINT32_MAX ||
+              source.width > SIZE_MAX / 4u) {
+            status = 0;
+            reason = kIrisGraphReasonPresentationSizeUnsupported;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph presentation size unsupported"
+                         userInfo:nil];
+          }
+          size_t bytesPerRow = IOSurfaceAlignProperty(
+              kIOSurfaceBytesPerRow, (size_t)source.width * 4u);
+          if (bytesPerRow == 0 ||
+              source.height > SIZE_MAX / bytesPerRow) {
+            status = 0;
+            reason = kIrisGraphReasonPresentationSizeUnsupported;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph presentation allocation unsupported"
+                         userInfo:nil];
+          }
+          NSDictionary *surfaceProperties = @{
+            (id)kIOSurfaceWidth : @(source.width),
+            (id)kIOSurfaceHeight : @(source.height),
+            (id)kIOSurfaceBytesPerElement : @4,
+            (id)kIOSurfaceBytesPerRow : @(bytesPerRow),
+            (id)kIOSurfaceAllocSize :
+                @(bytesPerRow * (size_t)source.height),
+            (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+          };
+          presentationSurface = iris_metal4_acquire_graph_surface(
+              (uint32_t)source.width, (uint32_t)source.height);
+          if (!presentationSurface) {
+            presentationSurface = IOSurfaceCreate(
+                (__bridge CFDictionaryRef)surfaceProperties);
+          }
+          MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                           width:source.width
+                                          height:source.height
+                                       mipmapped:NO];
+          descriptor.storageMode = MTLStorageModeShared;
+          descriptor.usage = MTLTextureUsageRenderTarget |
+                             MTLTextureUsageShaderRead;
+          if (presentationSurface) {
+            presentationTexture = [g_device
+                newTextureWithDescriptor:descriptor
+                                iosurface:presentationSurface
+                                    plane:0];
+          }
+          if (!presentationSurface || !presentationTexture) {
+            @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                           reason:@"presentation allocation failed"
+                                         userInfo:nil];
+          }
+          presentationWidth = (uint32_t)source.width;
+          presentationHeight = (uint32_t)source.height;
+          retained.push_back({UINT32_MAX, presentationTexture});
+          presentationTextureRetained = true;
+        }
+        profilePresentationReady = CACurrentMediaTime();
+
+        std::vector<id<MTLAllocation>> residencyAllocations;
+        std::vector<id<MTLAllocation>> uniqueResidencyAllocations;
+        std::unordered_set<const void *> seenResidencyAllocations;
+        residencyAllocations.reserve(retained.size() +
+                                     (readback ? 1 : 0) +
+                                     preparedAllocationCount +
+                                     frameArgumentArena.bufferCount());
+        for (const auto &resource : retained) {
+          if (resource.texture) {
+            residencyAllocations.push_back(
+                (id<MTLAllocation>)resource.texture);
+          }
+        }
+        frameArgumentArena.appendResidencyAllocations(
+            residencyAllocations);
+        for (IrisMetal4GraphPreparedDraw *draw : preparedDraws) {
+          if (draw) {
+            iris_graph_prepared_draw_append_residency_allocations(
+                draw, residencyAllocations);
+          }
+        }
+        if (readback)
+          residencyAllocations.push_back((id<MTLAllocation>)readback);
+        uniqueResidencyAllocations.reserve(residencyAllocations.size());
+        seenResidencyAllocations.reserve(residencyAllocations.size());
+        for (id<MTLAllocation> allocation : residencyAllocations) {
+          if (allocation && seenResidencyAllocations.emplace(
+                                (const void *)allocation).second) {
+            uniqueResidencyAllocations.push_back(allocation);
+          }
+        }
+        profileResidencyRawAllocations = residencyAllocations.size();
+        profileResidencyUniqueAllocations =
+            uniqueResidencyAllocations.size();
+
+        MTLResidencySetDescriptor *residencyDescriptor =
+            [[MTLResidencySetDescriptor alloc] init];
+        residencyDescriptor.label = @"MetalRender Iris graph frame";
+        residencyDescriptor.initialCapacity =
+            std::max((NSUInteger)1,
+                     (NSUInteger)uniqueResidencyAllocations.size());
+        NSError *residencyError = nil;
+        residency = [g_device
+            newResidencySetWithDescriptor:residencyDescriptor
+                                    error:&residencyError];
+        [residencyDescriptor release];
+        if (!residency)
+          @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                         reason:@"residency allocation failed"
+                                       userInfo:nil];
+        profileResidencyCreated = CACurrentMediaTime();
+        if (!uniqueResidencyAllocations.empty()) {
+          [residency addAllocations:uniqueResidencyAllocations.data()
+                              count:uniqueResidencyAllocations.size()];
+        }
+        profileResidencyPopulated = CACurrentMediaTime();
+        [residency commit];
+        // The command buffer's useResidencySet: declaration guarantees that
+        // Metal makes these allocations resident for this submission.
+        // requestResidency is an eager, synchronous residency request; doing
+        // both here serialized every Iris frame for several milliseconds.
+        profileResidencyCommitted = CACurrentMediaTime();
+
+        allocator = [g_device newCommandAllocator];
+        commandBuffer = [g_device newCommandBuffer];
+        if (!allocator || !commandBuffer)
+          @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                         reason:@"command allocation failed"
+                                       userInfo:nil];
+        [commandBuffer beginCommandBufferWithAllocator:allocator];
+        [commandBuffer useResidencySet:residency];
+        profileSetupReady = CACurrentMediaTime();
+
+        MTLStages graphStages = MTLStageVertex | MTLStageFragment |
+            MTLStageDispatch | MTLStageBlit;
+        // Metal 4 encoders from one command buffer may overlap unless an
+        // explicit queue barrier orders their conflicting accesses. Track
+        // both sides of the hazard: the older implementation only retained
+        // writes, which covered RAW/WAW but allowed a later render target
+        // write to race an earlier shader read (WAR).
+        std::unordered_set<uint32_t> pendingReads;
+        std::unordered_set<uint32_t> pendingWrites;
+        bool explicitBarrierPending = false;
+        auto readNeedsBarrier = [&](uint32_t resourceId) {
+          return explicitBarrierPending ||
+              pendingWrites.find(resourceId) != pendingWrites.end();
+        };
+        auto writeNeedsBarrier = [&](uint32_t resourceId) {
+          return explicitBarrierPending ||
+              pendingWrites.find(resourceId) != pendingWrites.end() ||
+              pendingReads.find(resourceId) != pendingReads.end();
+        };
+        auto consumeBarrier = [&]() {
+          pendingReads.clear();
+          pendingWrites.clear();
+          explicitBarrierPending = false;
+        };
+        auto clearMatchesDrawTarget = [](
+            const IrisMetal4GraphFrameOperation &clear,
+            const IrisMetal4GraphFrameOperation &draw) {
+          if (clear.kind != 1 || draw.kind != 5)
+            return false;
+          if (clear.aspect == 0) {
+            return std::any_of(draw.colorTargets.begin(),
+                draw.colorTargets.end(), [&](const auto &target) {
+                  return target.second == clear.firstResource;
+                });
+          }
+          bool depth = (clear.aspect == 1 || clear.aspect == 3) &&
+              draw.depthResource >= 0 &&
+              (uint32_t)draw.depthResource == clear.firstResource;
+          bool stencil = (clear.aspect == 2 || clear.aspect == 3) &&
+              draw.stencilResource >= 0 &&
+              (uint32_t)draw.stencilResource == clear.firstResource;
+          return clear.aspect == 3 ? depth && stencil : depth || stencil;
+        };
+        for (size_t operationIndex = 0;
+             operationIndex < packet.operations.size(); operationIndex++) {
+          const auto &operation = packet.operations[operationIndex];
+          // Fold attachment clears (and barriers that only order those
+          // clears) into the load actions of the immediately following draw
+          // pass. Ambiguous sequences retain the conservative standalone
+          // clear path below.
+          if (operation.kind == 1) {
+            size_t drawIndex = operationIndex;
+            std::vector<const IrisMetal4GraphFrameOperation *> loadClears;
+            uint64_t foldedBarriers = 0;
+            while (drawIndex < packet.operations.size() &&
+                   (packet.operations[drawIndex].kind == 1 ||
+                    packet.operations[drawIndex].kind == 2)) {
+              if (packet.operations[drawIndex].kind == 1) {
+                loadClears.push_back(&packet.operations[drawIndex]);
+              } else {
+                foldedBarriers++;
+              }
+              drawIndex++;
+            }
+            bool fold = !loadClears.empty() &&
+                drawIndex < packet.operations.size() &&
+                packet.operations[drawIndex].kind == 5 &&
+                std::all_of(loadClears.begin(), loadClears.end(),
+                    [&](const auto *clear) {
+                      return clearMatchesDrawTarget(
+                          *clear, packet.operations[drawIndex]);
+                    });
+            if (fold) {
+              size_t runEnd = drawIndex + 1;
+              while (runEnd < packet.operations.size() &&
+                     packet.operations[runEnd].kind == 5 &&
+                     iris_graph_prepared_draw_can_share_pass(
+                         preparedDraws[drawIndex],
+                         preparedDraws[runEnd])) {
+                runEnd++;
+              }
+              bool applyBarrier = explicitBarrierPending ||
+                  foldedBarriers != 0;
+              for (size_t index = drawIndex;
+                   !applyBarrier && index < runEnd; index++) {
+                const auto &draw = packet.operations[index];
+                for (const auto &target : draw.colorTargets) {
+                  if (writeNeedsBarrier(target.second)) {
+                    applyBarrier = true;
+                    break;
+                  }
+                }
+                if (!applyBarrier && draw.depthResource >= 0) {
+                  applyBarrier = writeNeedsBarrier(
+                      (uint32_t)draw.depthResource);
+                }
+                if (!applyBarrier && draw.stencilResource >= 0) {
+                  applyBarrier = writeNeedsBarrier(
+                      (uint32_t)draw.stencilResource);
+                }
+                if (!applyBarrier) {
+                  for (const auto &sampled : draw.textureOverrides) {
+                    if (readNeedsBarrier(sampled.second)) {
+                      applyBarrier = true;
+                      break;
+                    }
+                  }
+                }
+              }
+              int outcome = iris_graph_encode_prepared_draw_run(
+                  preparedDraws, drawIndex, runEnd, commandBuffer,
+                  applyBarrier, graphStages, packet.operations[drawIndex],
+                  loadClears, reason);
+              if (outcome <= 0) {
+                dbg("WARN: Iris graph fused-clear draw rejected operation=%zu "
+                    "runEnd=%zu reason=%lld pipeline=%.12s\n",
+                    drawIndex, runEnd, (long long)reason,
+                    packet.operations[drawIndex].pipelineKey.c_str());
+                status = outcome == 0 ? 0 : -1;
+                if (reason == 0)
+                  reason = outcome == 0 ? 6 : 5;
+                @throw [NSException
+                    exceptionWithName:outcome == 0
+                        ? @"MetalRenderGraphUnsupported"
+                        : @"MetalRenderGraphSetup"
+                               reason:@"fused-clear graph draw failed"
+                             userInfo:nil];
+              }
+              if (applyBarrier)
+                consumeBarrier();
+              if (applyBarrier)
+                profileBarrierCalls++;
+              clears += loadClears.size();
+              barriers += foldedBarriers;
+              for (size_t index = drawIndex; index < runEnd; index++) {
+                const auto &draw = packet.operations[index];
+                for (const auto &sampled : draw.textureOverrides)
+                  pendingReads.insert(sampled.second);
+                for (const auto &target : draw.colorTargets)
+                  pendingWrites.insert(target.second);
+                if (draw.depthResource >= 0)
+                  pendingWrites.insert((uint32_t)draw.depthResource);
+                if (draw.stencilResource >= 0)
+                  pendingWrites.insert((uint32_t)draw.stencilResource);
+              }
+              g_irisMetal4PipelineDrawAttemptCount.fetch_add(
+                  runEnd - drawIndex, std::memory_order_relaxed);
+              profileDrawOperations += runEnd - drawIndex;
+              profileDrawPasses++;
+              operationIndex = runEnd - 1;
+              continue;
+            }
+          }
+          if (operation.kind == 1) {
+            if (operation.hasRegion) {
+              status = 0;
+              reason = kIrisGraphReasonClearRegionUnsupported;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"partial graph clear unsupported"
+                           userInfo:nil];
+            }
+            id<MTLTexture> target = textureFor(operation.firstResource);
+            bool color = operation.aspect == 0;
+            bool depth = operation.aspect == 1 || operation.aspect == 3;
+            bool stencil = operation.aspect == 2 || operation.aspect == 3;
+            if (!target) {
+              status = 0;
+              reason = kIrisGraphReasonClearTextureMissing;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph clear texture missing"
+                           userInfo:nil];
+            }
+            if (color &&
+                !iris_graph_frame_color_format(target.pixelFormat)) {
+              status = 0;
+              reason = kIrisGraphReasonClearColorFormatUnsupported;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph color clear format unsupported"
+                           userInfo:nil];
+            }
+            if (depth &&
+                !iris_graph_frame_depth_format(target.pixelFormat)) {
+              status = 0;
+              reason = kIrisGraphReasonClearDepthFormatUnsupported;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph depth clear format unsupported"
+                           userInfo:nil];
+            }
+            if (stencil &&
+                !iris_graph_frame_stencil_format(target.pixelFormat)) {
+              status = 0;
+              reason = kIrisGraphReasonClearStencilFormatUnsupported;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph stencil clear format unsupported"
+                           userInfo:nil];
+            }
+            MTL4RenderPassDescriptor *pass =
+                [[MTL4RenderPassDescriptor alloc] init];
+            pass.defaultRasterSampleCount = target.sampleCount;
+            pass.renderTargetWidth = target.width;
+            pass.renderTargetHeight = target.height;
+            if (color) {
+              MTLRenderPassColorAttachmentDescriptor *attachment =
+                  pass.colorAttachments[0];
+              attachment.texture = target;
+              attachment.loadAction = MTLLoadActionClear;
+              attachment.storeAction = MTLStoreActionStore;
+              attachment.clearColor = MTLClearColorMake(
+                  iris_graph_frame_clear_component(operation.valueKind,
+                      operation.rawValues[0]),
+                  iris_graph_frame_clear_component(operation.valueKind,
+                      operation.rawValues[1]),
+                  iris_graph_frame_clear_component(operation.valueKind,
+                      operation.rawValues[2]),
+                  iris_graph_frame_clear_component(operation.valueKind,
+                      operation.rawValues[3]));
+            }
+            if (depth) {
+              pass.depthAttachment.texture = target;
+              pass.depthAttachment.loadAction = MTLLoadActionClear;
+              pass.depthAttachment.storeAction = MTLStoreActionStore;
+              pass.depthAttachment.clearDepth =
+                  iris_graph_frame_clear_component(operation.valueKind,
+                      operation.rawValues[0]);
+            }
+            if (stencil) {
+              pass.stencilAttachment.texture = target;
+              pass.stencilAttachment.loadAction = MTLLoadActionClear;
+              pass.stencilAttachment.storeAction = MTLStoreActionStore;
+              size_t index = operation.aspect == 3 ? 1 : 0;
+              pass.stencilAttachment.clearStencil =
+                  (uint32_t)operation.rawValues[index];
+            }
+            id<MTL4RenderCommandEncoder> encoder =
+                [commandBuffer renderCommandEncoderWithDescriptor:pass];
+            encodedObjects.push_back(pass);
+            if (!encoder)
+              @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                             reason:@"clear encoder unavailable"
+                                           userInfo:nil];
+            bool applyBarrier = writeNeedsBarrier(
+                operation.firstResource);
+            if (applyBarrier) {
+              [encoder barrierAfterQueueStages:graphStages
+                                  beforeStages:graphStages
+                             visibilityOptions:MTL4VisibilityOptionDevice];
+              profileBarrierCalls++;
+              consumeBarrier();
+            }
+            [encoder endEncoding];
+            pendingWrites.insert(operation.firstResource);
+            clears++;
+          } else if (operation.kind == 2) {
+            explicitBarrierPending = true;
+            barriers++;
+          } else if (operation.kind == 3) {
+            id<MTLTexture> source = textureFor(operation.firstResource);
+            id<MTLTexture> destination =
+                textureFor(operation.secondResource);
+            NSUInteger sourceWidth = source &&
+                operation.sourceLevel < source.mipmapLevelCount
+                    ? std::max((NSUInteger)1,
+                        source.width >> operation.sourceLevel) : 0;
+            NSUInteger sourceHeight = source &&
+                operation.sourceLevel < source.mipmapLevelCount
+                    ? std::max((NSUInteger)1,
+                        source.height >> operation.sourceLevel) : 0;
+            NSUInteger destinationWidth = destination &&
+                operation.destinationLevel < destination.mipmapLevelCount
+                    ? std::max((NSUInteger)1,
+                        destination.width >> operation.destinationLevel) : 0;
+            NSUInteger destinationHeight = destination &&
+                operation.destinationLevel < destination.mipmapLevelCount
+                    ? std::max((NSUInteger)1,
+                        destination.height >> operation.destinationLevel) : 0;
+            if (!source || !destination) {
+              status = 0;
+              reason = kIrisGraphReasonCopyTextureMissing;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph texture copy target missing"
+                           userInfo:nil];
+            }
+            if (source.pixelFormat != destination.pixelFormat) {
+              status = 0;
+              reason = kIrisGraphReasonCopyFormatMismatch;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph texture copy format mismatch"
+                           userInfo:nil];
+            }
+            if (source.sampleCount != 1 || destination.sampleCount != 1) {
+              status = 0;
+              reason = kIrisGraphReasonCopyMultisampleUnsupported;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph texture copy multisample unsupported"
+                           userInfo:nil];
+            }
+            if (operation.sourceLevel >= source.mipmapLevelCount ||
+                operation.destinationLevel >=
+                    destination.mipmapLevelCount) {
+              status = 0;
+              reason = kIrisGraphReasonCopyMipLevelUnsupported;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph texture copy mip level unsupported"
+                           userInfo:nil];
+            }
+            if ((uint64_t)operation.x + operation.width > sourceWidth ||
+                (uint64_t)operation.y + operation.height > sourceHeight ||
+                (uint64_t)operation.destinationX + operation.width >
+                    destinationWidth ||
+                (uint64_t)operation.destinationY + operation.height >
+                    destinationHeight) {
+              status = 0;
+              reason = kIrisGraphReasonCopyBoundsUnsupported;
+              dbg("WARN: Iris graph texture copy bounds rejected "
+                  "operation=%zu src=%lux%lu@%u origin=%d,%d "
+                  "dst=%lux%lu@%u origin=%d,%d size=%dx%d\n",
+                  operationIndex, (unsigned long)sourceWidth,
+                  (unsigned long)sourceHeight, operation.sourceLevel,
+                  operation.x, operation.y,
+                  (unsigned long)destinationWidth,
+                  (unsigned long)destinationHeight,
+                  operation.destinationLevel, operation.destinationX,
+                  operation.destinationY, operation.width,
+                  operation.height);
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph texture copy bounds unsupported"
+                           userInfo:nil];
+            }
+            id<MTL4ComputeCommandEncoder> encoder =
+                [commandBuffer computeCommandEncoder];
+            if (!encoder)
+              @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                             reason:@"copy encoder unavailable"
+                                           userInfo:nil];
+            bool applyBarrier = readNeedsBarrier(
+                operation.firstResource) || writeNeedsBarrier(
+                    operation.secondResource);
+            if (applyBarrier) {
+              [encoder barrierAfterQueueStages:graphStages
+                                  beforeStages:graphStages
+                             visibilityOptions:MTL4VisibilityOptionDevice];
+              profileBarrierCalls++;
+              consumeBarrier();
+            }
+            [encoder copyFromTexture:source
+                         sourceSlice:0
+                         sourceLevel:operation.sourceLevel
+                        sourceOrigin:MTLOriginMake(operation.x, operation.y, 0)
+                          sourceSize:MTLSizeMake(operation.width,
+                                               operation.height, 1)
+                           toTexture:destination
+                    destinationSlice:0
+                    destinationLevel:operation.destinationLevel
+                   destinationOrigin:MTLOriginMake(operation.destinationX,
+                                                   operation.destinationY, 0)];
+            [encoder endEncoding];
+            pendingReads.insert(operation.firstResource);
+            pendingWrites.insert(operation.secondResource);
+            transfers++;
+          } else if (operation.kind == 4) {
+            id<MTLTexture> texture = textureFor(operation.firstResource);
+            if (!texture) {
+              status = 0;
+              reason = kIrisGraphReasonMipmapTextureMissing;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph mipmap texture missing"
+                           userInfo:nil];
+            }
+            if (texture.mipmapLevelCount <= 1) {
+              status = 0;
+              reason = kIrisGraphReasonMipmapLevelsUnavailable;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph mipmap levels unavailable"
+                           userInfo:nil];
+            }
+            if (texture.sampleCount != 1) {
+              status = 0;
+              reason = kIrisGraphReasonMipmapMultisampleUnsupported;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph mipmap multisample unsupported"
+                           userInfo:nil];
+            }
+            id<MTL4ComputeCommandEncoder> encoder =
+                [commandBuffer computeCommandEncoder];
+            if (!encoder)
+              @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                             reason:@"mipmap encoder unavailable"
+                                           userInfo:nil];
+            bool applyBarrier = readNeedsBarrier(operation.firstResource) ||
+                writeNeedsBarrier(operation.firstResource);
+            if (applyBarrier) {
+              [encoder barrierAfterQueueStages:graphStages
+                                  beforeStages:MTLStageBlit
+                             visibilityOptions:MTL4VisibilityOptionDevice];
+              profileBarrierCalls++;
+              consumeBarrier();
+            }
+            [encoder generateMipmapsForTexture:texture];
+            [encoder endEncoding];
+            pendingWrites.insert(operation.firstResource);
+            transfers++;
+          } else {
+            size_t runEnd = operationIndex + 1;
+            while (runEnd < packet.operations.size() &&
+                   packet.operations[runEnd].kind == 5 &&
+                   iris_graph_prepared_draw_can_share_pass(
+                       preparedDraws[operationIndex],
+                       preparedDraws[runEnd])) {
+              runEnd++;
+            }
+            bool applyBarrier = explicitBarrierPending;
+            for (size_t drawIndex = operationIndex;
+                 !applyBarrier && drawIndex < runEnd; drawIndex++) {
+              const auto &drawOperation = packet.operations[drawIndex];
+              for (const auto &target : drawOperation.colorTargets) {
+                if (writeNeedsBarrier(target.second)) {
+                  applyBarrier = true;
+                  break;
+                }
+              }
+              if (!applyBarrier && drawOperation.depthResource >= 0) {
+                applyBarrier = writeNeedsBarrier(
+                    (uint32_t)drawOperation.depthResource);
+              }
+              if (!applyBarrier && drawOperation.stencilResource >= 0) {
+                applyBarrier = writeNeedsBarrier(
+                    (uint32_t)drawOperation.stencilResource);
+              }
+              if (!applyBarrier) {
+                for (const auto &sampled :
+                     drawOperation.textureOverrides) {
+                  if (readNeedsBarrier(sampled.second)) {
+                    applyBarrier = true;
+                    break;
+                  }
+                }
+              }
+            }
+            int outcome = iris_graph_encode_prepared_draw_run(
+                preparedDraws, operationIndex, runEnd, commandBuffer,
+                applyBarrier, graphStages, operation, {}, reason);
+            if (outcome <= 0) {
+              dbg("WARN: Iris graph draw encoding rejected operation=%zu "
+                  "runEnd=%zu reason=%lld pipeline=%.12s\n",
+                  operationIndex, runEnd, (long long)reason,
+                  operation.pipelineKey.c_str());
+              status = outcome == 0 ? 0 : -1;
+              if (reason == 0)
+                reason = outcome == 0 ? 6 : 5;
+              @throw [NSException
+                  exceptionWithName:outcome == 0
+                      ? @"MetalRenderGraphUnsupported"
+                      : @"MetalRenderGraphSetup"
+                             reason:@"graph draw encoding failed"
+                           userInfo:nil];
+            }
+            if (applyBarrier)
+              consumeBarrier();
+            if (applyBarrier)
+              profileBarrierCalls++;
+            for (size_t drawIndex = operationIndex;
+                 drawIndex < runEnd; drawIndex++) {
+              const auto &drawOperation = packet.operations[drawIndex];
+              for (const auto &sampled : drawOperation.textureOverrides)
+                pendingReads.insert(sampled.second);
+              for (const auto &target : drawOperation.colorTargets)
+                pendingWrites.insert(target.second);
+              if (drawOperation.depthResource >= 0) {
+                pendingWrites.insert(
+                    (uint32_t)drawOperation.depthResource);
+              }
+              if (drawOperation.stencilResource >= 0) {
+                pendingWrites.insert(
+                    (uint32_t)drawOperation.stencilResource);
+              }
+            }
+            g_irisMetal4PipelineDrawAttemptCount.fetch_add(
+                runEnd - operationIndex, std::memory_order_relaxed);
+            profileDrawOperations += runEnd - operationIndex;
+            profileDrawPasses++;
+            operationIndex = runEnd - 1;
+          }
+        }
+
+        if (readback) {
+          id<MTLTexture> texture =
+              textureFor((uint32_t)packet.readbackResourceId);
+          id<MTL4ComputeCommandEncoder> encoder =
+              [commandBuffer computeCommandEncoder];
+          if (!encoder)
+            @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                           reason:@"readback encoder unavailable"
+                                         userInfo:nil];
+          // QA readback is an artificial consumer outside the graph packet.
+          // Make every prior render/blit write visible before hashing it.
+          [encoder barrierAfterQueueStages:graphStages
+                              beforeStages:MTLStageBlit
+                         visibilityOptions:MTL4VisibilityOptionDevice];
+          profileBarrierCalls++;
+          [encoder copyFromTexture:texture
+                       sourceSlice:0
+                       sourceLevel:(NSUInteger)diagnosticReadbackMipLevel
+                      sourceOrigin:MTLOriginMake(0, 0, 0)
+                        sourceSize:MTLSizeMake(readbackWidth,
+                                             readbackHeight, 1)
+                          toBuffer:readback
+                 destinationOffset:0
+            destinationBytesPerRow:readbackRowBytes
+          destinationBytesPerImage:0];
+          [encoder endEncoding];
+        } else if (presentationTexture) {
+          id<MTLTexture> source = textureFor(
+              (uint32_t)packet.presentationResourceId);
+          id<MTL4ComputeCommandEncoder> encoder =
+              [commandBuffer computeCommandEncoder];
+          if (!source || !encoder)
+            @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                           reason:@"presentation encoder unavailable"
+                                         userInfo:nil];
+          // Presentation is an external consumer of the complete graph. Make
+          // every prior render/blit write visible, then copy into the
+          // IOSurface in the same GPU submission without a CPU readback.
+          [encoder barrierAfterQueueStages:graphStages
+                              beforeStages:MTLStageBlit
+                         visibilityOptions:MTL4VisibilityOptionDevice];
+          profileBarrierCalls++;
+          [encoder copyFromTexture:source
+                       sourceSlice:0
+                       sourceLevel:0
+                      sourceOrigin:MTLOriginMake(0, 0, 0)
+                        sourceSize:MTLSizeMake(presentationWidth,
+                                             presentationHeight, 1)
+                         toTexture:presentationTexture
+                  destinationSlice:0
+                  destinationLevel:0
+                 destinationOrigin:MTLOriginMake(0, 0, 0)];
+          [encoder endEncoding];
+        }
+        [commandBuffer endCommandBuffer];
+        profileEncoded = CACurrentMediaTime();
+
+        submissionState = std::make_shared<Metal4ProbeState>(allocator);
+        if (presentationTexture) {
+          options = iris_metal4_graph_timing_options();
+          presentationToken =
+              g_irisMetal4CutoverSurfaceSequence.fetch_add(
+                  1, std::memory_order_relaxed);
+          if (presentationToken == 0) {
+            presentationToken =
+                g_irisMetal4CutoverSurfaceSequence.fetch_add(
+                    1, std::memory_order_relaxed);
+          }
+          if (g_irisMetal4GraphPresentations.capacity() <
+              kIrisMetal4GraphPresentationLimit) {
+            g_irisMetal4GraphPresentations.reserve(
+                kIrisMetal4GraphPresentationLimit);
+          }
+          g_irisMetal4GraphPresentations.push_back({presentationToken,
+              presentationWidth, presentationHeight, presentationSurface,
+              submissionState});
+          presentationSurface = nullptr;
+          presentationQueued = true;
+          submissionCommitted = metal4_commit_without_wait(
+              (id<MTL4CommandQueue>)g_metal4CommandQueue,
+              commandBuffer, submissionState, options);
+          if (options) {
+            [options release];
+            options = nil;
+          }
+          if (!submissionCommitted) {
+            IrisMetal4GraphPresentation &queued =
+                g_irisMetal4GraphPresentations.back();
+            presentationSurface = queued.surface;
+            queued.surface = nullptr;
+            g_irisMetal4GraphPresentations.pop_back();
+            presentationQueued = false;
+            status = -1;
+            reason = 5;
+          } else {
+            outputHash = presentationToken;
+            status = 1;
+            reason = 0;
+          }
+        } else {
+          submissionCommitted = true;
+          bool completed = metal4_commit_and_wait(
+              (id<MTL4CommandQueue>)g_metal4CommandQueue,
+              commandBuffer, submissionState, 5'000);
+          if (!completed ||
+              !submissionState->completed.load(std::memory_order_acquire) ||
+              !submissionState->succeeded.load(std::memory_order_acquire)) {
+            status = -1;
+            reason = 4;
+          } else {
+            if (readback) {
+              outputHash = iris_graph_frame_fnv1a64(
+                  (const uint8_t *)readback.contents, readbackLength);
+              id<MTLTexture> texture =
+                  textureFor((uint32_t)packet.readbackResourceId);
+              if (!texture || readbackRowBytes != readbackWidth * 4 ||
+                  !iris_graph_readback_rgba8(texture,
+                      (const uint8_t *)readback.contents, readbackLength,
+                      readbackWidth, readbackHeight,
+                      g_irisMetal4LastGraphFrameRgba8))
+                graphReadbackCaptureFailed = true;
+            }
+            if (!graphReadbackCaptureFailed) {
+              status = 1;
+              reason = 0;
+            } else {
+              status = -1;
+              reason = 5;
+            }
+          }
+        }
+      } @catch (NSException *exception) {
+        if (![exception.name isEqualToString:
+                @"MetalRenderGraphUnsupported"]) {
+          dbg("WARN: Iris graph frame raised %s: %s\n",
+              exception.name.UTF8String ?: "NSException",
+              exception.reason.UTF8String ?: "unknown reason");
+          if (reason == 0)
+            reason = 5;
+        }
+      }
+      profileCommitted = CACurrentMediaTime();
+      // Every prepared draw retained the frame input objects it references.
+      // Drop the table's construction references before normal submission
+      // retirement so each allocation has one clear owner thereafter.
+      releaseGraphInputs();
+      if (presentationQueued && !submissionCommitted) {
+        auto queued = std::find_if(g_irisMetal4GraphPresentations.begin(),
+            g_irisMetal4GraphPresentations.end(),
+            [&](const IrisMetal4GraphPresentation &candidate) {
+              return candidate.token == presentationToken;
+            });
+        if (queued != g_irisMetal4GraphPresentations.end()) {
+          if (queued->surface)
+            CFRelease(queued->surface);
+          g_irisMetal4GraphPresentations.erase(queued);
+        }
+        presentationQueued = false;
+      }
+      if (presentationSurface) {
+        CFRelease(presentationSurface);
+        presentationSurface = nullptr;
+      }
+      if (presentationTexture && !presentationTextureRetained) {
+        [presentationTexture release];
+        presentationTexture = nil;
+      }
+      bool retired = submissionCommitted && iris_graph_retire_submission(
+          preparedDraws, retained, frameArgumentArena, encodedObjects,
+          readback, residency, allocator, commandBuffer, options,
+          submissionState);
+      bool safeToRelease = retired || !submissionCommitted ||
+          iris_metal4_submission_completed(submissionState);
+      if (!safeToRelease) {
+        safeToRelease = iris_metal4_wait_for_committed_submission(
+            submissionState, 5'000);
+        if (!safeToRelease) {
+          // Never release objects still referenced by the GPU. This branch is
+          // an allocation-failure quarantine, not a steady-state queue: the
+          // bounded preflight above makes it unreachable during normal play.
+          dbg("ERROR: quarantining an unretired Iris graph submission after "
+              "a shared-event timeout\n");
+          status = -1;
+          reason = 5;
+        }
+      }
+      if (safeToRelease) {
+        if (options) [options release];
+        if (readback) [readback release];
+        if (commandBuffer) [commandBuffer release];
+        if (allocator) [allocator release];
+        if (residency) {
+          [residency endResidency];
+          [residency release];
+        }
+        if (!retired)
+          releaseEncodedObjects();
+        releasePreparedDraws();
+        releaseRetained();
+      } else {
+        // Raw Objective-C pointers in these containers do not release on
+        // vector destruction. Deliberately abandon them so an in-flight GPU
+        // submission cannot observe freed resources.
+        options = nil;
+        readback = nil;
+        commandBuffer = nil;
+        allocator = nil;
+        residency = nil;
+        encodedObjects.clear();
+        preparedDraws.clear();
+        retained.clear();
+        frameArgumentArena.abandon();
+      }
+      CFTimeInterval profileRetired = CACurrentMediaTime();
+      if (requirePresentation && status == 1) {
+        iris_metal4_record_graph_cpu_profile(profileStarted, profileParsed,
+            profileInputsReady, profileDrawsReady,
+            profilePresentationReady, profileResidencyCreated,
+            profileResidencyPopulated, profileResidencyCommitted,
+            profileSetupReady, profileEncoded, profileCommitted,
+            profileRetired, profileResidencyRawAllocations,
+            profileResidencyUniqueAllocations, profileDrawOperations,
+            profileDrawPasses, profileBarrierCalls);
+      }
+      iris_metal4_finish_input_surface_leases(inputSurfaceLeases,
+          submissionCommitted ? submissionState : nullptr);
+      return iris_graph_frame_result(env, status,
+          status == 1 ? (jlong)packet.operations.size() : 0,
+          status == 1 ? clears : 0,
+          status == 1 ? transfers : 0,
+          status == 1 ? barriers : 0,
+          status == 1 ? (jlong)outputHash : 0, reason);
+    }
+    return iris_graph_frame_result(env, 0, 0, 0, 0, 0, 0, 1);
+  }
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nRunIrisMetal4GraphFrame(
+    JNIEnv *env, jclass, jbyteArray packetValue,
+    jint diagnosticReadbackMipLevel) {
+  return run_iris_metal4_graph_frame(env, packetValue,
+      0, diagnosticReadbackMipLevel, false, false);
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSubmitIrisMetal4GraphFrame(
+    JNIEnv *env, jclass, jbyteArray packetValue) {
+  return run_iris_metal4_graph_frame(env, packetValue, 0, 0, true, false);
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nSubmitIrisMetal4GraphFrameDirect(
+    JNIEnv *env, jclass, jobject packetValue, jint packetLength) {
+  return run_iris_metal4_graph_frame(env, packetValue, packetLength, 0,
+      true, true);
+}
+
+static jlongArray iris_graph_presentation_result(
+    JNIEnv *env, jlong status, jlong token, jlong width, jlong height,
+    jlong reason) {
+  jlong values[] = {status, token, width, height, reason};
+  jlongArray result = env->NewLongArray(5);
+  if (!result)
+    return nullptr;
+  env->SetLongArrayRegion(result, 0, 5, values);
+  return env->ExceptionCheck() ? nullptr : result;
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4GraphPresentationStatus(
+    JNIEnv *env, jclass, jlong tokenValue) {
+  std::unique_lock<std::mutex> executionLock(g_irisMetal4ExecutionMutex,
+      std::try_to_lock);
+  if (!executionLock.owns_lock()) {
+    // The submission worker owns the graph queue while it encodes the next
+    // frame. Status polling is speculative: report PENDING without dimensions
+    // so the render thread can reuse the last completed IOSurface instead of
+    // waiting behind a full native submit.
+    return iris_graph_presentation_result(env, 0, tokenValue, 0, 0, 0);
+  }
+  @autoreleasepool {
+    if (tokenValue <= 0)
+      return iris_graph_presentation_result(env, -1, 0, 0, 0, 2);
+    if (@available(macOS 26.0, *)) {
+      uint64_t token = (uint64_t)tokenValue;
+      auto found = std::find_if(g_irisMetal4GraphPresentations.begin(),
+          g_irisMetal4GraphPresentations.end(),
+          [&](const IrisMetal4GraphPresentation &candidate) {
+            return candidate.token == token;
+          });
+      if (found == g_irisMetal4GraphPresentations.end())
+        return iris_graph_presentation_result(env, -1, tokenValue, 0, 0, 1);
+      bool completed = iris_metal4_submission_completed(
+          found->feedbackState);
+      if (!completed) {
+        return iris_graph_presentation_result(env, 0, tokenValue,
+            found->width, found->height, 0);
+      }
+      bool succeeded = found->feedbackState &&
+          found->feedbackState->succeeded.load(std::memory_order_acquire);
+      return iris_graph_presentation_result(env, succeeded ? 1 : -1,
+          tokenValue, found->width, found->height, succeeded ? 0 : 3);
+    }
+    return iris_graph_presentation_result(env, -1, tokenValue, 0, 0, 4);
+  }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nPromoteIrisMetal4GraphPresentation(
+    JNIEnv *, jclass, jlong tokenValue, jint width, jint height) {
+  std::unique_lock<std::mutex> executionLock(g_irisMetal4ExecutionMutex,
+      std::try_to_lock);
+  if (!executionLock.owns_lock()) {
+    // Promotion is retried on the next frame. Keep the completed token in its
+    // queue rather than stalling the render thread behind worker submission.
+    return JNI_FALSE;
+  }
+  @autoreleasepool {
+    if (tokenValue <= 0 || width <= 0 || height <= 0 ||
+        g_irisMetal4PendingCutoverSurface) {
+      return JNI_FALSE;
+    }
+    if (@available(macOS 26.0, *)) {
+      uint64_t token = (uint64_t)tokenValue;
+      auto found = std::find_if(g_irisMetal4GraphPresentations.begin(),
+          g_irisMetal4GraphPresentations.end(),
+          [&](const IrisMetal4GraphPresentation &candidate) {
+            return candidate.token == token;
+          });
+      if (found == g_irisMetal4GraphPresentations.end() ||
+          found->width != (uint32_t)width ||
+          found->height != (uint32_t)height ||
+          !iris_metal4_submission_completed(found->feedbackState) ||
+          !found->feedbackState ||
+          !found->feedbackState->succeeded.load(std::memory_order_acquire) ||
+          !found->surface) {
+        return JNI_FALSE;
+      }
+      g_irisMetal4PendingCutoverSurface = found->surface;
+      g_irisMetal4PendingCutoverWidth = found->width;
+      g_irisMetal4PendingCutoverHeight = found->height;
+      found->surface = nullptr;
+      g_irisMetal4GraphPresentations.erase(found);
+      return JNI_TRUE;
+    }
+    return JNI_FALSE;
+  }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDiscardIrisMetal4GraphPresentation(
+    JNIEnv *, jclass, jlong tokenValue) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  if (tokenValue <= 0)
+    return JNI_FALSE;
+  uint64_t token = (uint64_t)tokenValue;
+  auto found = std::find_if(g_irisMetal4GraphPresentations.begin(),
+      g_irisMetal4GraphPresentations.end(),
+      [&](const IrisMetal4GraphPresentation &candidate) {
+        return candidate.token == token;
+      });
+  if (found == g_irisMetal4GraphPresentations.end())
+    return JNI_FALSE;
+  if (found->surface)
+    CFRelease(found->surface);
+  g_irisMetal4GraphPresentations.erase(found);
+  return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4GraphTiming(
+    JNIEnv *env, jclass) {
+  jlong values[] = {
+      (jlong)g_irisMetal4GraphGpuSamples.load(std::memory_order_acquire),
+      (jlong)g_irisMetal4GraphLastGpuNs.load(std::memory_order_relaxed),
+      (jlong)g_irisMetal4GraphTotalGpuNs.load(std::memory_order_relaxed),
+      (jlong)g_irisMetal4GraphMaxGpuNs.load(std::memory_order_relaxed),
+      (jlong)g_irisMetal4GraphFeedbackErrors.load(
+          std::memory_order_relaxed),
+      (jlong)g_irisMetal4GraphCpuSamples.load(std::memory_order_acquire),
+      (jlong)g_irisMetal4GraphLastCpuNs.load(std::memory_order_relaxed),
+      (jlong)g_irisMetal4GraphTotalCpuNs.load(std::memory_order_relaxed),
+      (jlong)g_irisMetal4GraphMaxCpuNs.load(std::memory_order_relaxed),
+      (jlong)g_irisMetal4GraphLastQueueNs.load(std::memory_order_relaxed),
+      (jlong)g_irisMetal4GraphTotalQueueNs.load(std::memory_order_relaxed),
+      (jlong)g_irisMetal4GraphMaxQueueNs.load(std::memory_order_relaxed)};
+  jlongArray result = env->NewLongArray(12);
+  if (!result)
+    return nullptr;
+  env->SetLongArrayRegion(result, 0, 12, values);
+  return env->ExceptionCheck() ? nullptr : result;
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4GraphCpuProfile(
+    JNIEnv *env, jclass) {
+  IrisMetal4GraphCpuProfile profile;
+  {
+    std::lock_guard<std::mutex> lock(g_irisMetal4GraphCpuProfileMutex);
+    profile = g_irisMetal4GraphCpuProfile;
+  }
+  jlong values[] = {
+      (jlong)profile.samples,
+      (jlong)profile.parseNs,
+      (jlong)profile.inputsNs,
+      (jlong)profile.drawsNs,
+      (jlong)profile.setupNs,
+      (jlong)profile.presentationNs,
+      (jlong)profile.residencyCreateNs,
+      (jlong)profile.residencyPopulateNs,
+      (jlong)profile.residencyCommitNs,
+      (jlong)profile.commandNs,
+      (jlong)profile.encodeNs,
+      (jlong)profile.commitNs,
+      (jlong)profile.retireNs,
+      (jlong)profile.residencyRawAllocations,
+      (jlong)profile.residencyUniqueAllocations,
+      (jlong)profile.drawOperations,
+      (jlong)profile.drawPasses,
+      (jlong)profile.barrierCalls,
+  };
+  jlongArray result = env->NewLongArray(18);
+  if (!result)
+    return nullptr;
+  env->SetLongArrayRegion(result, 0, 18, values);
+  return env->ExceptionCheck() ? nullptr : result;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nResetIrisMetal4GraphPerformanceSamples(
+    JNIEnv *, jclass) {
+  std::lock_guard<std::mutex> lock(g_irisMetal4GraphPerformanceMutex);
+  g_irisMetal4GraphPerformanceSampling.store(false,
+                                              std::memory_order_release);
+  g_irisMetal4GraphPerformanceSamples.clear();
+  g_irisMetal4GraphPerformanceDropped = 0;
+  try {
+    g_irisMetal4GraphPerformanceSamples.reserve(
+        kIrisMetal4GraphPerformanceSampleLimit);
+  } catch (...) {
+    return JNI_FALSE;
+  }
+  g_irisMetal4GraphPerformanceSampling.store(true,
+                                              std::memory_order_release);
+  return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDrainIrisMetal4GraphPerformanceSamples(
+    JNIEnv *env, jclass) {
+  std::vector<uint64_t> samples;
+  uint64_t dropped = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_irisMetal4GraphPerformanceMutex);
+    samples.swap(g_irisMetal4GraphPerformanceSamples);
+    dropped = g_irisMetal4GraphPerformanceDropped;
+    g_irisMetal4GraphPerformanceDropped = 0;
+  }
+  if (samples.size() >= (size_t)std::numeric_limits<jsize>::max())
+    return nullptr;
+  jsize length = (jsize)samples.size() + 1;
+  jlongArray result = env->NewLongArray(length);
+  if (!result)
+    return nullptr;
+  jlong droppedValue = (jlong)dropped;
+  env->SetLongArrayRegion(result, 0, 1, &droppedValue);
+  if (env->ExceptionCheck() || samples.empty())
+    return env->ExceptionCheck() ? nullptr : result;
+  std::vector<jlong> javaSamples;
+  try {
+    javaSamples.reserve(samples.size());
+    for (uint64_t sample : samples)
+      javaSamples.push_back((jlong)sample);
+  } catch (...) {
+    return nullptr;
+  }
+  env->SetLongArrayRegion(result, 1, (jsize)javaSamples.size(),
+                          javaSamples.data());
+  return env->ExceptionCheck() ? nullptr : result;
+}
+
+static MTLVertexFormat iris_metal_vertex_format(const std::string &name) {
+#define IRIS_VERTEX(n, value)                                                  \
+  if (name == n)                                                              \
+    return value
+  IRIS_VERTEX("r8-unorm", MTLVertexFormatUCharNormalized);
+  IRIS_VERTEX("rg8-unorm", MTLVertexFormatUChar2Normalized);
+  IRIS_VERTEX("rgb8-unorm", MTLVertexFormatUChar3Normalized);
+  IRIS_VERTEX("rgba8-unorm", MTLVertexFormatUChar4Normalized);
+  IRIS_VERTEX("r8-snorm", MTLVertexFormatCharNormalized);
+  IRIS_VERTEX("rg8-snorm", MTLVertexFormatChar2Normalized);
+  IRIS_VERTEX("rgb8-snorm", MTLVertexFormatChar3Normalized);
+  IRIS_VERTEX("rgba8-snorm", MTLVertexFormatChar4Normalized);
+  IRIS_VERTEX("r8-uint", MTLVertexFormatUChar);
+  IRIS_VERTEX("rg8-uint", MTLVertexFormatUChar2);
+  IRIS_VERTEX("rgb8-uint", MTLVertexFormatUChar3);
+  IRIS_VERTEX("rgba8-uint", MTLVertexFormatUChar4);
+  IRIS_VERTEX("r8-sint", MTLVertexFormatChar);
+  IRIS_VERTEX("rg8-sint", MTLVertexFormatChar2);
+  IRIS_VERTEX("rgb8-sint", MTLVertexFormatChar3);
+  IRIS_VERTEX("rgba8-sint", MTLVertexFormatChar4);
+  IRIS_VERTEX("r16-unorm", MTLVertexFormatUShortNormalized);
+  IRIS_VERTEX("rg16-unorm", MTLVertexFormatUShort2Normalized);
+  IRIS_VERTEX("rgb16-unorm", MTLVertexFormatUShort3Normalized);
+  IRIS_VERTEX("rgba16-unorm", MTLVertexFormatUShort4Normalized);
+  IRIS_VERTEX("r16-snorm", MTLVertexFormatShortNormalized);
+  IRIS_VERTEX("rg16-snorm", MTLVertexFormatShort2Normalized);
+  IRIS_VERTEX("rgb16-snorm", MTLVertexFormatShort3Normalized);
+  IRIS_VERTEX("rgba16-snorm", MTLVertexFormatShort4Normalized);
+  IRIS_VERTEX("r16-uint", MTLVertexFormatUShort);
+  IRIS_VERTEX("rg16-uint", MTLVertexFormatUShort2);
+  IRIS_VERTEX("rgb16-uint", MTLVertexFormatUShort3);
+  IRIS_VERTEX("rgba16-uint", MTLVertexFormatUShort4);
+  IRIS_VERTEX("r16-sint", MTLVertexFormatShort);
+  IRIS_VERTEX("rg16-sint", MTLVertexFormatShort2);
+  IRIS_VERTEX("rgb16-sint", MTLVertexFormatShort3);
+  IRIS_VERTEX("rgba16-sint", MTLVertexFormatShort4);
+  IRIS_VERTEX("r16-float", MTLVertexFormatHalf);
+  IRIS_VERTEX("rg16-float", MTLVertexFormatHalf2);
+  IRIS_VERTEX("rgb16-float", MTLVertexFormatHalf3);
+  IRIS_VERTEX("rgba16-float", MTLVertexFormatHalf4);
+  IRIS_VERTEX("r32-float", MTLVertexFormatFloat);
+  IRIS_VERTEX("rg32-float", MTLVertexFormatFloat2);
+  IRIS_VERTEX("rgb32-float", MTLVertexFormatFloat3);
+  IRIS_VERTEX("rgba32-float", MTLVertexFormatFloat4);
+  IRIS_VERTEX("r32-sint", MTLVertexFormatInt);
+  IRIS_VERTEX("rg32-sint", MTLVertexFormatInt2);
+  IRIS_VERTEX("rgb32-sint", MTLVertexFormatInt3);
+  IRIS_VERTEX("rgba32-sint", MTLVertexFormatInt4);
+  IRIS_VERTEX("r32-uint", MTLVertexFormatUInt);
+  IRIS_VERTEX("rg32-uint", MTLVertexFormatUInt2);
+  IRIS_VERTEX("rgb32-uint", MTLVertexFormatUInt3);
+  IRIS_VERTEX("rgba32-uint", MTLVertexFormatUInt4);
+  IRIS_VERTEX("rgb10a2-unorm", MTLVertexFormatUInt1010102Normalized);
+  IRIS_VERTEX("rg11b10-float", MTLVertexFormatFloatRG11B10);
+  IRIS_VERTEX("rgb9e5-float", MTLVertexFormatFloatRGB9E5);
+#undef IRIS_VERTEX
+  return MTLVertexFormatInvalid;
+}
+
+static MTLBlendFactor iris_metal_blend_factor(uint32_t value) {
+  switch (value) {
+  case 0: return MTLBlendFactorZero;
+  case 1: return MTLBlendFactorOne;
+  case 2: return MTLBlendFactorSourceColor;
+  case 3: return MTLBlendFactorOneMinusSourceColor;
+  case 4: return MTLBlendFactorDestinationColor;
+  case 5: return MTLBlendFactorOneMinusDestinationColor;
+  case 6: return MTLBlendFactorSourceAlpha;
+  case 7: return MTLBlendFactorOneMinusSourceAlpha;
+  case 8: return MTLBlendFactorDestinationAlpha;
+  case 9: return MTLBlendFactorOneMinusDestinationAlpha;
+  case 10: return MTLBlendFactorBlendColor;
+  case 11: return MTLBlendFactorOneMinusBlendColor;
+  case 12: return MTLBlendFactorBlendAlpha;
+  case 13: return MTLBlendFactorOneMinusBlendAlpha;
+  case 14: return MTLBlendFactorSourceAlphaSaturated;
+  case 15: return MTLBlendFactorSource1Color;
+  case 16: return MTLBlendFactorOneMinusSource1Color;
+  case 17: return MTLBlendFactorSource1Alpha;
+  case 18: return MTLBlendFactorOneMinusSource1Alpha;
+  default: return MTLBlendFactorZero;
+  }
+}
+
+static MTLCompareFunction iris_metal_compare(uint32_t value) {
+  static const MTLCompareFunction values[] = {
+      MTLCompareFunctionNever, MTLCompareFunctionLess,
+      MTLCompareFunctionEqual, MTLCompareFunctionLessEqual,
+      MTLCompareFunctionGreater, MTLCompareFunctionNotEqual,
+      MTLCompareFunctionGreaterEqual, MTLCompareFunctionAlways};
+  return value < 8 ? values[value] : MTLCompareFunctionAlways;
+}
+
+static MTLStencilOperation iris_metal_stencil(uint32_t value) {
+  static const MTLStencilOperation values[] = {
+      MTLStencilOperationKeep, MTLStencilOperationZero,
+      MTLStencilOperationReplace, MTLStencilOperationIncrementClamp,
+      MTLStencilOperationDecrementClamp, MTLStencilOperationInvert,
+      MTLStencilOperationIncrementWrap, MTLStencilOperationDecrementWrap};
+  return value < 8 ? values[value] : MTLStencilOperationKeep;
+}
+
+static MTLPrimitiveTopologyClass iris_metal_topology_class(uint32_t value) {
+  if (value == 0)
+    return MTLPrimitiveTopologyClassPoint;
+  if (value >= 1 && value <= 3)
+    return MTLPrimitiveTopologyClassLine;
+  if (value >= 4 && value <= 6)
+    return MTLPrimitiveTopologyClassTriangle;
+  return MTLPrimitiveTopologyClassUnspecified;
+}
+
+static bool iris_metal_primitive_type(uint32_t value,
+                                      MTLPrimitiveType &result) {
+  switch (value) {
+  case 0: result = MTLPrimitiveTypePoint; return true;
+  case 1: result = MTLPrimitiveTypeLine; return true;
+  // OpenGL line loops are expanded to a closed line strip in the immutable
+  // draw snapshot before this pipeline is used.
+  case 2: result = MTLPrimitiveTypeLineStrip; return true;
+  case 3: result = MTLPrimitiveTypeLineStrip; return true;
+  case 4: result = MTLPrimitiveTypeTriangle; return true;
+  case 5: result = MTLPrimitiveTypeTriangleStrip; return true;
+  // OpenGL triangle fans are expanded to an explicit triangle list.
+  case 6: result = MTLPrimitiveTypeTriangle; return true;
+  default: return false;
+  }
+}
+
+static uint32_t iris_metal_effective_packet_topology(uint32_t value) {
+  if (value == 2)
+    return 3;
+  if (value == 6)
+    return 4;
+  return value;
+}
+
+static bool iris_metal4_execution_state(
+    const IrisParsedPipelineDescriptor &parsed,
+    IrisMetal4PipelineEntry &entry) {
+  switch (parsed.cullMode) {
+  case 0: entry.cullMode = MTLCullModeNone; break;
+  case 1: entry.cullMode = MTLCullModeFront; break;
+  case 2: entry.cullMode = MTLCullModeBack; break;
+  default: return false;
+  }
+  // The fixed Iris translation profile asks SPIRV-Cross to flip vertex Y.
+  // That reflection reverses triangle winding, so compensate here to retain
+  // the original OpenGL front/back and culling semantics.
+  entry.frontFacingWinding = parsed.frontFace == 0
+      ? MTLWindingCounterClockwise : MTLWindingClockwise;
+  if (parsed.frontFill != parsed.backFill || parsed.frontFill > 1)
+    return false;
+  entry.triangleFillMode = parsed.frontFill == 0
+      ? MTLTriangleFillModeFill : MTLTriangleFillModeLines;
+  entry.depthClipMode = parsed.depthClip == 0
+      ? MTLDepthClipModeClip : MTLDepthClipModeClamp;
+  entry.sampleMask = (NSUInteger)parsed.sampleMask;
+  std::memcpy(&entry.depthBias, &parsed.depthBiasBits, sizeof(float));
+  std::memcpy(&entry.slopeScale, &parsed.slopeScaleBits, sizeof(float));
+  std::memcpy(&entry.depthBiasClamp, &parsed.depthBiasClampBits,
+              sizeof(float));
+  if (!std::isfinite(entry.depthBias) || !std::isfinite(entry.slopeScale) ||
+      !std::isfinite(entry.depthBiasClamp) || parsed.sampleCoverageEnabled)
+    return false;
+  entry.polygonOffsetMask = parsed.polygonOffsetMask;
+  entry.frontStencilReference = parsed.stencilFront.reference;
+  entry.backStencilReference = parsed.stencilBack.reference;
+  entry.topology = parsed.topology;
+  entry.restartMode = parsed.restartMode;
+  entry.patchControlPoints = parsed.patchControlPoints;
+  return parsed.topology != 7;
+}
+
+static MTLColorWriteMask iris_metal_write_mask(uint32_t mask) {
+  MTLColorWriteMask result = MTLColorWriteMaskNone;
+  if (mask & 1) result |= MTLColorWriteMaskRed;
+  if (mask & 2) result |= MTLColorWriteMaskGreen;
+  if (mask & 4) result |= MTLColorWriteMaskBlue;
+  if (mask & 8) result |= MTLColorWriteMaskAlpha;
+  return result;
+}
+
+static bool copy_bounded_jbyte_array(JNIEnv *env, jbyteArray input,
+                                     std::vector<jbyte> &output,
+                                     bool required) {
+  if (!input)
+    return !required;
+  jsize length = env->GetArrayLength(input);
+  if (length <= 0 || length > kIrisMslMaximumSourceBytes)
+    return false;
+  try {
+    output.resize((size_t)length);
+  } catch (...) {
+    return false;
+  }
+  env->GetByteArrayRegion(input, 0, length, output.data());
+  return !env->ExceptionCheck();
+}
+
+static id<MTLLibrary> iris_metal4_compile_library(
+    const std::vector<jbyte> &sourceBytes, NSString *name, NSError **error) {
+  if (@available(macOS 26.0, *)) {
+    if (!g_irisMetal4Compiler || sourceBytes.empty())
+      return nil;
+    NSString *source = [[NSString alloc]
+        initWithBytes:sourceBytes.data()
+               length:sourceBytes.size()
+             encoding:NSUTF8StringEncoding];
+    if (!source)
+      return nil;
+    MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+    options.languageVersion = MTLLanguageVersion3_0;
+    options.libraryType = MTLLibraryTypeExecutable;
+    options.preserveInvariance = YES;
+    options.mathMode = MTLMathModeFast;
+    MTL4LibraryDescriptor *descriptor =
+        [[MTL4LibraryDescriptor alloc] init];
+    descriptor.source = source;
+    descriptor.options = options;
+    descriptor.name = name;
+    id<MTLLibrary> library =
+        [(id<MTL4Compiler>)g_irisMetal4Compiler
+            newLibraryWithDescriptor:descriptor error:error];
+    [descriptor release];
+    [options release];
+    [source release];
+    return library;
+  }
+  return nil;
+}
+
+// Called under g_irisMetal4PipelineCacheMutex. The map owns one reference and
+// the returned value owns another, keeping caller cleanup uniform.
+static id<MTLLibrary> iris_metal4_cached_library(
+    const std::string &cacheKey, const std::vector<jbyte> &sourceBytes,
+    NSString *name, NSError **error) {
+  auto existing = g_irisMetal4Libraries.find(cacheKey);
+  if (existing != g_irisMetal4Libraries.end())
+    return [existing->second retain];
+  id<MTLLibrary> library =
+      iris_metal4_compile_library(sourceBytes, name, error);
+  if (!library)
+    return nil;
+  g_irisMetal4Libraries.emplace(cacheKey, library);
+  return [library retain];
+}
+
+static bool set_iris_function_constant(MTLFunctionConstantValues *values,
+                                       const IrisPipelineFunctionConstant &c) {
+  switch (c.type) {
+  case 0: {
+    bool value = c.bits != 0;
+    [values setConstantValue:&value type:MTLDataTypeBool atIndex:c.index];
+    return true;
+  }
+  case 1: {
+    int32_t value = (int32_t)c.bits;
+    [values setConstantValue:&value type:MTLDataTypeInt atIndex:c.index];
+    return true;
+  }
+  case 2: {
+    uint32_t value = (uint32_t)c.bits;
+    [values setConstantValue:&value type:MTLDataTypeUInt atIndex:c.index];
+    return true;
+  }
+  case 3: {
+    uint32_t bits = (uint32_t)c.bits;
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    [values setConstantValue:&value type:MTLDataTypeFloat atIndex:c.index];
+    return true;
+  }
+  case 4: {
+    int64_t value = (int64_t)c.bits;
+    [values setConstantValue:&value type:MTLDataTypeLong atIndex:c.index];
+    return true;
+  }
+  case 5: {
+    uint64_t value = c.bits;
+    [values setConstantValue:&value type:MTLDataTypeULong atIndex:c.index];
+    return true;
+  }
+  default:
+    // MSL has no double-precision scalar function constant.
+    return false;
+  }
+}
+
+static MTL4FunctionDescriptor *iris_metal4_function_descriptor(
+    id<MTLLibrary> library, uint32_t stage,
+    const std::vector<IrisPipelineFunctionConstant> &constants,
+    bool *supported) API_AVAILABLE(macos(26.0)) {
+  if (@available(macOS 26.0, *)) {
+    MTL4LibraryFunctionDescriptor *base =
+        [[MTL4LibraryFunctionDescriptor alloc] init];
+    base.name = @"main0";
+    base.library = library;
+    bool hasConstants = false;
+    for (const auto &constant : constants)
+      hasConstants |= constant.stage == stage;
+    if (!hasConstants)
+      return base;
+
+    MTLFunctionConstantValues *values =
+        [[MTLFunctionConstantValues alloc] init];
+    for (const auto &constant : constants) {
+      if (constant.stage == stage &&
+          !set_iris_function_constant(values, constant)) {
+        *supported = false;
+        [values release];
+        [base release];
+        return nil;
+      }
+    }
+    MTL4SpecializedFunctionDescriptor *specialized =
+        [[MTL4SpecializedFunctionDescriptor alloc] init];
+    specialized.functionDescriptor = base;
+    specialized.constantValues = values;
+    [values release];
+    [base release];
+    return specialized;
+  }
+  *supported = false;
+  return nil;
+}
+
+static id<MTLFunction> iris_metal_runtime_function(
+    id<MTLLibrary> library, uint32_t stage,
+    const std::vector<IrisPipelineFunctionConstant> &constants,
+    NSError **error, bool *supported) {
+  bool hasConstants = false;
+  for (const auto &constant : constants)
+    hasConstants |= constant.stage == stage;
+  if (!hasConstants)
+    return [library newFunctionWithName:@"main0"];
+  MTLFunctionConstantValues *values =
+      [[MTLFunctionConstantValues alloc] init];
+  for (const auto &constant : constants) {
+    if (constant.stage == stage &&
+        !set_iris_function_constant(values, constant)) {
+      *supported = false;
+      [values release];
+      return nil;
+    }
+  }
+  id<MTLFunction> function = [library newFunctionWithName:@"main0"
+                                          constantValues:values
+                                                   error:error];
+  [values release];
+  return function;
+}
+
+static id<MTLDepthStencilState> iris_metal_depth_stencil_state(
+    const IrisParsedPipelineDescriptor &parsed) {
+  MTLDepthStencilDescriptor *descriptor =
+      [[MTLDepthStencilDescriptor alloc] init];
+  descriptor.depthCompareFunction = parsed.depthTest
+      ? iris_metal_compare(parsed.depthCompare) : MTLCompareFunctionAlways;
+  descriptor.depthWriteEnabled = parsed.depthWrite;
+  if (parsed.stencilEnabled) {
+    auto makeFace = [](const IrisPipelineStencilFace &face) {
+      MTLStencilDescriptor *result = [[MTLStencilDescriptor alloc] init];
+      result.stencilCompareFunction = iris_metal_compare(face.compare);
+      result.stencilFailureOperation = iris_metal_stencil(face.stencilFail);
+      result.depthFailureOperation = iris_metal_stencil(face.depthFail);
+      result.depthStencilPassOperation = iris_metal_stencil(face.pass);
+      result.readMask = face.readMask;
+      result.writeMask = face.writeMask;
+      return result;
+    };
+    MTLStencilDescriptor *front = makeFace(parsed.stencilFront);
+    MTLStencilDescriptor *back = makeFace(parsed.stencilBack);
+    descriptor.frontFaceStencil = front;
+    descriptor.backFaceStencil = back;
+    [front release];
+    [back release];
+  }
+  id<MTLDepthStencilState> result =
+      [g_device newDepthStencilStateWithDescriptor:descriptor];
+  [descriptor release];
+  return result;
+}
+
+static MTLVertexDescriptor *iris_metal_vertex_descriptor(
+    const IrisParsedPipelineDescriptor &parsed, bool *supported) {
+  MTLVertexDescriptor *descriptor = [[MTLVertexDescriptor alloc] init];
+  for (const auto &buffer : parsed.buffers) {
+    MTLVertexBufferLayoutDescriptor *layout =
+        descriptor.layouts[buffer.index];
+    layout.stride = buffer.stride;
+    layout.stepFunction = buffer.stepFunction == 0
+        ? MTLVertexStepFunctionPerVertex
+        : buffer.stepFunction == 1 ? MTLVertexStepFunctionPerInstance
+                                   : MTLVertexStepFunctionConstant;
+    layout.stepRate = buffer.stepFunction == 1 ? buffer.stepRate
+                                                : buffer.stepFunction == 0;
+  }
+  for (const auto &attribute : parsed.attributes) {
+    MTLVertexFormat format = iris_metal_vertex_format(attribute.format);
+    if (format == MTLVertexFormatInvalid) {
+      *supported = false;
+      [descriptor release];
+      return nil;
+    }
+    MTLVertexAttributeDescriptor *target =
+        descriptor.attributes[attribute.location];
+    target.format = format;
+    target.offset = attribute.offset;
+    target.bufferIndex = attribute.buffer;
+  }
+  return descriptor;
+}
+
+static bool valid_iris_pipeline_key(const char *key) {
+  if (!key || std::strlen(key) != 64)
+    return false;
+  for (size_t index = 0; index < 64; ++index) {
+    char value = key[index];
+    if (!((value >= '0' && value <= '9') ||
+          (value >= 'a' && value <= 'f')))
+      return false;
+  }
+  return true;
+}
+} // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4PipelineCacheIdentity(
+    JNIEnv *env, jclass) {
+  @autoreleasepool {
+    if (!g_device ||
+        !g_metal4RuntimeVerified.load(std::memory_order_acquire))
+      return env->NewStringUTF("");
+    if (@available(macOS 26.0, *)) {
+      NSBundle *metalBundle = [NSBundle bundleWithPath:
+          @"/System/Library/Frameworks/Metal.framework"];
+      NSString *frameworkVersion =
+          [metalBundle objectForInfoDictionaryKey:@"CFBundleVersion"];
+      if (!frameworkVersion)
+        frameworkVersion = @"unknown";
+      NSString *identity = [NSString stringWithFormat:
+          @"device=%@;registry=%llu;os=%@;metal-framework=%@;"
+           "argument-buffers=%lu;msl=3.0;mtl4=1;math=fast;invariance=1",
+          [g_device name], (unsigned long long)[g_device registryID],
+          [[NSProcessInfo processInfo] operatingSystemVersionString],
+          frameworkVersion, (unsigned long)[g_device argumentBuffersSupport]];
+      return env->NewStringUTF([identity UTF8String]);
+    }
+    return env->NewStringUTF("");
+  }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nConfigureIrisMetal4PipelineCache(
+    JNIEnv *env, jclass, jstring archivePathValue) {
+  @autoreleasepool {
+    if (!archivePathValue)
+      return kIrisMetal4PipelineFailed;
+    const char *utf8 = env->GetStringUTFChars(archivePathValue, nullptr);
+    if (!utf8)
+      return kIrisMetal4PipelineFailed;
+    size_t length = std::strlen(utf8);
+    NSString *path = length > 0 && length <= 4096
+        ? [NSString stringWithUTF8String:utf8] : nil;
+    env->ReleaseStringUTFChars(archivePathValue, utf8);
+    if (!path || ![path isAbsolutePath])
+      return kIrisMetal4PipelineFailed;
+    std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
+    return prepare_iris_metal4_pipeline_cache_for_translated_msl_locked(path);
+  }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCompileIrisMetal4Pipeline(
+    JNIEnv *env, jclass, jstring pipelineKeyValue, jstring shaderKeyValue,
+    jbyteArray descriptorValue, jbyteArray vertexValue,
+    jbyteArray fragmentValue, jbyteArray computeValue) {
+  @autoreleasepool {
+    if (!g_device ||
+        !g_metal4RuntimeVerified.load(std::memory_order_acquire))
+      return kIrisMetal4PipelineDeferred;
+    if (@available(macOS 26.0, *)) {
+      if (!pipelineKeyValue || !shaderKeyValue || !descriptorValue)
+        return kIrisMetal4PipelineFailed;
+      const char *pipelineKey =
+          env->GetStringUTFChars(pipelineKeyValue, nullptr);
+      if (!pipelineKey)
+        return kIrisMetal4PipelineFailed;
+      std::string key(pipelineKey);
+      bool validKey = valid_iris_pipeline_key(pipelineKey);
+      env->ReleaseStringUTFChars(pipelineKeyValue, pipelineKey);
+      if (!validKey)
+        return kIrisMetal4PipelineFailed;
+      const char *shaderKeyUtf8 =
+          env->GetStringUTFChars(shaderKeyValue, nullptr);
+      if (!shaderKeyUtf8)
+        return kIrisMetal4PipelineFailed;
+      std::string shaderKey(shaderKeyUtf8);
+      bool validShaderKey = valid_iris_pipeline_key(shaderKeyUtf8);
+      env->ReleaseStringUTFChars(shaderKeyValue, shaderKeyUtf8);
+      if (!validShaderKey)
+        return kIrisMetal4PipelineFailed;
+
+      jsize descriptorLength = env->GetArrayLength(descriptorValue);
+      if (descriptorLength <= 0 ||
+          descriptorLength > kIrisMetal4MaximumDescriptorBytes)
+        return kIrisMetal4PipelineFailed;
+      std::vector<jbyte> descriptorBytes;
+      try {
+        descriptorBytes.resize((size_t)descriptorLength);
+      } catch (...) {
+        return kIrisMetal4PipelineFailed;
+      }
+      env->GetByteArrayRegion(descriptorValue, 0, descriptorLength,
+                              descriptorBytes.data());
+      if (env->ExceptionCheck())
+        return kIrisMetal4PipelineFailed;
+      IrisParsedPipelineDescriptor parsed;
+      if (!parse_iris_metal4_pipeline_descriptor(descriptorBytes, parsed))
+        return kIrisMetal4PipelineFailed;
+
+      std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
+      if (!g_irisMetal4Compiler || !g_irisMetal4PipelineSerializer)
+        return kIrisMetal4PipelineDeferred;
+      auto existing = g_irisMetal4Pipelines.find(key);
+      if (existing != g_irisMetal4Pipelines.end())
+        return kIrisMetal4PipelineCacheHit;
+      g_irisMetal4PipelineAttemptCount.fetch_add(1,
+                                                  std::memory_order_relaxed);
+
+      bool compute = parsed.passKind == 2;
+      std::vector<jbyte> vertexBytes;
+      std::vector<jbyte> fragmentBytes;
+      std::vector<jbyte> computeBytes;
+      if (!copy_bounded_jbyte_array(env, vertexValue, vertexBytes, !compute) ||
+          !copy_bounded_jbyte_array(env, fragmentValue, fragmentBytes,
+                                    !compute && parsed.rasterizationEnabled) ||
+          !copy_bounded_jbyte_array(env, computeValue, computeBytes, compute)) {
+        g_irisMetal4PipelineFailureCount.fetch_add(
+            1, std::memory_order_relaxed);
+        return kIrisMetal4PipelineFailed;
+      }
+
+      NSError *error = nil;
+      bool supported = true;
+      IrisMetal4PipelineEntry entry;
+      if (!compute && !iris_metal4_execution_state(parsed, entry))
+        return kIrisMetal4PipelineUnsupported;
+      if (compute) {
+        id<MTLLibrary> library = iris_metal4_cached_library(
+            shaderKey + ":compute", computeBytes,
+            @"MetalRender Iris compute", &error);
+        if (!library) {
+          pipeline_archive_warning("Iris MTL4 compute library failed", error);
+          g_irisMetal4PipelineFailureCount.fetch_add(
+              1, std::memory_order_relaxed);
+          return kIrisMetal4PipelineFailed;
+        }
+        MTL4FunctionDescriptor *function = iris_metal4_function_descriptor(
+            library, 5, parsed.constants, &supported);
+        id<MTLFunction> runtimeFunction = iris_metal_runtime_function(
+            library, 5, parsed.constants, &error, &supported);
+        MTL4ComputePipelineDescriptor *pipelineDescriptor =
+            [[MTL4ComputePipelineDescriptor alloc] init];
+        pipelineDescriptor.label = [NSString stringWithUTF8String:key.c_str()];
+        pipelineDescriptor.computeFunctionDescriptor = function;
+        id<MTLComputePipelineState> pipeline = nil;
+        bool archiveHit = false;
+        if (supported && g_irisMetal4LookupArchives.count > 0) {
+          for (id archive in g_irisMetal4LookupArchives) {
+            NSError *lookupError = nil;
+            pipeline = [(id<MTL4Archive>)archive
+                newComputePipelineStateWithDescriptor:pipelineDescriptor
+                                                 error:&lookupError];
+            if (pipeline)
+              break;
+          }
+          archiveHit = pipeline != nil;
+        }
+        if (supported && !pipeline) {
+          MTL4CompilerTaskOptions *taskOptions =
+              [[MTL4CompilerTaskOptions alloc] init];
+          if (g_irisMetal4LookupArchives.count > 0)
+            taskOptions.lookupArchives = g_irisMetal4LookupArchives;
+          pipeline = [(id<MTL4Compiler>)g_irisMetal4Compiler
+              newComputePipelineStateWithDescriptor:pipelineDescriptor
+                                 compilerTaskOptions:taskOptions
+                                               error:&error];
+          [taskOptions release];
+        }
+        id archiveDescriptor = supported && pipeline
+            ? [pipelineDescriptor copy] : nil;
+        [pipelineDescriptor release];
+        if (function) [function release];
+        [library release];
+        if (!supported) {
+          if (archiveDescriptor) [archiveDescriptor release];
+          if (runtimeFunction) [runtimeFunction release];
+          return kIrisMetal4PipelineUnsupported;
+        }
+        if (!pipeline || !runtimeFunction) {
+          pipeline_archive_warning("Iris MTL4 compute pipeline failed", error);
+          if (pipeline) [pipeline release];
+          if (runtimeFunction) [runtimeFunction release];
+          if (archiveDescriptor) [archiveDescriptor release];
+          g_irisMetal4PipelineFailureCount.fetch_add(
+              1, std::memory_order_relaxed);
+          return kIrisMetal4PipelineFailed;
+        }
+        if (!g_irisMetal4ComputeArchiveDescriptors) {
+          g_irisMetal4ComputeArchiveDescriptors =
+              [[NSMutableArray alloc] init];
+        }
+        [g_irisMetal4ComputeArchiveDescriptors addObject:archiveDescriptor];
+        [archiveDescriptor release];
+        entry.compute = pipeline;
+        entry.computeFunction = runtimeFunction;
+        g_irisMetal4Pipelines.emplace(key, entry);
+        if (archiveHit) {
+          g_irisMetal4PipelineCacheHitCount.fetch_add(
+              1, std::memory_order_relaxed);
+          return kIrisMetal4PipelineCacheHit;
+        }
+      } else {
+        id<MTLLibrary> vertexLibrary = iris_metal4_cached_library(
+            shaderKey + ":vertex", vertexBytes,
+            @"MetalRender Iris vertex", &error);
+        if (!vertexLibrary) {
+          pipeline_archive_warning("Iris MTL4 vertex library failed", error);
+          g_irisMetal4PipelineFailureCount.fetch_add(
+              1, std::memory_order_relaxed);
+          return kIrisMetal4PipelineFailed;
+        }
+        id<MTLLibrary> fragmentLibrary = nil;
+        if (!fragmentBytes.empty()) {
+          fragmentLibrary = iris_metal4_cached_library(
+              shaderKey + ":fragment", fragmentBytes,
+              @"MetalRender Iris fragment", &error);
+        }
+        if (!fragmentBytes.empty() && !fragmentLibrary) {
+          [vertexLibrary release];
+          pipeline_archive_warning("Iris MTL4 fragment library failed", error);
+          g_irisMetal4PipelineFailureCount.fetch_add(
+              1, std::memory_order_relaxed);
+          return kIrisMetal4PipelineFailed;
+        }
+        MTL4FunctionDescriptor *vertexFunction =
+            iris_metal4_function_descriptor(vertexLibrary, 0,
+                                             parsed.constants, &supported);
+        MTL4FunctionDescriptor *fragmentFunction = fragmentLibrary
+            ? iris_metal4_function_descriptor(fragmentLibrary, 4,
+                                               parsed.constants, &supported)
+            : nil;
+        id<MTLFunction> runtimeVertex = iris_metal_runtime_function(
+            vertexLibrary, 0, parsed.constants, &error, &supported);
+        id<MTLFunction> runtimeFragment = fragmentLibrary
+            ? iris_metal_runtime_function(fragmentLibrary, 4,
+                                          parsed.constants, &error,
+                                          &supported)
+            : nil;
+        MTLVertexDescriptor *vertexDescriptor =
+            iris_metal_vertex_descriptor(parsed, &supported);
+        MTL4RenderPipelineDescriptor *pipelineDescriptor =
+            [[MTL4RenderPipelineDescriptor alloc] init];
+        pipelineDescriptor.label = [NSString stringWithUTF8String:key.c_str()];
+        pipelineDescriptor.vertexFunctionDescriptor = vertexFunction;
+        pipelineDescriptor.fragmentFunctionDescriptor = fragmentFunction;
+        pipelineDescriptor.vertexDescriptor = vertexDescriptor;
+        pipelineDescriptor.rasterSampleCount = parsed.rasterSampleCount;
+        pipelineDescriptor.alphaToCoverageState = parsed.alphaToCoverage
+            ? MTL4AlphaToCoverageStateEnabled
+            : MTL4AlphaToCoverageStateDisabled;
+        pipelineDescriptor.alphaToOneState = parsed.alphaToOne
+            ? MTL4AlphaToOneStateEnabled : MTL4AlphaToOneStateDisabled;
+        pipelineDescriptor.rasterizationEnabled = parsed.rasterizationEnabled;
+        pipelineDescriptor.inputPrimitiveTopology =
+            iris_metal_topology_class(parsed.topology);
+        for (const auto &color : parsed.colors) {
+          MTLPixelFormat format = iris_metal_pixel_format(color.format);
+          if (format == MTLPixelFormatInvalid) {
+            supported = false;
+            break;
+          }
+          MTL4RenderPipelineColorAttachmentDescriptor *target =
+              pipelineDescriptor.colorAttachments[color.slot];
+          target.pixelFormat = format;
+          target.writeMask = iris_metal_write_mask(color.writeMask);
+          target.blendingState = color.blendEnabled
+              ? MTL4BlendStateEnabled : MTL4BlendStateDisabled;
+          if (color.blendEnabled) {
+            target.rgbBlendOperation =
+                (MTLBlendOperation)color.rgb.operation;
+            target.sourceRGBBlendFactor =
+                iris_metal_blend_factor(color.rgb.source);
+            target.destinationRGBBlendFactor =
+                iris_metal_blend_factor(color.rgb.destination);
+            target.alphaBlendOperation =
+                (MTLBlendOperation)color.alpha.operation;
+            target.sourceAlphaBlendFactor =
+                iris_metal_blend_factor(color.alpha.source);
+            target.destinationAlphaBlendFactor =
+                iris_metal_blend_factor(color.alpha.destination);
+          }
+        }
+        id<MTLRenderPipelineState> pipeline = nil;
+        bool archiveHit = false;
+        if (supported && g_irisMetal4LookupArchives.count > 0) {
+          for (id archive in g_irisMetal4LookupArchives) {
+            NSError *lookupError = nil;
+            pipeline = [(id<MTL4Archive>)archive
+                newRenderPipelineStateWithDescriptor:pipelineDescriptor
+                                                error:&lookupError];
+            if (pipeline)
+              break;
+          }
+          archiveHit = pipeline != nil;
+        }
+        if (supported && !pipeline) {
+          MTL4CompilerTaskOptions *taskOptions =
+              [[MTL4CompilerTaskOptions alloc] init];
+          if (g_irisMetal4LookupArchives.count > 0)
+            taskOptions.lookupArchives = g_irisMetal4LookupArchives;
+          pipeline = [(id<MTL4Compiler>)g_irisMetal4Compiler
+              newRenderPipelineStateWithDescriptor:pipelineDescriptor
+                                compilerTaskOptions:taskOptions
+                                              error:&error];
+          [taskOptions release];
+        }
+        id archiveDescriptor = supported && pipeline
+            ? [pipelineDescriptor copy] : nil;
+        [pipelineDescriptor release];
+        if (vertexDescriptor) [vertexDescriptor release];
+        if (vertexFunction) [vertexFunction release];
+        if (fragmentFunction) [fragmentFunction release];
+        [vertexLibrary release];
+        if (fragmentLibrary) [fragmentLibrary release];
+        if (!supported) {
+          if (archiveDescriptor) [archiveDescriptor release];
+          if (runtimeVertex) [runtimeVertex release];
+          if (runtimeFragment) [runtimeFragment release];
+          return kIrisMetal4PipelineUnsupported;
+        }
+        if (!pipeline || !runtimeVertex ||
+            (fragmentLibrary && !runtimeFragment)) {
+          pipeline_archive_warning("Iris MTL4 render pipeline failed", error);
+          if (pipeline) [pipeline release];
+          if (runtimeVertex) [runtimeVertex release];
+          if (runtimeFragment) [runtimeFragment release];
+          if (archiveDescriptor) [archiveDescriptor release];
+          g_irisMetal4PipelineFailureCount.fetch_add(
+              1, std::memory_order_relaxed);
+          return kIrisMetal4PipelineFailed;
+        }
+        entry.render = pipeline;
+        entry.vertexFunction = runtimeVertex;
+        entry.fragmentFunction = runtimeFragment;
+        entry.rasterSampleCount = parsed.rasterSampleCount;
+        size_t colorSlotCount = 0;
+        for (const auto &color : parsed.colors)
+          colorSlotCount = std::max(colorSlotCount, (size_t)color.slot + 1u);
+        entry.colorFormats.resize(colorSlotCount, MTLPixelFormatInvalid);
+        for (const auto &color : parsed.colors)
+          entry.colorFormats[color.slot] =
+              iris_metal_pixel_format(color.format);
+        entry.depthFormat = parsed.hasDepthFormat
+            ? iris_metal_pixel_format(parsed.depthFormat)
+            : MTLPixelFormatInvalid;
+        entry.stencilFormat = parsed.hasStencilFormat
+            ? iris_metal_pixel_format(parsed.stencilFormat)
+            : MTLPixelFormatInvalid;
+        entry.depthStencil = iris_metal_depth_stencil_state(parsed);
+        if (!entry.depthStencil) {
+          [pipeline release];
+          [runtimeVertex release];
+          if (runtimeFragment) [runtimeFragment release];
+          if (archiveDescriptor) [archiveDescriptor release];
+          g_irisMetal4PipelineFailureCount.fetch_add(
+              1, std::memory_order_relaxed);
+          return kIrisMetal4PipelineFailed;
+        }
+        if (!g_irisMetal4RenderArchiveDescriptors) {
+          g_irisMetal4RenderArchiveDescriptors =
+              [[NSMutableArray alloc] init];
+        }
+        [g_irisMetal4RenderArchiveDescriptors addObject:archiveDescriptor];
+        [archiveDescriptor release];
+        g_irisMetal4Pipelines.emplace(key, entry);
+        if (archiveHit) {
+          g_irisMetal4PipelineCacheHitCount.fetch_add(
+              1, std::memory_order_relaxed);
+          return kIrisMetal4PipelineCacheHit;
+        }
+      }
+      g_irisMetal4PipelineCompileCount.fetch_add(
+          1, std::memory_order_relaxed);
+      g_irisMetal4PipelineCacheDirty = true;
+      return kIrisMetal4PipelineCompiled;
+    }
+    return kIrisMetal4PipelineUnsupported;
+  }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nFlushIrisMetal4PipelineCache(
+    JNIEnv *, jclass) {
+  @autoreleasepool {
+    std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
+    return serialize_iris_metal4_pipeline_cache_after_translated_builds_locked()
+        ? JNI_TRUE : JNI_FALSE;
+  }
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4PipelineAttemptCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMetal4PipelineAttemptCount.load(
+      std::memory_order_acquire);
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4PipelineCompileCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMetal4PipelineCompileCount.load(
+      std::memory_order_acquire);
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4PipelineCacheHitCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMetal4PipelineCacheHitCount.load(
+      std::memory_order_acquire);
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4PipelineFailureCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMetal4PipelineFailureCount.load(
+      std::memory_order_acquire);
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4PipelineStaleRecoveryCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMetal4PipelineStaleRecoveryCount.load(
+      std::memory_order_acquire);
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4LivePipelineCount(
+    JNIEnv *, jclass) {
+  std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
+  return (jlong)g_irisMetal4Pipelines.size();
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetIrisMetal4PipelineDrawAttemptCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_irisMetal4PipelineDrawAttemptCount.load(
+      std::memory_order_acquire);
+}
+
+static bool iris_shadow_exact_texture_format(const std::string &name,
+                                             uint32_t bytesPerPixel,
+                                             MTLPixelFormat &format) {
+  // Three-component formats are routed through the type-aware repacker below.
+  if (name == "rgb16-unorm" || name == "rgb16-snorm" ||
+      name == "rgb16-float" || name == "rgb32-float" ||
+      name == "rgb8-sint" || name == "rgb8-uint" ||
+      name == "rgb16-sint" || name == "rgb16-uint" ||
+      name == "rgb32-sint" || name == "rgb32-uint")
+    return false;
+  format = iris_metal_pixel_format(name);
+  if (format == MTLPixelFormatInvalid)
+    return false;
+  uint32_t expected = 0;
+  if (name == "r8-unorm" || name == "r8-snorm" || name == "r8-sint" ||
+      name == "r8-uint" || name == "s8-uint")
+    expected = 1;
+  else if (name == "rg8-unorm" || name == "rg8-snorm" ||
+           name == "r16-unorm" || name == "r16-snorm" ||
+           name == "r16-float" || name == "r16-sint" ||
+           name == "r16-uint" || name == "rg8-sint" ||
+           name == "rg8-uint" || name == "d16-unorm")
+    expected = 2;
+  else if (name == "rgba8-unorm" || name == "rgba8-snorm" ||
+           name == "rg16-unorm" || name == "rg16-snorm" ||
+           name == "r32-float" || name == "r32-sint" ||
+           name == "r32-uint" || name == "rg16-sint" ||
+           name == "rg16-uint" || name == "rgba8-sint" ||
+           name == "rgba8-uint" || name == "rgb10a2-unorm" ||
+           name == "rgb10a2-uint" || name == "rg11b10-float" ||
+           name == "rgb9e5-float" || name == "d32-float" ||
+           name == "d24-unorm-s8-uint")
+    expected = 4;
+  else if (name == "rgba16-unorm" || name == "rgba16-snorm" ||
+           name == "rgba16-float" || name == "rg32-float" ||
+           name == "rgba16-sint" || name == "rgba16-uint" ||
+           name == "rg32-sint" || name == "rg32-uint" ||
+           name == "d32-float-s8-uint")
+    expected = 8;
+  else if (name == "rgba32-float" || name == "rgba32-sint" ||
+           name == "rgba32-uint")
+    expected = 16;
+  return expected != 0 && expected == bytesPerPixel;
+}
+
+static bool iris_shadow_rgb_expansion(const std::string &name,
+                                      uint32_t &componentBytes,
+                                      uint32_t &alphaBits) {
+  componentBytes = 0;
+  alphaBits = 0;
+  if (name == "rgb8-unorm") {
+    componentBytes = 1;
+    alphaBits = 0xffu;
+  } else if (name == "rgb8-snorm") {
+    componentBytes = 1;
+    alphaBits = 0x7fu;
+  } else if (name == "rgb8-sint" || name == "rgb8-uint") {
+    componentBytes = 1;
+    alphaBits = 1u;
+  } else if (name == "rgb16-unorm") {
+    componentBytes = 2;
+    alphaBits = 0xffffu;
+  } else if (name == "rgb16-snorm") {
+    componentBytes = 2;
+    alphaBits = 0x7fffu;
+  } else if (name == "rgb16-float") {
+    componentBytes = 2;
+    alphaBits = 0x3c00u; // IEEE 754 binary16 1.0
+  } else if (name == "rgb16-sint" || name == "rgb16-uint") {
+    componentBytes = 2;
+    alphaBits = 1u;
+  } else if (name == "rgb32-float") {
+    componentBytes = 4;
+    alphaBits = 0x3f800000u; // IEEE 754 binary32 1.0
+  } else if (name == "rgb32-sint" || name == "rgb32-uint") {
+    componentBytes = 4;
+    alphaBits = 1u;
+  }
+  return componentBytes != 0;
+}
+
+static bool iris_shadow_texture_upload(
+    const IrisShadowTexture &captured, MTLPixelFormat &format,
+    const uint8_t *&bytes, uint32_t &bytesPerPixel,
+    std::vector<uint8_t> &expanded) {
+  bytes = captured.bytes.data();
+  bytesPerPixel = captured.bytesPerPixel;
+  uint32_t componentBytes = 0;
+  uint32_t alphaBits = 0;
+  if (!iris_shadow_rgb_expansion(captured.format, componentBytes,
+                                 alphaBits)) {
+    return iris_shadow_exact_texture_format(captured.format,
+        captured.bytesPerPixel, format);
+  }
+  if (captured.bytesPerPixel != componentBytes * 3u)
+    return false;
+  format = iris_metal_pixel_format(captured.format);
+  if (format == MTLPixelFormatInvalid)
+    return false;
+  uint64_t pixels = (uint64_t)captured.width * captured.height;
+  uint64_t inputStride = componentBytes * 3u;
+  uint64_t outputStride = componentBytes * 4u;
+  if (pixels == 0 ||
+      pixels > kIrisShadowReplayMaximumTextureBytes / outputStride ||
+      captured.bytes.size() != pixels * inputStride)
+    return false;
+  try {
+    expanded.resize((size_t)(pixels * outputStride));
+  } catch (...) {
+    return false;
+  }
+  for (uint64_t pixel = 0; pixel < pixels; pixel++) {
+    size_t source = (size_t)(pixel * inputStride);
+    size_t destination = (size_t)(pixel * outputStride);
+    std::memcpy(expanded.data() + destination,
+                captured.bytes.data() + source, (size_t)inputStride);
+    std::memcpy(expanded.data() + destination + inputStride,
+                &alphaBits, componentBytes);
+  }
+  bytes = expanded.data();
+  bytesPerPixel = (uint32_t)outputStride;
+  return true;
+}
+
+static bool iris_shadow_color_bytes(MTLPixelFormat format,
+                                    uint32_t &bytesPerPixel) {
+  switch (format) {
+  case MTLPixelFormatR8Unorm:
+  case MTLPixelFormatR8Snorm:
+  case MTLPixelFormatR8Uint:
+  case MTLPixelFormatR8Sint:
+    bytesPerPixel = 1; return true;
+  case MTLPixelFormatRG8Unorm:
+  case MTLPixelFormatRG8Snorm:
+  case MTLPixelFormatRG8Uint:
+  case MTLPixelFormatRG8Sint:
+  case MTLPixelFormatR16Unorm:
+  case MTLPixelFormatR16Snorm:
+  case MTLPixelFormatR16Uint:
+  case MTLPixelFormatR16Sint:
+  case MTLPixelFormatR16Float:
+    bytesPerPixel = 2; return true;
+  case MTLPixelFormatRGBA8Unorm:
+  case MTLPixelFormatRGBA8Snorm:
+  case MTLPixelFormatRGBA8Uint:
+  case MTLPixelFormatRGBA8Sint:
+  case MTLPixelFormatRG16Unorm:
+  case MTLPixelFormatRG16Snorm:
+  case MTLPixelFormatRG16Uint:
+  case MTLPixelFormatRG16Sint:
+  case MTLPixelFormatRG16Float:
+  case MTLPixelFormatR32Uint:
+  case MTLPixelFormatR32Sint:
+  case MTLPixelFormatR32Float:
+  case MTLPixelFormatRGB10A2Unorm:
+  case MTLPixelFormatRGB10A2Uint:
+  case MTLPixelFormatRG11B10Float:
+  case MTLPixelFormatRGB9E5Float:
+    bytesPerPixel = 4; return true;
+  case MTLPixelFormatRGBA16Unorm:
+  case MTLPixelFormatRGBA16Snorm:
+  case MTLPixelFormatRGBA16Uint:
+  case MTLPixelFormatRGBA16Sint:
+  case MTLPixelFormatRGBA16Float:
+  case MTLPixelFormatRG32Uint:
+  case MTLPixelFormatRG32Sint:
+  case MTLPixelFormatRG32Float:
+    bytesPerPixel = 8; return true;
+  case MTLPixelFormatRGBA32Uint:
+  case MTLPixelFormatRGBA32Sint:
+  case MTLPixelFormatRGBA32Float:
+    bytesPerPixel = 16; return true;
+  default:
+    return false;
+  }
+}
+
+static bool iris_shadow_address_mode(uint32_t gl,
+                                     MTLSamplerAddressMode &result) {
+  switch (gl) {
+  case 0x2901: result = MTLSamplerAddressModeRepeat; return true;
+  case 0x812f: result = MTLSamplerAddressModeClampToEdge; return true;
+  case 0x8370: result = MTLSamplerAddressModeMirrorRepeat; return true;
+  case 0x812d: result = MTLSamplerAddressModeClampToBorderColor; return true;
+  default: return false;
+  }
+}
+
+using IrisMetal4SamplerKey = std::array<uint32_t, 18>;
+
+struct IrisMetal4SamplerKeyHash {
+  size_t operator()(const IrisMetal4SamplerKey &key) const {
+    size_t hash = 1469598103934665603ULL;
+    for (uint32_t value : key) {
+      hash ^= value;
+      hash *= 1099511628211ULL;
+    }
+    return hash;
+  }
+};
+
+class IrisMetal4SamplerCache {
+ public:
+  id<MTLSamplerState> find(const IrisMetal4SamplerKey &key) {
+    synchronizeGeneration();
+    auto found = values_.find(key);
+    return found == values_.end() || !found->second
+        ? nil : [found->second retain];
+  }
+
+  void store(const IrisMetal4SamplerKey &key, id<MTLSamplerState> sampler) {
+    if (!sampler)
+      return;
+    synchronizeGeneration();
+    if (values_.size() >= kMaximumEntries ||
+        values_.find(key) != values_.end())
+      return;
+    id<MTLSamplerState> retained = [sampler retain];
+    try {
+      values_.emplace(key, retained);
+    } catch (...) {
+      // The caller still owns and can use the uncached sampler.
+      [retained release];
+    }
+  }
+
+  ~IrisMetal4SamplerCache() { clear(); }
+
+ private:
+  static constexpr size_t kMaximumEntries = 256;
+
+  void synchronizeGeneration() {
+    uint64_t current = g_irisMetal4ArgumentEncoderGeneration.load(
+        std::memory_order_acquire);
+    if (generation_ == current)
+      return;
+    clear();
+    generation_ = current;
+  }
+
+  void clear() {
+    for (auto &entry : values_) {
+      if (entry.second)
+        [entry.second release];
+    }
+    values_.clear();
+  }
+
+  uint64_t generation_ = 0;
+  std::unordered_map<IrisMetal4SamplerKey, id<MTLSamplerState>,
+      IrisMetal4SamplerKeyHash> values_;
+};
+
+static thread_local IrisMetal4SamplerCache g_irisMetal4SamplerCache;
+
+static IrisMetal4SamplerKey iris_shadow_sampler_key(
+    const IrisShadowSampler &captured) {
+  return {captured.minFilter, captured.magFilter, captured.wrapS,
+      captured.wrapT, captured.wrapR, captured.compareMode,
+      captured.compareFunc, captured.baseLevel, captured.maxLevel,
+      captured.minLodBits, captured.maxLodBits, captured.lodBiasBits,
+      captured.maxAnisotropyBits, captured.integerBorderColor ? 1u : 0u,
+      captured.borderColor[0], captured.borderColor[1],
+      captured.borderColor[2], captured.borderColor[3]};
+}
+
+static id<MTLSamplerState> iris_shadow_sampler(
+    const IrisShadowSampler &captured, bool &supported) {
+  supported = false;
+  float minLod = 0.0f;
+  float maxLod = 0.0f;
+  float lodBias = 0.0f;
+  float anisotropy = 0.0f;
+  std::memcpy(&minLod, &captured.minLodBits, sizeof(float));
+  std::memcpy(&maxLod, &captured.maxLodBits, sizeof(float));
+  std::memcpy(&lodBias, &captured.lodBiasBits, sizeof(float));
+  std::memcpy(&anisotropy, &captured.maxAnisotropyBits, sizeof(float));
+  if (!std::isfinite(minLod) || !std::isfinite(maxLod) ||
+      !std::isfinite(lodBias) || !std::isfinite(anisotropy) ||
+      minLod > maxLod || captured.baseLevel != 0 ||
+      captured.maxLevel < captured.baseLevel || lodBias != 0.0f ||
+      anisotropy < 1.0f ||
+      anisotropy > 16.0f || std::floor(anisotropy) != anisotropy)
+    return nil;
+
+  MTLSamplerMinMagFilter minFilter;
+  MTLSamplerMipFilter mipFilter;
+  switch (captured.minFilter) {
+  case 0x2600:
+    minFilter = MTLSamplerMinMagFilterNearest;
+    mipFilter = MTLSamplerMipFilterNotMipmapped;
+    break;
+  case 0x2601:
+    minFilter = MTLSamplerMinMagFilterLinear;
+    mipFilter = MTLSamplerMipFilterNotMipmapped;
+    break;
+  case 0x2700:
+    minFilter = MTLSamplerMinMagFilterNearest;
+    mipFilter = MTLSamplerMipFilterNearest;
+    break;
+  case 0x2701:
+    minFilter = MTLSamplerMinMagFilterLinear;
+    mipFilter = MTLSamplerMipFilterNearest;
+    break;
+  case 0x2702:
+    minFilter = MTLSamplerMinMagFilterNearest;
+    mipFilter = MTLSamplerMipFilterLinear;
+    break;
+  case 0x2703:
+    minFilter = MTLSamplerMinMagFilterLinear;
+    mipFilter = MTLSamplerMipFilterLinear;
+    break;
+  default:
+    return nil;
+  }
+  MTLSamplerMinMagFilter magFilter;
+  if (captured.magFilter == 0x2600)
+    magFilter = MTLSamplerMinMagFilterNearest;
+  else if (captured.magFilter == 0x2601)
+    magFilter = MTLSamplerMinMagFilterLinear;
+  else
+    return nil;
+  MTLSamplerAddressMode s, t, r;
+  if (!iris_shadow_address_mode(captured.wrapS, s) ||
+      !iris_shadow_address_mode(captured.wrapT, t) ||
+      !iris_shadow_address_mode(captured.wrapR, r))
+    return nil;
+  bool borderUsed = captured.wrapS == 0x812d || captured.wrapT == 0x812d ||
+                    captured.wrapR == 0x812d;
+  if (borderUsed && (captured.integerBorderColor ||
+      captured.borderColor[0] != 0 || captured.borderColor[1] != 0 ||
+      captured.borderColor[2] != 0 || captured.borderColor[3] != 0))
+    return nil;
+  MTLCompareFunction compare = MTLCompareFunctionNever;
+  if (captured.compareMode == 0) {
+    compare = MTLCompareFunctionNever;
+  } else if (captured.compareMode == 0x884e &&
+             captured.compareFunc >= 0x0200 &&
+             captured.compareFunc <= 0x0207) {
+    static const MTLCompareFunction values[] = {
+        MTLCompareFunctionNever, MTLCompareFunctionLess,
+        MTLCompareFunctionEqual, MTLCompareFunctionLessEqual,
+        MTLCompareFunctionGreater, MTLCompareFunctionNotEqual,
+        MTLCompareFunctionGreaterEqual, MTLCompareFunctionAlways};
+    compare = values[captured.compareFunc - 0x0200];
+  } else {
+    return nil;
+  }
+  IrisMetal4SamplerKey samplerKey = iris_shadow_sampler_key(captured);
+  id<MTLSamplerState> cached = g_irisMetal4SamplerCache.find(samplerKey);
+  if (cached) {
+    supported = true;
+    return cached;
+  }
+  MTLSamplerDescriptor *descriptor = [[MTLSamplerDescriptor alloc] init];
+  descriptor.minFilter = minFilter;
+  descriptor.magFilter = magFilter;
+  descriptor.mipFilter = mipFilter;
+  descriptor.sAddressMode = s;
+  descriptor.tAddressMode = t;
+  descriptor.rAddressMode = r;
+  descriptor.borderColor = MTLSamplerBorderColorTransparentBlack;
+  descriptor.lodMinClamp = std::max(0.0f, minLod);
+  descriptor.lodMaxClamp = std::max(0.0f,
+      std::min(maxLod, (float)captured.maxLevel));
+  descriptor.maxAnisotropy = (NSUInteger)anisotropy;
+  descriptor.compareFunction = compare;
+  descriptor.supportArgumentBuffers = YES;
+  id<MTLSamplerState> sampler = [g_device newSamplerStateWithDescriptor:descriptor];
+  [descriptor release];
+  if (sampler)
+    g_irisMetal4SamplerCache.store(samplerKey, sampler);
+  supported = sampler != nil;
+  return sampler;
+}
+
+static constexpr size_t kIrisMetal4TransientBufferPoolLimit = 8192;
+static constexpr uint64_t kIrisMetal4TransientBufferPoolByteLimit =
+    256ULL * 1024ULL * 1024ULL;
+
+/**
+ * Per-calling-thread pool for the shared buffers used by Iris argument
+ * encoders and captured CPU buffer images.
+ *
+ * Metal 4's macOS 26 shared-buffer implementation internally suballocates
+ * small MTLBuffers.  Releasing hundreds of them after one command buffer and
+ * immediately allocating the same shapes on another Iris path exposed a
+ * driver assertion in IOGPUMetalSuballocatorAllocate.  Retaining and reusing
+ * a bounded set also removes that allocation churn from the eventual frame
+ * path.  Buffers are returned only after synchronous command completion.
+ */
+struct IrisMetal4TransientBufferPool {
+  std::unordered_map<NSUInteger, std::vector<id<MTLBuffer>>> available;
+  size_t allocatedCount = 0;
+  uint64_t allocatedBytes = 0;
+
+  id<MTLBuffer> acquire(NSUInteger length) {
+    if (!g_device || length == 0)
+      return nil;
+    auto found = available.find(length);
+    if (found != available.end() && !found->second.empty()) {
+      id<MTLBuffer> buffer = found->second.back();
+      found->second.pop_back();
+      return buffer;
+    }
+    if (allocatedCount >= kIrisMetal4TransientBufferPoolLimit ||
+        (uint64_t)length > kIrisMetal4TransientBufferPoolByteLimit ||
+        allocatedBytes >
+            kIrisMetal4TransientBufferPoolByteLimit - (uint64_t)length) {
+      return nil;
+    }
+    id<MTLBuffer> buffer = [g_device
+        newBufferWithLength:length
+                    options:MTLResourceStorageModeShared |
+                            MTLResourceCPUCacheModeWriteCombined];
+    if (!buffer)
+      return nil;
+    allocatedCount++;
+    allocatedBytes += (uint64_t)length;
+    return buffer;
+  }
+
+  void recycle(id<MTLBuffer> buffer) {
+    if (!buffer)
+      return;
+    available[buffer.length].push_back(buffer);
+  }
+
+  ~IrisMetal4TransientBufferPool() {
+    for (auto &bucket : available) {
+      for (id<MTLBuffer> buffer : bucket.second)
+        [buffer release];
+    }
+  }
+};
+
+static thread_local IrisMetal4TransientBufferPool
+    g_irisMetal4TransientBufferPool;
+
+struct IrisMetal4RetiredSubmission;
+
+struct IrisShadowRuntimeResources {
+  std::vector<id<MTLBuffer>> buffers;
+  std::vector<uint8_t> pooledBufferOwnership;
+  std::vector<id<MTLBuffer>> inlineBuffers;
+  std::vector<id<MTLBuffer>> argumentBuffers;
+  std::vector<id<MTLTexture>> sampledTextures;
+  std::unordered_map<uint32_t, id<MTLTexture>> sampledByName;
+  std::vector<id<MTLSamplerState>> samplers;
+  std::vector<id<MTLTexture>> colorTargets;
+  id<MTLTexture> depthTarget = nil;
+  id<MTLTexture> stencilTarget = nil;
+  id vertexTable = nil;
+  id fragmentTable = nil;
+
+  void transferTo(IrisMetal4RetiredSubmission &submission);
+
+  ~IrisShadowRuntimeResources() {
+    if (vertexTable) [vertexTable release];
+    if (fragmentTable) [fragmentTable release];
+    for (id<MTLSamplerState> value : samplers) [value release];
+    for (id<MTLBuffer> value : argumentBuffers)
+      g_irisMetal4TransientBufferPool.recycle(value);
+    for (id<MTLBuffer> value : inlineBuffers)
+      g_irisMetal4TransientBufferPool.recycle(value);
+    for (id<MTLTexture> value : sampledTextures) [value release];
+    for (size_t index = 0; index < buffers.size(); index++) {
+      if (index < pooledBufferOwnership.size() &&
+          pooledBufferOwnership[index] != 0) {
+        g_irisMetal4TransientBufferPool.recycle(buffers[index]);
+      } else {
+        [buffers[index] release];
+      }
+    }
+    for (id<MTLTexture> value : colorTargets) {
+      if (value) [value release];
+    }
+    if (depthTarget) [depthTarget release];
+    if (stencilTarget && stencilTarget != depthTarget)
+      [stencilTarget release];
+  }
+};
+
+/**
+ * Metal 4 command buffers don't retain the resources they reference.  A
+ * submission whose shared-event completion has not been observed therefore
+ * keeps its complete ownership graph in this bounded quarantine.  Successful
+ * synchronous submissions are released immediately after the event boundary;
+ * only genuinely unresolved GPU work consumes a slot.
+ */
+struct IrisMetal4RetiredSubmission {
+  std::vector<id> submissionObjects;
+  std::vector<id> resourceObjects;
+  std::vector<id<MTLBuffer>> pooledBuffers;
+  std::vector<IrisMetal4FrameArenaChunk> frameArenaChunks;
+  // Store the retained Objective-C object without its macOS 15 protocol
+  // spelling. Every assignment/use is guarded by the Metal 4 macOS 26 path,
+  // while keeping the dylib's supported deployment target at macOS 14.
+  id residency = nil;
+  std::shared_ptr<Metal4ProbeState> feedbackState;
+
+  ~IrisMetal4RetiredSubmission() {
+    for (auto object = submissionObjects.rbegin();
+         object != submissionObjects.rend(); ++object) {
+      if (*object)
+        [*object release];
+    }
+    if (residency) {
+      [residency endResidency];
+      [residency release];
+    }
+    for (auto object = resourceObjects.rbegin();
+         object != resourceObjects.rend(); ++object) {
+      if (*object)
+        [*object release];
+    }
+    for (id<MTLBuffer> buffer : pooledBuffers)
+      g_irisMetal4TransientBufferPool.recycle(buffer);
+    for (IrisMetal4FrameArenaChunk &chunk : frameArenaChunks)
+      g_irisMetal4FrameArenaBufferPool.recycle(chunk.buffer);
+  }
+};
+
+static constexpr size_t kIrisMetal4RetiredSubmissionLimit = 16;
+static thread_local std::vector<std::unique_ptr<IrisMetal4RetiredSubmission>>
+    g_irisMetal4RetiredSubmissions;
+
+static void iris_metal4_reap_retired_submissions()
+    API_AVAILABLE(macos(26.0)) {
+  auto current = g_irisMetal4RetiredSubmissions.begin();
+  while (current != g_irisMetal4RetiredSubmissions.end()) {
+    const IrisMetal4RetiredSubmission &submission = **current;
+    if (iris_metal4_submission_completed(submission.feedbackState)) {
+      current = g_irisMetal4RetiredSubmissions.erase(current);
+    } else {
+      ++current;
+    }
+  }
+}
+
+static bool iris_metal4_retired_submission_slot_available()
+    API_AVAILABLE(macos(26.0)) {
+  iris_metal4_reap_retired_submissions();
+  return g_irisMetal4RetiredSubmissions.size() <
+      kIrisMetal4RetiredSubmissionLimit;
+}
+
+void IrisShadowRuntimeResources::transferTo(
+    IrisMetal4RetiredSubmission &submission) {
+  if (vertexTable) {
+    submission.resourceObjects.push_back(vertexTable);
+    vertexTable = nil;
+  }
+  if (fragmentTable) {
+    submission.resourceObjects.push_back(fragmentTable);
+    fragmentTable = nil;
+  }
+  for (id<MTLSamplerState> value : samplers)
+    submission.resourceObjects.push_back(value);
+  samplers.clear();
+  for (id<MTLBuffer> value : argumentBuffers)
+    submission.pooledBuffers.push_back(value);
+  argumentBuffers.clear();
+  for (id<MTLBuffer> value : inlineBuffers)
+    submission.pooledBuffers.push_back(value);
+  inlineBuffers.clear();
+  for (id<MTLTexture> value : sampledTextures)
+    submission.resourceObjects.push_back(value);
+  sampledTextures.clear();
+  sampledByName.clear();
+  for (size_t index = 0; index < buffers.size(); index++) {
+    if (index < pooledBufferOwnership.size() &&
+        pooledBufferOwnership[index] != 0) {
+      submission.pooledBuffers.push_back(buffers[index]);
+    } else {
+      submission.resourceObjects.push_back(buffers[index]);
+    }
+  }
+  buffers.clear();
+  pooledBufferOwnership.clear();
+  for (id<MTLTexture> value : colorTargets) {
+    if (value)
+      submission.resourceObjects.push_back(value);
+  }
+  colorTargets.clear();
+  if (depthTarget)
+    submission.resourceObjects.push_back(depthTarget);
+  if (stencilTarget && stencilTarget != depthTarget)
+    submission.resourceObjects.push_back(stencilTarget);
+  depthTarget = nil;
+  stencilTarget = nil;
+}
+
+static bool iris_metal4_retire_replay_submission(
+    IrisShadowRuntimeResources &resources, IrisMetal4PipelineEntry &entry,
+    id<MTLResidencySet> &residency,
+    id<MTL4CommandAllocator> &allocator,
+    id<MTL4CommandBuffer> &commandBuffer,
+    MTL4RenderPassDescriptor *&pass, MTL4CommitOptions *&options,
+    const std::shared_ptr<Metal4ProbeState> &feedbackState)
+    API_AVAILABLE(macos(26.0)) {
+  // The caller owns all resources and performs the normal destruction path
+  // when this function returns false.  Once the shared event is complete that
+  // path is both safe and preferable to consuming a quarantine slot.
+  if (iris_metal4_submission_completed(feedbackState))
+    return false;
+  if (!iris_metal4_retired_submission_slot_available())
+    return false;
+  std::unique_ptr<IrisMetal4RetiredSubmission> submission(
+      new (std::nothrow) IrisMetal4RetiredSubmission());
+  if (!submission)
+    return false;
+  try {
+    size_t resourceObjectCount = 2 + resources.samplers.size() +
+        resources.sampledTextures.size() + resources.buffers.size() +
+        resources.colorTargets.size() + 2;
+    size_t pooledBufferCount = resources.argumentBuffers.size() +
+        resources.inlineBuffers.size() + resources.buffers.size();
+    submission->resourceObjects.reserve(resourceObjectCount);
+    submission->pooledBuffers.reserve(pooledBufferCount);
+    submission->submissionObjects.reserve(8);
+    if (g_irisMetal4RetiredSubmissions.capacity() <
+        kIrisMetal4RetiredSubmissionLimit) {
+      g_irisMetal4RetiredSubmissions.reserve(
+          kIrisMetal4RetiredSubmissionLimit);
+    }
+    resources.transferTo(*submission);
+    if (entry.render)
+      submission->submissionObjects.push_back(entry.render);
+    if (entry.vertexFunction)
+      submission->submissionObjects.push_back(entry.vertexFunction);
+    if (entry.fragmentFunction)
+      submission->submissionObjects.push_back(entry.fragmentFunction);
+    if (entry.depthStencil)
+      submission->submissionObjects.push_back(entry.depthStencil);
+    if (pass)
+      submission->submissionObjects.push_back(pass);
+    if (options)
+      submission->submissionObjects.push_back(options);
+    if (allocator)
+      submission->submissionObjects.push_back(allocator);
+    if (commandBuffer)
+      submission->submissionObjects.push_back(commandBuffer);
+    submission->residency = residency;
+    submission->feedbackState = feedbackState;
+    g_irisMetal4RetiredSubmissions.push_back(std::move(submission));
+  } catch (...) {
+    return false;
+  }
+  entry.render = nil;
+  entry.vertexFunction = nil;
+  entry.fragmentFunction = nil;
+  entry.depthStencil = nil;
+  residency = nil;
+  allocator = nil;
+  commandBuffer = nil;
+  pass = nil;
+  options = nil;
+  return true;
+}
+
+struct IrisTextureBufferFormat {
+  MTLPixelFormat pixelFormat = MTLPixelFormatInvalid;
+  NSUInteger bytesPerTexel = 0;
+};
+
+static bool iris_texture_buffer_format(uint32_t glInternalFormat,
+                                       IrisTextureBufferFormat &result) {
+  switch (glInternalFormat) {
+  case 0x8229: result = {MTLPixelFormatR8Unorm, 1}; break;       // GL_R8
+  case 0x822a: result = {MTLPixelFormatR16Unorm, 2}; break;     // GL_R16
+  case 0x822b: result = {MTLPixelFormatRG8Unorm, 2}; break;     // GL_RG8
+  case 0x822c: result = {MTLPixelFormatRG16Unorm, 4}; break;    // GL_RG16
+  case 0x822d: result = {MTLPixelFormatR16Float, 2}; break;     // GL_R16F
+  case 0x822e: result = {MTLPixelFormatR32Float, 4}; break;     // GL_R32F
+  case 0x822f: result = {MTLPixelFormatRG16Float, 4}; break;    // GL_RG16F
+  case 0x8230: result = {MTLPixelFormatRG32Float, 8}; break;    // GL_RG32F
+  case 0x8231: result = {MTLPixelFormatR8Sint, 1}; break;       // GL_R8I
+  case 0x8232: result = {MTLPixelFormatR8Uint, 1}; break;       // GL_R8UI
+  case 0x8233: result = {MTLPixelFormatR16Sint, 2}; break;      // GL_R16I
+  case 0x8234: result = {MTLPixelFormatR16Uint, 2}; break;      // GL_R16UI
+  case 0x8235: result = {MTLPixelFormatR32Sint, 4}; break;      // GL_R32I
+  case 0x8236: result = {MTLPixelFormatR32Uint, 4}; break;      // GL_R32UI
+  case 0x8237: result = {MTLPixelFormatRG8Sint, 2}; break;      // GL_RG8I
+  case 0x8238: result = {MTLPixelFormatRG8Uint, 2}; break;      // GL_RG8UI
+  case 0x8239: result = {MTLPixelFormatRG16Sint, 4}; break;     // GL_RG16I
+  case 0x823a: result = {MTLPixelFormatRG16Uint, 4}; break;     // GL_RG16UI
+  case 0x823b: result = {MTLPixelFormatRG32Sint, 8}; break;     // GL_RG32I
+  case 0x823c: result = {MTLPixelFormatRG32Uint, 8}; break;     // GL_RG32UI
+  case 0x8058: result = {MTLPixelFormatRGBA8Unorm, 4}; break;   // GL_RGBA8
+  case 0x805b: result = {MTLPixelFormatRGBA16Unorm, 8}; break;  // GL_RGBA16
+  case 0x8814: result = {MTLPixelFormatRGBA32Float, 16}; break; // GL_RGBA32F
+  case 0x881a: result = {MTLPixelFormatRGBA16Float, 8}; break;  // GL_RGBA16F
+  case 0x8d70: result = {MTLPixelFormatRGBA32Uint, 16}; break;  // GL_RGBA32UI
+  case 0x8d76: result = {MTLPixelFormatRGBA16Uint, 8}; break;   // GL_RGBA16UI
+  case 0x8d7c: result = {MTLPixelFormatRGBA8Uint, 4}; break;    // GL_RGBA8UI
+  case 0x8d82: result = {MTLPixelFormatRGBA32Sint, 16}; break;  // GL_RGBA32I
+  case 0x8d88: result = {MTLPixelFormatRGBA16Sint, 8}; break;   // GL_RGBA16I
+  case 0x8d8e: result = {MTLPixelFormatRGBA8Sint, 4}; break;    // GL_RGBA8I
+  case 0x8f94: result = {MTLPixelFormatR8Snorm, 1}; break;      // GL_R8_SNORM
+  case 0x8f95: result = {MTLPixelFormatRG8Snorm, 2}; break;     // GL_RG8_SNORM
+  case 0x8f97: result = {MTLPixelFormatRGBA8Snorm, 4}; break;   // GL_RGBA8_SNORM
+  case 0x8f98: result = {MTLPixelFormatR16Snorm, 2}; break;     // GL_R16_SNORM
+  case 0x8f99: result = {MTLPixelFormatRG16Snorm, 4}; break;    // GL_RG16_SNORM
+  case 0x8f9b: result = {MTLPixelFormatRGBA16Snorm, 8}; break;  // GL_RGBA16_SNORM
+  default: return false;
+  }
+  return true;
+}
+
+struct IrisMetal4ArgumentEncoderKey {
+  const void *function = nullptr;
+  uint32_t bufferIndex = 0;
+
+  bool operator==(const IrisMetal4ArgumentEncoderKey &other) const {
+    return function == other.function && bufferIndex == other.bufferIndex;
+  }
+};
+
+struct IrisMetal4ArgumentEncoderKeyHash {
+  size_t operator()(const IrisMetal4ArgumentEncoderKey &key) const {
+    size_t pointerHash = std::hash<const void *>{}(key.function);
+    return pointerHash ^ ((size_t)key.bufferIndex +
+        0x9e3779b97f4a7c15ULL + (pointerHash << 6) +
+        (pointerHash >> 2));
+  }
+};
+
+class IrisMetal4ArgumentEncoderCache {
+ public:
+  id<MTLArgumentEncoder> acquire(id<MTLFunction> function,
+                                 uint32_t bufferIndex) {
+    if (!function)
+      return nil;
+    synchronizeGeneration();
+    IrisMetal4ArgumentEncoderKey key{(const void *)function, bufferIndex};
+    auto found = encoders_.find(key);
+    if (found != encoders_.end() && found->second)
+      return [found->second retain];
+    id<MTLArgumentEncoder> encoder =
+        [function newArgumentEncoderWithBufferIndex:bufferIndex];
+    if (!encoder)
+      return nil;
+    if (encoders_.size() >= kMaximumEntries)
+      return encoder;
+    try {
+      encoders_.emplace(key, encoder);
+      return [encoder retain];
+    } catch (...) {
+      [encoder release];
+      return nil;
+    }
+  }
+
+  ~IrisMetal4ArgumentEncoderCache() { clear(); }
+
+ private:
+  static constexpr size_t kMaximumEntries = 1024;
+
+  void synchronizeGeneration() {
+    uint64_t current = g_irisMetal4ArgumentEncoderGeneration.load(
+        std::memory_order_acquire);
+    if (generation_ == current)
+      return;
+    clear();
+    generation_ = current;
+  }
+
+  void clear() {
+    for (auto &entry : encoders_) {
+      if (entry.second)
+        [entry.second release];
+    }
+    encoders_.clear();
+  }
+
+  uint64_t generation_ = 0;
+  std::unordered_map<IrisMetal4ArgumentEncoderKey,
+      id<MTLArgumentEncoder>, IrisMetal4ArgumentEncoderKeyHash> encoders_;
+};
+
+static thread_local IrisMetal4ArgumentEncoderCache
+    g_irisMetal4ArgumentEncoderCache;
+
+class IrisMetal4ArgumentTableFactory {
+ public:
+  id make() API_AVAILABLE(macos(26.0)) {
+    if (!descriptor_) {
+      MTL4ArgumentTableDescriptor *descriptor =
+          [[MTL4ArgumentTableDescriptor alloc] init];
+      descriptor.maxBufferBindCount = 31;
+      descriptor.maxTextureBindCount = 0;
+      descriptor.maxSamplerStateBindCount = 0;
+      descriptor.initializeBindings = YES;
+      descriptor_ = descriptor;
+    }
+    NSError *error = nil;
+    return descriptor_
+        ? [g_device newArgumentTableWithDescriptor:
+              (MTL4ArgumentTableDescriptor *)descriptor_ error:&error]
+        : nil;
+  }
+
+  ~IrisMetal4ArgumentTableFactory() {
+    if (descriptor_)
+      [descriptor_ release];
+  }
+
+ private:
+  // Keep the long-lived reference dynamically typed so loading the dylib on
+  // macOS 14/15 does not require a Metal 4 Objective-C class symbol.
+  id descriptor_ = nil;
+};
+
+static thread_local IrisMetal4ArgumentTableFactory
+    g_irisMetal4ArgumentTableFactory;
+
+static int iris_shadow_prepare_arguments(
+    const IrisShadowStageArguments &stage,
+    id<MTLFunction> function, IrisShadowRuntimeResources &resources,
+    IrisMetal4FrameBufferArena *frameArena = nullptr)
+    API_AVAILABLE(macos(26.0)) {
+  if (!function)
+    return stage.arguments.empty() ? 1 : 0;
+  id *tableSlot = stage.stage == 0
+      ? &resources.vertexTable : &resources.fragmentTable;
+  *tableSlot = g_irisMetal4ArgumentTableFactory.make();
+  if (!*tableSlot)
+    return -1;
+
+  size_t begin = 0;
+  while (begin < stage.arguments.size()) {
+    uint32_t outer = stage.arguments[begin].argumentBufferIndex;
+    size_t end = begin + 1;
+    while (end < stage.arguments.size() &&
+           stage.arguments[end].argumentBufferIndex == outer)
+      end++;
+    id<MTLArgumentEncoder> argumentEncoder =
+        g_irisMetal4ArgumentEncoderCache.acquire(function, outer);
+    if (!argumentEncoder || argumentEncoder.encodedLength == 0) {
+      if (argumentEncoder) [argumentEncoder release];
+      return 0;
+    }
+    id<MTLBuffer> argumentBuffer = nil;
+    NSUInteger argumentBufferOffset = 0;
+    IrisMetal4FrameBufferArena::Slice argumentSlice;
+    if (frameArena) {
+      if (frameArena->allocate(argumentEncoder.encodedLength,
+              std::max((NSUInteger)256, argumentEncoder.alignment),
+              argumentSlice)) {
+        argumentBuffer = argumentSlice.buffer;
+        argumentBufferOffset = argumentSlice.offset;
+      }
+    } else {
+      argumentBuffer = g_irisMetal4TransientBufferPool.acquire(
+          argumentEncoder.encodedLength);
+    }
+    if (!argumentBuffer) {
+      [argumentEncoder release];
+      return -1;
+    }
+    std::memset((uint8_t *)argumentBuffer.contents + argumentBufferOffset,
+                0, argumentEncoder.encodedLength);
+    [argumentEncoder setArgumentBuffer:argumentBuffer
+                                offset:argumentBufferOffset];
+    if (!frameArena)
+      resources.argumentBuffers.push_back(argumentBuffer);
+    [(id<MTL4ArgumentTable>)*tableSlot
+        setAddress:argumentBuffer.gpuAddress + argumentBufferOffset
+           atIndex:outer];
+
+    for (size_t index = begin; index < end; index++) {
+      const IrisShadowArgument &argument = stage.arguments[index];
+      if (argument.kind == 1) {
+        id<MTLBuffer> inlineBuffer = nil;
+        NSUInteger inlineBufferOffset = 0;
+        IrisMetal4FrameBufferArena::Slice inlineSlice;
+        if (frameArena) {
+          if (frameArena->allocate(argument.inlineBytes.size(), 256,
+                                   inlineSlice)) {
+            inlineBuffer = inlineSlice.buffer;
+            inlineBufferOffset = inlineSlice.offset;
+          }
+        } else {
+          inlineBuffer = g_irisMetal4TransientBufferPool.acquire(
+              argument.inlineBytes.size());
+        }
+        if (!inlineBuffer) {
+          [argumentEncoder release];
+          return -1;
+        }
+        std::memcpy((uint8_t *)inlineBuffer.contents + inlineBufferOffset,
+                    argument.inlineBytes.data(),
+                    argument.inlineBytes.size());
+        if (!frameArena)
+          resources.inlineBuffers.push_back(inlineBuffer);
+        [argumentEncoder setBuffer:inlineBuffer offset:inlineBufferOffset
+                            atIndex:argument.id];
+      } else if (argument.kind == 2) {
+        [argumentEncoder setBuffer:resources.buffers[argument.reference]
+                            offset:0 atIndex:argument.id];
+      } else if (argument.kind == 3) {
+        auto texture = resources.sampledByName.find(argument.reference);
+        if (texture == resources.sampledByName.end()) {
+          [argumentEncoder release];
+          return -1;
+        }
+        [argumentEncoder setTexture:texture->second atIndex:argument.id];
+      } else if (argument.kind == 7) {
+        IrisTextureBufferFormat format;
+        id<MTLBuffer> storage = resources.buffers[argument.reference];
+        if (!storage ||
+            !iris_texture_buffer_format(argument.auxiliary, format) ||
+            format.bytesPerTexel == 0 || storage.length == 0 ||
+            storage.length % format.bytesPerTexel != 0) {
+          [argumentEncoder release];
+          return 0;
+        }
+        NSUInteger texels = storage.length / format.bytesPerTexel;
+        if (texels == 0 ||
+            texels > std::numeric_limits<NSUInteger>::max() /
+                         format.bytesPerTexel) {
+          [argumentEncoder release];
+          return 0;
+        }
+        // A texture view backed by an MTLBuffer is a linear texture. Metal
+        // validates bytesPerRow even for MTLTextureTypeTextureBuffer, so zero
+        // is not a sentinel here: it must cover the complete texel row.
+        NSUInteger bytesPerRow = texels * format.bytesPerTexel;
+        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+            textureBufferDescriptorWithPixelFormat:format.pixelFormat
+                                             width:texels
+                                   resourceOptions:MTLResourceStorageModeShared
+                                             usage:MTLTextureUsageShaderRead];
+        id<MTLTexture> texture = [storage
+            newTextureWithDescriptor:descriptor
+                                offset:0
+                           bytesPerRow:bytesPerRow];
+        if (!texture) {
+          [argumentEncoder release];
+          return 0;
+        }
+        resources.sampledTextures.push_back(texture);
+        [argumentEncoder setTexture:texture atIndex:argument.id];
+      } else if (argument.kind == 4 || argument.kind == 6) {
+        // The packet does not yet carry the SPIR-V sampled type needed to
+        // create a type-correct zero texture/default sampler pair.
+        [argumentEncoder release];
+        return 0;
+      } else if (argument.kind == 5) {
+        bool samplerSupported = false;
+        id<MTLSamplerState> sampler = iris_shadow_sampler(argument.sampler,
+                                                          samplerSupported);
+        if (!samplerSupported || !sampler) {
+          if (sampler) [sampler release];
+          [argumentEncoder release];
+          return 0;
+        }
+        resources.samplers.push_back(sampler);
+        [argumentEncoder setSamplerState:sampler atIndex:argument.id];
+      }
+    }
+    [argumentEncoder release];
+    begin = end;
+  }
+  return 1;
+}
+
+namespace {
+
+struct IrisMetal4GraphPreparedDraw {
+  IrisShadowReplayPacket packet;
+  IrisMetal4PipelineEntry pipeline;
+  IrisShadowRuntimeResources resources;
+  MTLPrimitiveType primitiveType = MTLPrimitiveTypeTriangle;
+  std::vector<id> additionalAllocations;
+  std::vector<id> encodedObjects;
+  bool pipelineRetained = false;
+
+  ~IrisMetal4GraphPreparedDraw() {
+    for (id object : encodedObjects) {
+      if (object)
+        [object release];
+    }
+    if (!pipelineRetained)
+      return;
+    if (pipeline.render) [pipeline.render release];
+    if (pipeline.vertexFunction) [pipeline.vertexFunction release];
+    if (pipeline.fragmentFunction) [pipeline.fragmentFunction release];
+    if (pipeline.depthStencil) [pipeline.depthStencil release];
+  }
+};
+
+static bool iris_graph_texture_override_format_compatible(
+    MTLPixelFormat graphFormat, MTLPixelFormat capturedFormat) {
+  // CGL cannot expose a packed RG11B10F attachment as an IOSurface, so the GL
+  // validation bridge expands it to RGBA16F.  A Metal-owned graph samples the
+  // original packed texture directly; both are floating-point shader inputs.
+  return graphFormat == capturedFormat ||
+      (graphFormat == MTLPixelFormatRG11B10Float &&
+       capturedFormat == MTLPixelFormatRGBA16Float);
+}
+
+static bool iris_input_handoff_format_compatible(
+    const IrisMetal4InputHandoff &handoff,
+    MTLPixelFormat logicalFormat) {
+  if (!handoff.metalTexture)
+    return false;
+  MTLPixelFormat physicalFormat = handoff.metalTexture.pixelFormat;
+  if (physicalFormat == logicalFormat)
+    return true;
+  // CGL exposes the 8-bit IOSurface as BGRA. Metal must use the matching
+  // physical pixel format so texture sampling returns logical RGBA channels.
+  return handoff.kind == 1 && logicalFormat == MTLPixelFormatRGBA8Unorm &&
+      physicalFormat == MTLPixelFormatBGRA8Unorm;
+}
+
+static bool iris_graph_prepare_input_textures(
+    const std::vector<IrisShadowTexture> &inputs,
+    std::vector<IrisMetal4GraphFramePreparedInputTexture> &textures,
+    jlong &reason) API_AVAILABLE(macos(26.0)) {
+  reason = 0;
+  try {
+    textures.reserve(inputs.size());
+  } catch (...) {
+    reason = 5;
+    return false;
+  }
+  uint64_t uploadedBytes = 0;
+  for (const auto &captured : inputs) {
+    if (captured.storageKind != 1 || captured.layer != 0 ||
+        captured.mipLevel != 0) {
+      reason = kIrisGraphReasonDrawTextureSubresourceUnsupported;
+      return false;
+    }
+    MTLPixelFormat format = MTLPixelFormatInvalid;
+    const uint8_t *uploadBytes = nullptr;
+    uint32_t uploadBytesPerPixel = 0;
+    std::vector<uint8_t> expanded;
+    if (!iris_shadow_texture_upload(captured, format, uploadBytes,
+                                    uploadBytesPerPixel, expanded)) {
+      reason = kIrisGraphReasonDrawTextureFormatUnsupported;
+      return false;
+    }
+    uint64_t byteLength = (uint64_t)captured.width * captured.height;
+    if (byteLength > UINT64_MAX / uploadBytesPerPixel ||
+        !iris_shadow_add_bounded(uploadedBytes,
+            byteLength * uploadBytesPerPixel,
+            kIrisShadowReplayMaximumTextureBytes)) {
+      reason = kIrisGraphReasonDrawTextureByteBudgetExceeded;
+      return false;
+    }
+    id<MTLTexture> texture = nil;
+    @try {
+      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+          texture2DDescriptorWithPixelFormat:format width:captured.width
+                                        height:captured.height mipmapped:NO];
+      descriptor.storageMode = MTLStorageModeShared;
+      descriptor.usage = MTLTextureUsageShaderRead;
+      texture = [g_device newTextureWithDescriptor:descriptor];
+      if (texture) {
+        [texture replaceRegion:MTLRegionMake2D(0, 0, captured.width,
+                                               captured.height)
+                  mipmapLevel:0 withBytes:uploadBytes
+                  bytesPerRow:(NSUInteger)captured.width *
+                              uploadBytesPerPixel];
+      }
+    } @catch (NSException *) {
+      if (texture)
+        [texture release];
+      reason = 5;
+      return false;
+    }
+    if (!texture) {
+      reason = 5;
+      return false;
+    }
+    try {
+      IrisMetal4GraphFramePreparedInputTexture prepared;
+      prepared.glName = captured.glName;
+      prepared.format = captured.format;
+      prepared.width = captured.width;
+      prepared.height = captured.height;
+      prepared.layer = captured.layer;
+      prepared.mipLevel = captured.mipLevel;
+      prepared.bytesPerPixel = captured.bytesPerPixel;
+      prepared.texture = texture;
+      textures.push_back(std::move(prepared));
+    } catch (...) {
+      [texture release];
+      reason = 5;
+      return false;
+    }
+  }
+  return true;
+}
+
+static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
+    const IrisMetal4GraphFrameOperation &operation,
+    const std::unordered_map<uint32_t, id<MTLTexture>> &graphTextures,
+    const std::vector<id<MTLBuffer>> &graphInputBuffers,
+    const std::vector<IrisMetal4GraphFramePreparedInputTexture>
+        &graphInputTextures,
+    IrisMetal4FrameBufferArena *frameArena,
+    std::vector<uint64_t> &inputSurfaceLeases,
+    int &outcome, jlong &reason) API_AVAILABLE(macos(26.0)) {
+  outcome = -1;
+  reason = 5;
+  std::unique_ptr<IrisMetal4GraphPreparedDraw> prepared(
+      new (std::nothrow) IrisMetal4GraphPreparedDraw());
+  if (!prepared)
+    return nullptr;
+  try {
+    bool parsedReplay = operation.borrowedReplayPacket
+        ? parse_iris_shadow_graph_replay_packet(
+            operation.borrowedReplayPacket, operation.replayPacketLength,
+            prepared->packet)
+        : parse_iris_shadow_graph_replay_packet(operation.replayPacket,
+            prepared->packet);
+    if (!parsedReplay) {
+      reason = 5;
+      return nullptr;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
+      auto found = g_irisMetal4Pipelines.find(operation.pipelineKey);
+      if (found == g_irisMetal4Pipelines.end() || !found->second.render) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawPipelineUnavailable;
+        return nullptr;
+      }
+      prepared->pipeline = found->second;
+      [prepared->pipeline.render retain];
+      if (prepared->pipeline.vertexFunction)
+        [prepared->pipeline.vertexFunction retain];
+      if (prepared->pipeline.fragmentFunction)
+        [prepared->pipeline.fragmentFunction retain];
+      if (prepared->pipeline.depthStencil)
+        [prepared->pipeline.depthStencil retain];
+      prepared->pipelineRetained = true;
+    }
+
+    IrisMetal4PipelineEntry &entry = prepared->pipeline;
+    IrisShadowReplayPacket &packet = prepared->packet;
+    prepared->encodedObjects.reserve(1);
+    uint32_t packetTopology = packet.draw.primitiveMode <= 5
+        ? packet.draw.primitiveMode : UINT32_MAX;
+    if (!iris_metal_primitive_type(entry.topology,
+                                   prepared->primitiveType) ||
+        packetTopology != iris_metal_effective_packet_topology(
+            entry.topology) || entry.rasterSampleCount == 0 ||
+        (entry.colorFormats.empty() &&
+         entry.depthFormat == MTLPixelFormatInvalid &&
+         entry.stencilFormat == MTLPixelFormatInvalid)) {
+      outcome = 0;
+      reason = kIrisGraphReasonDrawPipelineStateMismatch;
+      return nullptr;
+    }
+
+    auto graphTexture = [&](uint32_t resourceId) -> id<MTLTexture> {
+      auto found = graphTextures.find(resourceId);
+      return found == graphTextures.end() ? nil : found->second;
+    };
+    auto validTarget = [&](id<MTLTexture> texture,
+                           MTLPixelFormat format) -> bool {
+      return texture && texture.pixelFormat == format &&
+          texture.sampleCount == entry.rasterSampleCount &&
+          texture.width == packet.width && texture.height == packet.height &&
+          (texture.usage & MTLTextureUsageRenderTarget) != 0;
+    };
+
+    prepared->resources.colorTargets.resize(entry.colorFormats.size(), nil);
+    for (const auto &target : operation.colorTargets) {
+      if (target.first >= entry.colorFormats.size() ||
+          entry.colorFormats[target.first] == MTLPixelFormatInvalid) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawColorSlotMismatch;
+        return nullptr;
+      }
+      id<MTLTexture> texture = graphTexture(target.second);
+      if (!validTarget(texture, entry.colorFormats[target.first])) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawColorTargetMismatch;
+        return nullptr;
+      }
+      prepared->resources.colorTargets[target.first] = [texture retain];
+    }
+    for (size_t slot = 0; slot < entry.colorFormats.size(); slot++) {
+      if ((entry.colorFormats[slot] != MTLPixelFormatInvalid) !=
+          (prepared->resources.colorTargets[slot] != nil)) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawColorCoverageMismatch;
+        return nullptr;
+      }
+    }
+
+    if ((entry.depthFormat != MTLPixelFormatInvalid) !=
+        (operation.depthResource >= 0) ||
+        (entry.stencilFormat != MTLPixelFormatInvalid) !=
+        (operation.stencilResource >= 0)) {
+      outcome = 0;
+      reason = kIrisGraphReasonDrawDepthStencilPresenceMismatch;
+      return nullptr;
+    }
+    if (operation.depthResource >= 0) {
+      id<MTLTexture> texture = graphTexture(
+          (uint32_t)operation.depthResource);
+      if (!validTarget(texture, entry.depthFormat)) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawDepthTargetMismatch;
+        return nullptr;
+      }
+      prepared->resources.depthTarget = [texture retain];
+    }
+    if (operation.stencilResource >= 0) {
+      id<MTLTexture> texture = graphTexture(
+          (uint32_t)operation.stencilResource);
+      if (!validTarget(texture, entry.stencilFormat)) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawStencilTargetMismatch;
+        return nullptr;
+      }
+      if (operation.stencilResource == operation.depthResource) {
+        if (entry.stencilFormat != entry.depthFormat) {
+          outcome = 0;
+          reason = kIrisGraphReasonDrawDepthStencilAliasMismatch;
+          return nullptr;
+        }
+        prepared->resources.stencilTarget =
+            prepared->resources.depthTarget;
+      } else {
+        if (entry.stencilFormat == entry.depthFormat &&
+            entry.depthFormat != MTLPixelFormatInvalid) {
+          outcome = 0;
+          reason = kIrisGraphReasonDrawDepthStencilAliasMismatch;
+          return nullptr;
+        }
+        prepared->resources.stencilTarget = [texture retain];
+      }
+    }
+
+    for (const auto &image : packet.buffers) {
+      id<MTLBuffer> buffer = nil;
+      if (image.storageKind == 3) {
+        uint64_t externalIndex = image.sharedHandle - 1;
+        if (externalIndex >= graphInputBuffers.size()) {
+          outcome = 0;
+          reason = kIrisGraphReasonDrawExternalBufferIndexMismatch;
+          return nullptr;
+        }
+        if (!graphInputBuffers[(size_t)externalIndex]) {
+          outcome = 0;
+          reason = kIrisGraphReasonDrawExternalBufferMissing;
+          return nullptr;
+        }
+        if (graphInputBuffers[(size_t)externalIndex].length !=
+            image.byteLength) {
+          dbg("WARN: Iris graph external buffer mismatch index=%llu "
+              "count=%zu expected=%u actual=%llu\n",
+              (unsigned long long)externalIndex,
+              graphInputBuffers.size(), image.byteLength,
+              (unsigned long long)(externalIndex < graphInputBuffers.size() &&
+                      graphInputBuffers[(size_t)externalIndex]
+                  ? graphInputBuffers[(size_t)externalIndex].length : 0));
+          outcome = 0;
+          reason = kIrisGraphReasonDrawExternalBufferLengthMismatch;
+          return nullptr;
+        }
+        buffer = [graphInputBuffers[(size_t)externalIndex] retain];
+      } else if (image.storageKind == 2) {
+        id<MTLBuffer> resident = iris_metal4_resident_buffer(
+            image.sharedHandle, image.byteLength);
+        if (resident)
+          buffer = [resident retain];
+        if (!buffer) {
+          outcome = 0;
+          reason = kIrisGraphReasonDrawBufferResidencyMismatch;
+          return nullptr;
+        }
+      } else {
+        buffer = g_irisMetal4TransientBufferPool.acquire(
+            (NSUInteger)image.byteLength);
+        if (buffer)
+          std::memcpy(buffer.contents, image.bytes.data(), image.byteLength);
+      }
+      if (!buffer)
+        return nullptr;
+      prepared->resources.buffers.push_back(buffer);
+      prepared->resources.pooledBufferOwnership.push_back(
+          image.storageKind == 1 ? 1 : 0);
+      prepared->additionalAllocations.push_back(
+          (id<MTLAllocation>)buffer);
+    }
+
+    uint64_t sampledTextureBytes = 0;
+    size_t overrideUses = 0;
+    for (const auto &captured : packet.textures) {
+      auto override = operation.textureOverrides.find(captured.glName);
+      if (override != operation.textureOverrides.end()) {
+        id<MTLTexture> texture = graphTexture(override->second);
+        MTLPixelFormat expectedFormat =
+            iris_metal_pixel_format(captured.format);
+        NSUInteger expectedWidth = texture &&
+            captured.mipLevel < texture.mipmapLevelCount
+                ? std::max((NSUInteger)1,
+                    texture.width >> captured.mipLevel) : 0;
+        NSUInteger expectedHeight = texture &&
+            captured.mipLevel < texture.mipmapLevelCount
+                ? std::max((NSUInteger)1,
+                    texture.height >> captured.mipLevel) : 0;
+        uint64_t logicalBytes = (uint64_t)captured.width *
+            captured.height * captured.bytesPerPixel;
+        if (!texture || expectedFormat == MTLPixelFormatInvalid ||
+            !iris_graph_texture_override_format_compatible(
+                texture.pixelFormat, expectedFormat) ||
+            captured.layer != 0 ||
+            captured.mipLevel >= texture.mipmapLevelCount ||
+            expectedWidth != captured.width ||
+            expectedHeight != captured.height ||
+            (texture.usage & MTLTextureUsageShaderRead) == 0 ||
+            !iris_shadow_add_bounded(sampledTextureBytes, logicalBytes,
+                kIrisShadowReplayMaximumTextureBytes)) {
+          outcome = 0;
+          reason = kIrisGraphReasonDrawTextureOverrideMismatch;
+          return nullptr;
+        }
+        id<MTLTexture> retainedTexture = [texture retain];
+        prepared->resources.sampledTextures.push_back(retainedTexture);
+        prepared->resources.sampledByName.emplace(captured.glName,
+                                                   retainedTexture);
+        overrideUses++;
+        continue;
+      }
+
+      if (captured.storageKind == 4) {
+        uint64_t externalIndex = captured.sharedHandle - 1;
+        if (externalIndex >= graphInputTextures.size()) {
+          outcome = 0;
+          reason = kIrisGraphReasonDrawExternalTextureIndexMismatch;
+          return nullptr;
+        }
+        const auto &input = graphInputTextures[(size_t)externalIndex];
+        if (!input.texture) {
+          outcome = 0;
+          reason = kIrisGraphReasonDrawExternalTextureMissing;
+          return nullptr;
+        }
+        uint64_t logicalBytes = (uint64_t)captured.width *
+            captured.height * captured.bytesPerPixel;
+        if (input.glName != captured.glName ||
+            input.format != captured.format ||
+            input.width != captured.width ||
+            input.height != captured.height ||
+            input.layer != captured.layer ||
+            input.mipLevel != captured.mipLevel ||
+            input.bytesPerPixel != captured.bytesPerPixel ||
+            (input.texture.usage & MTLTextureUsageShaderRead) == 0 ||
+            !iris_shadow_add_bounded(sampledTextureBytes, logicalBytes,
+                kIrisShadowReplayMaximumTextureBytes)) {
+          outcome = 0;
+          reason = kIrisGraphReasonDrawExternalTextureMetadataMismatch;
+          return nullptr;
+        }
+        id<MTLTexture> texture = [input.texture retain];
+        prepared->resources.sampledTextures.push_back(texture);
+        prepared->resources.sampledByName.emplace(captured.glName, texture);
+        prepared->additionalAllocations.push_back(
+            (id<MTLAllocation>)texture);
+        continue;
+      }
+
+      if (captured.storageKind == 2) {
+        IrisMetal4InputHandoff *shared = iris_metal4_find_input_handoff(
+            captured.glName, captured.sharedHandle);
+        MTLPixelFormat expectedFormat =
+            iris_metal_pixel_format(captured.format);
+        if (!shared || shared->width != captured.width ||
+            shared->height != captured.height ||
+            !iris_input_handoff_format_compatible(
+                *shared, expectedFormat) ||
+            !iris_metal4_track_input_surface_lease(
+                *shared, inputSurfaceLeases) ||
+            !iris_shadow_add_bounded(sampledTextureBytes,
+                (uint64_t)captured.width * captured.height *
+                    captured.bytesPerPixel,
+                kIrisShadowReplayMaximumTextureBytes)) {
+          outcome = 0;
+          reason = kIrisGraphReasonDrawSharedTextureMismatch;
+          return nullptr;
+        }
+        IrisMetal4InputHandoffReadiness readiness =
+            iris_metal4_ensure_input_handoff_ready(*shared);
+        if (readiness != IrisMetal4InputHandoffReadiness::READY) {
+          outcome = 0;
+          reason = readiness ==
+                  IrisMetal4InputHandoffReadiness::FENCE_TIMEOUT
+              ? kIrisGraphReasonDrawSharedTextureFenceTimeout
+              : kIrisGraphReasonDrawSharedTextureMismatch;
+          return nullptr;
+        }
+        id<MTLTexture> texture = [shared->metalTexture retain];
+        prepared->resources.sampledTextures.push_back(texture);
+        prepared->resources.sampledByName.emplace(captured.glName, texture);
+        prepared->additionalAllocations.push_back(
+            (id<MTLAllocation>)texture);
+        continue;
+      }
+
+      if (captured.storageKind == 3) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawTextureOverrideMismatch;
+        return nullptr;
+      }
+
+      MTLPixelFormat format = MTLPixelFormatInvalid;
+      const uint8_t *uploadBytes = nullptr;
+      uint32_t uploadBytesPerPixel = 0;
+      std::vector<uint8_t> expanded;
+      if (captured.layer != 0 || captured.mipLevel != 0) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawTextureSubresourceUnsupported;
+        return nullptr;
+      }
+      if (!iris_shadow_texture_upload(captured, format, uploadBytes,
+                                      uploadBytesPerPixel, expanded)) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawTextureFormatUnsupported;
+        return nullptr;
+      }
+      if (!iris_shadow_add_bounded(sampledTextureBytes,
+              (uint64_t)captured.width * captured.height *
+                  uploadBytesPerPixel,
+              kIrisShadowReplayMaximumTextureBytes)) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawTextureByteBudgetExceeded;
+        return nullptr;
+      }
+      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+          texture2DDescriptorWithPixelFormat:format width:captured.width
+                                        height:captured.height mipmapped:NO];
+      descriptor.storageMode = MTLStorageModeShared;
+      descriptor.usage = MTLTextureUsageShaderRead;
+      id<MTLTexture> texture = [g_device newTextureWithDescriptor:descriptor];
+      if (!texture)
+        return nullptr;
+      [texture replaceRegion:MTLRegionMake2D(0, 0, captured.width,
+                                             captured.height)
+                mipmapLevel:0 withBytes:uploadBytes
+                bytesPerRow:(NSUInteger)captured.width *
+                            uploadBytesPerPixel];
+      prepared->resources.sampledTextures.push_back(texture);
+      prepared->resources.sampledByName.emplace(captured.glName, texture);
+      prepared->additionalAllocations.push_back(
+          (id<MTLAllocation>)texture);
+    }
+    if (overrideUses != operation.textureOverrides.size()) {
+      outcome = 0;
+      reason = kIrisGraphReasonDrawUnusedTextureOverride;
+      return nullptr;
+    }
+
+    for (const auto &stage : packet.stages) {
+      int result = iris_shadow_prepare_arguments(stage,
+          stage.stage == 0 ? entry.vertexFunction : entry.fragmentFunction,
+          prepared->resources, frameArena);
+      if (result <= 0) {
+        outcome = result;
+        reason = result == 0
+            ? kIrisGraphReasonDrawArgumentBindingUnsupported : 5;
+        return nullptr;
+      }
+    }
+    for (id<MTLBuffer> buffer : prepared->resources.inlineBuffers) {
+      prepared->additionalAllocations.push_back(
+          (id<MTLAllocation>)buffer);
+    }
+    for (id<MTLBuffer> buffer : prepared->resources.argumentBuffers) {
+      prepared->additionalAllocations.push_back(
+          (id<MTLAllocation>)buffer);
+    }
+
+    if (!packet.vertexBuffers.empty() &&
+        !prepared->resources.vertexTable) {
+      prepared->resources.vertexTable =
+          g_irisMetal4ArgumentTableFactory.make();
+      if (!prepared->resources.vertexTable)
+        return nullptr;
+    }
+    for (const auto &binding : packet.vertexBuffers) {
+      [(id<MTL4ArgumentTable>)prepared->resources.vertexTable
+          setAddress:prepared->resources.buffers[binding.second].gpuAddress
+             atIndex:binding.first];
+    }
+
+    outcome = 1;
+    reason = 0;
+    return prepared.release();
+  } catch (...) {
+    outcome = -1;
+    reason = 5;
+    return nullptr;
+  }
+}
+
+static NSUInteger iris_graph_prepared_draw_allocation_count(
+    const IrisMetal4GraphPreparedDraw *draw) API_AVAILABLE(macos(26.0)) {
+  return draw ? draw->additionalAllocations.size() : 0;
+}
+
+static void iris_graph_prepared_draw_append_residency_allocations(
+    const IrisMetal4GraphPreparedDraw *draw,
+    std::vector<id<MTLAllocation>> &allocations)
+    API_AVAILABLE(macos(26.0)) {
+  if (!draw)
+    return;
+  for (id allocation : draw->additionalAllocations) {
+    if (allocation)
+      allocations.push_back((id<MTLAllocation>)allocation);
+  }
+}
+
+static bool iris_graph_prepared_draw_samples_pass_target(
+    const IrisMetal4GraphPreparedDraw *draw) API_AVAILABLE(macos(26.0)) {
+  if (!draw)
+    return true;
+  const IrisShadowRuntimeResources &resources = draw->resources;
+  for (id<MTLTexture> sampled : resources.sampledTextures) {
+    if (!sampled)
+      continue;
+    if (sampled == resources.depthTarget ||
+        sampled == resources.stencilTarget) {
+      return true;
+    }
+    for (id<MTLTexture> target : resources.colorTargets) {
+      if (sampled == target)
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool iris_graph_prepared_draw_can_share_pass(
+    const IrisMetal4GraphPreparedDraw *first,
+    const IrisMetal4GraphPreparedDraw *next) API_AVAILABLE(macos(26.0)) {
+  if (!first || !next ||
+      iris_graph_prepared_draw_samples_pass_target(first) ||
+      iris_graph_prepared_draw_samples_pass_target(next) ||
+      first->packet.width != next->packet.width ||
+      first->packet.height != next->packet.height ||
+      first->pipeline.rasterSampleCount !=
+          next->pipeline.rasterSampleCount ||
+      first->resources.colorTargets.size() !=
+          next->resources.colorTargets.size() ||
+      first->resources.depthTarget != next->resources.depthTarget ||
+      first->resources.stencilTarget != next->resources.stencilTarget) {
+    return false;
+  }
+  for (size_t slot = 0; slot < first->resources.colorTargets.size();
+       slot++) {
+    if (first->resources.colorTargets[slot] !=
+        next->resources.colorTargets[slot]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static int iris_graph_encode_prepared_draw_commands(
+    IrisMetal4GraphPreparedDraw *draw,
+    id<MTL4RenderCommandEncoder> encoder,
+    jlong &reason) API_AVAILABLE(macos(26.0)) {
+  if (!draw || !encoder) {
+    reason = 5;
+    return -1;
+  }
+  IrisShadowReplayPacket &packet = draw->packet;
+  IrisMetal4PipelineEntry &entry = draw->pipeline;
+  IrisShadowRuntimeResources &resources = draw->resources;
+  [encoder setRenderPipelineState:entry.render];
+  [encoder setDepthStencilState:entry.depthStencil];
+  [encoder setCullMode:entry.cullMode];
+  [encoder setFrontFacingWinding:entry.frontFacingWinding];
+  [encoder setTriangleFillMode:entry.triangleFillMode];
+  [encoder setDepthClipMode:entry.depthClipMode];
+  uint32_t offsetBit = entry.topology == 0 ? 1u
+      : (entry.topology >= 1 && entry.topology <= 3 ? 2u : 4u);
+  if ((entry.polygonOffsetMask & offsetBit) != 0) {
+    [encoder setDepthBias:entry.depthBias slopeScale:entry.slopeScale
+                    clamp:entry.depthBiasClamp];
+  } else {
+    // A fused encoder retains dynamic raster state between draws.
+    [encoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+  }
+  [encoder setStencilFrontReferenceValue:entry.frontStencilReference
+                      backReferenceValue:entry.backStencilReference];
+  MTLViewport viewport = {(double)packet.viewport.x,
+      (double)((int64_t)packet.height - packet.viewport.y -
+               packet.viewport.height),
+      (double)packet.viewport.width, (double)packet.viewport.height,
+      0.0, 1.0};
+  [encoder setViewport:viewport];
+  int64_t sx0 = packet.scissorEnabled
+      ? std::max<int64_t>(0, packet.scissor.x) : 0;
+  int64_t sy0 = packet.scissorEnabled
+      ? std::max<int64_t>(0, packet.scissor.y) : 0;
+  int64_t sx1 = packet.scissorEnabled
+      ? std::min<int64_t>(packet.width,
+          (int64_t)packet.scissor.x + packet.scissor.width)
+      : packet.width;
+  int64_t sy1 = packet.scissorEnabled
+      ? std::min<int64_t>(packet.height,
+          (int64_t)packet.scissor.y + packet.scissor.height)
+      : packet.height;
+  if (sx1 <= sx0 || sy1 <= sy0) {
+    reason = 0;
+    return 1;
+  }
+  MTLScissorRect scissor = {(NSUInteger)sx0,
+      (NSUInteger)((int64_t)packet.height - sy1),
+      (NSUInteger)(sx1 - sx0), (NSUInteger)(sy1 - sy0)};
+  [encoder setScissorRect:scissor];
+  if (resources.vertexTable) {
+    [encoder setArgumentTable:resources.vertexTable
+                      atStages:MTLRenderStageVertex];
+  }
+  if (resources.fragmentTable) {
+    [encoder setArgumentTable:resources.fragmentTable
+                      atStages:MTLRenderStageFragment];
+  }
+  if (packet.draw.kind == 1) {
+    [encoder drawPrimitives:draw->primitiveType
+                 vertexStart:(NSUInteger)packet.draw.firstVertex
+                 vertexCount:packet.draw.vertexCount
+               instanceCount:packet.draw.instanceCount
+                baseInstance:packet.draw.baseInstance];
+  } else {
+    if (packet.indexBufferImage < 0 ||
+        (size_t)packet.indexBufferImage >= resources.buffers.size()) {
+      reason = kIrisGraphReasonDrawIndexBufferMissing;
+      return 0;
+    }
+    id<MTLBuffer> indices =
+        resources.buffers[(size_t)packet.indexBufferImage];
+    MTLIndexType indexType = packet.draw.indexElementBytes == 2
+        ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+    for (const auto &indexed : packet.draw.indexed) {
+      uint64_t required = (uint64_t)indexed.count *
+                          packet.draw.indexElementBytes;
+      if (indexed.offset % packet.draw.indexElementBytes != 0 ||
+          indexed.offset > indices.length ||
+          required > indices.length - indexed.offset) {
+        reason = kIrisGraphReasonDrawIndexRangeInvalid;
+        return 0;
+      }
+      [encoder drawIndexedPrimitives:draw->primitiveType
+                          indexCount:indexed.count
+                           indexType:indexType
+                         indexBuffer:indices.gpuAddress + indexed.offset
+                   indexBufferLength:indices.length - indexed.offset
+                       instanceCount:packet.draw.instanceCount
+                          baseVertex:indexed.baseVertex
+                        baseInstance:packet.draw.baseInstance];
+    }
+  }
+  reason = 0;
+  return 1;
+}
+
+static int iris_graph_encode_prepared_draw_run(
+    std::vector<IrisMetal4GraphPreparedDraw *> &draws,
+    size_t begin, size_t end,
+    id<MTL4CommandBuffer> commandBuffer, bool applyBarrier,
+    MTLStages graphStages,
+    const IrisMetal4GraphFrameOperation &drawOperation,
+    const std::vector<const IrisMetal4GraphFrameOperation *> &loadClears,
+    jlong &reason) API_AVAILABLE(macos(26.0)) {
+  if (!commandBuffer || begin >= end || end > draws.size() ||
+      !draws[begin]) {
+    reason = 5;
+    return -1;
+  }
+  IrisMetal4GraphPreparedDraw *first = draws[begin];
+  IrisShadowReplayPacket &packet = first->packet;
+  IrisMetal4PipelineEntry &entry = first->pipeline;
+  IrisShadowRuntimeResources &resources = first->resources;
+  MTL4RenderPassDescriptor *pass =
+      [[MTL4RenderPassDescriptor alloc] init];
+  if (!pass) {
+    reason = 5;
+    return -1;
+  }
+  pass.defaultRasterSampleCount = entry.rasterSampleCount;
+  pass.renderTargetWidth = packet.width;
+  pass.renderTargetHeight = packet.height;
+  for (size_t slot = 0; slot < resources.colorTargets.size(); slot++) {
+    if (!resources.colorTargets[slot])
+      continue;
+    MTLRenderPassColorAttachmentDescriptor *attachment =
+        pass.colorAttachments[slot];
+    attachment.texture = resources.colorTargets[slot];
+    attachment.loadAction = MTLLoadActionLoad;
+    attachment.storeAction = MTLStoreActionStore;
+  }
+  if (resources.depthTarget) {
+    pass.depthAttachment.texture = resources.depthTarget;
+    pass.depthAttachment.loadAction = MTLLoadActionLoad;
+    pass.depthAttachment.storeAction = MTLStoreActionStore;
+  }
+  if (resources.stencilTarget) {
+    pass.stencilAttachment.texture = resources.stencilTarget;
+    pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+    pass.stencilAttachment.storeAction = MTLStoreActionStore;
+  }
+  for (const IrisMetal4GraphFrameOperation *clear : loadClears) {
+    if (!clear || clear->kind != 1) {
+      [pass release];
+      reason = 5;
+      return -1;
+    }
+    bool matched = false;
+    if (clear->aspect == 0) {
+      for (const auto &target : drawOperation.colorTargets) {
+        if (target.second != clear->firstResource ||
+            target.first >= resources.colorTargets.size() ||
+            !resources.colorTargets[target.first]) {
+          continue;
+        }
+        MTLRenderPassColorAttachmentDescriptor *attachment =
+            pass.colorAttachments[target.first];
+        attachment.loadAction = MTLLoadActionClear;
+        attachment.clearColor = MTLClearColorMake(
+            iris_graph_frame_clear_component(clear->valueKind,
+                clear->rawValues[0]),
+            iris_graph_frame_clear_component(clear->valueKind,
+                clear->rawValues[1]),
+            iris_graph_frame_clear_component(clear->valueKind,
+                clear->rawValues[2]),
+            iris_graph_frame_clear_component(clear->valueKind,
+                clear->rawValues[3]));
+        matched = true;
+        break;
+      }
+    }
+    if (clear->aspect == 1 || clear->aspect == 3) {
+      if (drawOperation.depthResource >= 0 &&
+          (uint32_t)drawOperation.depthResource == clear->firstResource &&
+          resources.depthTarget) {
+        pass.depthAttachment.loadAction = MTLLoadActionClear;
+        pass.depthAttachment.clearDepth =
+            iris_graph_frame_clear_component(clear->valueKind,
+                clear->rawValues[0]);
+        matched = true;
+      }
+    }
+    if (clear->aspect == 2 || clear->aspect == 3) {
+      if (drawOperation.stencilResource >= 0 &&
+          (uint32_t)drawOperation.stencilResource == clear->firstResource &&
+          resources.stencilTarget) {
+        size_t valueIndex = clear->aspect == 3 ? 1 : 0;
+        pass.stencilAttachment.loadAction = MTLLoadActionClear;
+        pass.stencilAttachment.clearStencil =
+            (uint32_t)clear->rawValues[valueIndex];
+        matched = true;
+      }
+    }
+    if (!matched) {
+      [pass release];
+      reason = 5;
+      return -1;
+    }
+  }
+  id<MTL4RenderCommandEncoder> encoder =
+      [commandBuffer renderCommandEncoderWithDescriptor:pass];
+  first->encodedObjects.push_back(pass);
+  if (!encoder) {
+    reason = 5;
+    return -1;
+  }
+  if (applyBarrier) {
+    [encoder barrierAfterQueueStages:graphStages
+                        beforeStages:graphStages
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+  }
+  for (size_t index = begin; index < end; index++) {
+    int outcome = iris_graph_encode_prepared_draw_commands(
+        draws[index], encoder, reason);
+    if (outcome <= 0) {
+      [encoder endEncoding];
+      return outcome;
+    }
+  }
+  [encoder endEncoding];
+  reason = 0;
+  return 1;
+}
+
+static void iris_graph_destroy_prepared_draw(
+    IrisMetal4GraphPreparedDraw *draw) API_AVAILABLE(macos(26.0)) {
+  delete draw;
+}
+
+static bool iris_graph_retire_submission(
+    std::vector<IrisMetal4GraphPreparedDraw *> &preparedDraws,
+    std::vector<IrisMetal4GraphFrameRetainedResource> &retained,
+    IrisMetal4FrameBufferArena &frameArena,
+    std::vector<id> &encodedObjects, id<MTLBuffer> &readback,
+    id<MTLResidencySet> &residency,
+    id<MTL4CommandAllocator> &allocator,
+    id<MTL4CommandBuffer> &commandBuffer, MTL4CommitOptions *&options,
+    const std::shared_ptr<Metal4ProbeState> &feedbackState)
+    API_AVAILABLE(macos(26.0)) {
+  if (iris_metal4_submission_completed(feedbackState))
+    return false;
+  if (!iris_metal4_retired_submission_slot_available())
+    return false;
+  std::unique_ptr<IrisMetal4RetiredSubmission> submission(
+      new (std::nothrow) IrisMetal4RetiredSubmission());
+  if (!submission)
+    return false;
+  try {
+    size_t resourceObjectCount = retained.size() + (readback ? 1 : 0);
+    size_t pooledBufferCount = 0;
+    size_t submissionObjectCount = encodedObjects.size() + 3;
+    for (IrisMetal4GraphPreparedDraw *draw : preparedDraws) {
+      if (!draw)
+        continue;
+      IrisShadowRuntimeResources &resources = draw->resources;
+      resourceObjectCount += 4 + resources.samplers.size() +
+          resources.sampledTextures.size() + resources.buffers.size() +
+          resources.colorTargets.size();
+      pooledBufferCount += resources.argumentBuffers.size() +
+          resources.inlineBuffers.size() + resources.buffers.size();
+      submissionObjectCount += 4 + draw->encodedObjects.size();
+    }
+    submission->resourceObjects.reserve(resourceObjectCount);
+    submission->pooledBuffers.reserve(pooledBufferCount);
+    submission->submissionObjects.reserve(submissionObjectCount);
+    if (g_irisMetal4RetiredSubmissions.capacity() <
+        kIrisMetal4RetiredSubmissionLimit) {
+      g_irisMetal4RetiredSubmissions.reserve(
+          kIrisMetal4RetiredSubmissionLimit);
+    }
+
+    for (IrisMetal4GraphFrameRetainedResource &resource : retained) {
+      if (resource.texture) {
+        submission->resourceObjects.push_back(resource.texture);
+        resource.texture = nil;
+      }
+    }
+    for (IrisMetal4GraphPreparedDraw *&draw : preparedDraws) {
+      if (!draw)
+        continue;
+      draw->resources.transferTo(*submission);
+      IrisMetal4PipelineEntry &entry = draw->pipeline;
+      if (entry.render) {
+        submission->submissionObjects.push_back(entry.render);
+        entry.render = nil;
+      }
+      if (entry.vertexFunction) {
+        submission->submissionObjects.push_back(entry.vertexFunction);
+        entry.vertexFunction = nil;
+      }
+      if (entry.fragmentFunction) {
+        submission->submissionObjects.push_back(entry.fragmentFunction);
+        entry.fragmentFunction = nil;
+      }
+      if (entry.depthStencil) {
+        submission->submissionObjects.push_back(entry.depthStencil);
+        entry.depthStencil = nil;
+      }
+      for (id object : draw->encodedObjects)
+        submission->submissionObjects.push_back(object);
+      draw->encodedObjects.clear();
+      draw->additionalAllocations.clear();
+      draw->pipelineRetained = false;
+      delete draw;
+      draw = nullptr;
+    }
+    for (id object : encodedObjects)
+      submission->submissionObjects.push_back(object);
+    encodedObjects.clear();
+    if (readback) {
+      submission->resourceObjects.push_back(readback);
+      readback = nil;
+    }
+    if (options) {
+      submission->submissionObjects.push_back(options);
+      options = nil;
+    }
+    if (allocator) {
+      submission->submissionObjects.push_back(allocator);
+      allocator = nil;
+    }
+    if (commandBuffer) {
+      submission->submissionObjects.push_back(commandBuffer);
+      commandBuffer = nil;
+    }
+    submission->residency = residency;
+    residency = nil;
+    submission->feedbackState = feedbackState;
+    submission->frameArenaChunks = frameArena.takeChunks();
+    g_irisMetal4RetiredSubmissions.push_back(std::move(submission));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+} // namespace
+
+static uint64_t iris_shadow_fnv1a64(const uint8_t *bytes, size_t length) {
+  uint64_t hash = 1469598103934665603ULL;
+  for (size_t index = 0; index < length; index++) {
+    hash ^= bytes[index];
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+static jlongArray iris_shadow_result(JNIEnv *env, jlong status, jlong hash,
+                                     jlong width, jlong height,
+                                     jlong reason = 0) {
+  jlong values[] = {status, hash, width, height, reason};
+  jlongArray result = env->NewLongArray(5);
+  if (!result)
+    return nullptr;
+  env->SetLongArrayRegion(result, 0, 5, values);
+  return env->ExceptionCheck() ? nullptr : result;
+}
+
+static jlongArray run_iris_metal4_replay(
+    JNIEnv *env, jstring pipelineKeyValue, jbyteArray packetValue,
+    bool directPresentation) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  @autoreleasepool {
+    g_irisMetal4LastReplayRgba8.clear();
+    if (directPresentation && g_irisMetal4PendingCutoverSurface) {
+      CFRelease(g_irisMetal4PendingCutoverSurface);
+      g_irisMetal4PendingCutoverSurface = nullptr;
+      g_irisMetal4PendingCutoverWidth = 0;
+      g_irisMetal4PendingCutoverHeight = 0;
+    }
+    if (!g_device || !g_metal4CommandQueue ||
+        !g_metal4RuntimeVerified.load(std::memory_order_acquire))
+      return iris_shadow_result(env, 0, 0, 0, 0, 1);
+    if (!pipelineKeyValue || !packetValue)
+      return iris_shadow_result(env, -1, 0, 0, 0);
+    if (@available(macOS 26.0, *)) {
+      const char *pipelineKey =
+          env->GetStringUTFChars(pipelineKeyValue, nullptr);
+      if (!pipelineKey)
+        return nullptr;
+      std::string key(pipelineKey);
+      bool validKey = valid_iris_pipeline_key(pipelineKey);
+      env->ReleaseStringUTFChars(pipelineKeyValue, pipelineKey);
+      if (!validKey)
+        return iris_shadow_result(env, -1, 0, 0, 0);
+      jsize packetLength = env->GetArrayLength(packetValue);
+      if (packetLength <= 0 ||
+          packetLength > kIrisShadowReplayMaximumPacketBytes)
+        return iris_shadow_result(env, -1, 0, 0, 0);
+      std::vector<jbyte> packetBytes;
+      try {
+        packetBytes.resize((size_t)packetLength);
+      } catch (...) {
+        return iris_shadow_result(env, -1, 0, 0, 0);
+      }
+      env->GetByteArrayRegion(packetValue, 0, packetLength,
+                              packetBytes.data());
+      if (env->ExceptionCheck())
+        return nullptr;
+      IrisShadowReplayPacket packet;
+      if (!parse_iris_shadow_replay_packet(packetBytes, packet))
+        return iris_shadow_result(env, -1, 0, 0, 0);
+
+      IrisMetal4PipelineEntry entry;
+      {
+        std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
+        auto found = g_irisMetal4Pipelines.find(key);
+        if (found == g_irisMetal4Pipelines.end() || !found->second.render)
+          return iris_shadow_result(env, -1, 0, 0, 0);
+        entry = found->second;
+        [entry.render retain];
+        if (entry.vertexFunction) [entry.vertexFunction retain];
+        if (entry.fragmentFunction) [entry.fragmentFunction retain];
+        if (entry.depthStencil) [entry.depthStencil retain];
+      }
+      auto releaseEntry = [&]() {
+        [entry.render release];
+        if (entry.vertexFunction) [entry.vertexFunction release];
+        if (entry.fragmentFunction) [entry.fragmentFunction release];
+        if (entry.depthStencil) [entry.depthStencil release];
+      };
+      MTLPrimitiveType primitiveType = MTLPrimitiveTypeTriangle;
+      uint32_t packetTopology = packet.draw.primitiveMode <= 5
+          ? packet.draw.primitiveMode : UINT32_MAX;
+      if (!iris_metal_primitive_type(entry.topology, primitiveType) ||
+          packetTopology != iris_metal_effective_packet_topology(
+              entry.topology) || entry.rasterSampleCount != 1 ||
+          entry.colorFormats.empty()) {
+        releaseEntry();
+        return iris_shadow_result(env, 0, 0, packet.width, packet.height, 2);
+      }
+      if (directPresentation &&
+          (entry.colorFormats.size() != 1 ||
+           entry.colorFormats[0] != MTLPixelFormatRGBA8Unorm ||
+           entry.depthFormat != MTLPixelFormatInvalid ||
+           entry.stencilFormat != MTLPixelFormatInvalid)) {
+        releaseEntry();
+        return iris_shadow_result(env, 0, 0, packet.width, packet.height, 8);
+      }
+      if (!iris_metal4_retired_submission_slot_available()) {
+        releaseEntry();
+        return iris_shadow_result(env, 0, 0, packet.width, packet.height, 10);
+      }
+
+      IrisShadowRuntimeResources resources;
+      IOSurfaceRef directSurface = nullptr;
+      id<MTLResidencySet> residency = nil;
+      id<MTL4CommandAllocator> allocator = nil;
+      id<MTL4CommandBuffer> commandBuffer = nil;
+      MTL4RenderPassDescriptor *pass = nil;
+      MTL4CommitOptions *options = nil;
+      jlong status = -1;
+      jlong unsupportedReason = 0;
+      uint64_t outputHash = 0;
+      bool submissionCommitted = false;
+      std::shared_ptr<Metal4ProbeState> submissionState;
+      std::vector<uint64_t> inputSurfaceLeases;
+      @try {
+        for (const auto &image : packet.buffers) {
+          id<MTLBuffer> buffer = nil;
+          if (image.storageKind == 2) {
+            id<MTLBuffer> resident = iris_metal4_resident_buffer(
+                image.sharedHandle, image.byteLength);
+            if (resident)
+              buffer = [resident retain];
+            if (!buffer) {
+              status = 0;
+              unsupportedReason = 9;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderShadowUnsupported"
+                             reason:@"resident buffer unavailable"
+                           userInfo:nil];
+            }
+          } else {
+            buffer = g_irisMetal4TransientBufferPool.acquire(
+                (NSUInteger)image.byteLength);
+            if (buffer)
+              std::memcpy(buffer.contents, image.bytes.data(),
+                          image.byteLength);
+          }
+          if (!buffer)
+            @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                           reason:@"buffer allocation failed"
+                                         userInfo:nil];
+          resources.buffers.push_back(buffer);
+          resources.pooledBufferOwnership.push_back(
+              image.storageKind == 2 ? 0 : 1);
+        }
+        uint64_t sampledTextureBytes = 0;
+        for (const auto &captured : packet.textures) {
+          if (captured.storageKind == 2) {
+            IrisMetal4InputHandoff *shared = iris_metal4_find_input_handoff(
+                captured.glName, captured.sharedHandle);
+            MTLPixelFormat expectedFormat =
+                iris_metal_pixel_format(captured.format);
+            if (!shared || shared->width != captured.width ||
+                shared->height != captured.height ||
+                !iris_input_handoff_format_compatible(
+                    *shared, expectedFormat) ||
+                !iris_metal4_track_input_surface_lease(
+                    *shared, inputSurfaceLeases) ||
+                !iris_shadow_add_bounded(sampledTextureBytes,
+                    (uint64_t)captured.width * captured.height *
+                        captured.bytesPerPixel,
+                    kIrisShadowReplayMaximumTextureBytes)) {
+              status = 0;
+              unsupportedReason = 3;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderShadowUnsupported"
+                               reason:@"shared texture unavailable"
+                             userInfo:nil];
+            }
+            IrisMetal4InputHandoffReadiness readiness =
+                iris_metal4_ensure_input_handoff_ready(*shared);
+            if (readiness != IrisMetal4InputHandoffReadiness::READY) {
+              status = 0;
+              unsupportedReason = 3;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderShadowUnsupported"
+                             reason:readiness ==
+                                     IrisMetal4InputHandoffReadiness::FENCE_TIMEOUT
+                                 ? @"shared texture fence timeout"
+                                 : @"shared texture fence unavailable"
+                           userInfo:nil];
+            }
+            id<MTLTexture> texture = [shared->metalTexture retain];
+            resources.sampledTextures.push_back(texture);
+            resources.sampledByName.emplace(captured.glName, texture);
+            continue;
+          }
+          MTLPixelFormat format = MTLPixelFormatInvalid;
+          const uint8_t *uploadBytes = nullptr;
+          uint32_t uploadBytesPerPixel = 0;
+          std::vector<uint8_t> expanded;
+          if (captured.layer != 0 || captured.mipLevel != 0 ||
+              !iris_shadow_texture_upload(captured, format, uploadBytes,
+                                          uploadBytesPerPixel, expanded) ||
+              !iris_shadow_add_bounded(sampledTextureBytes,
+                  (uint64_t)captured.width * captured.height *
+                      uploadBytesPerPixel,
+                  kIrisShadowReplayMaximumTextureBytes)) {
+            status = 0;
+            unsupportedReason = 3;
+            @throw [NSException exceptionWithName:@"MetalRenderShadowUnsupported"
+                                           reason:@"texture format unsupported"
+                                         userInfo:nil];
+          }
+          MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:format
+                                           width:captured.width
+                                          height:captured.height
+                                       mipmapped:NO];
+          descriptor.storageMode = MTLStorageModeShared;
+          descriptor.usage = MTLTextureUsageShaderRead;
+          id<MTLTexture> texture = [g_device newTextureWithDescriptor:descriptor];
+          if (!texture)
+            @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                           reason:@"texture allocation failed"
+                                         userInfo:nil];
+          [texture replaceRegion:MTLRegionMake2D(0, 0, captured.width,
+                                                 captured.height)
+                    mipmapLevel:0 withBytes:uploadBytes
+                    bytesPerRow:(NSUInteger)captured.width *
+                                uploadBytesPerPixel];
+          resources.sampledTextures.push_back(texture);
+          resources.sampledByName.emplace(captured.glName, texture);
+        }
+
+        uint64_t targetBytes = 0;
+        resources.colorTargets.resize(entry.colorFormats.size(), nil);
+        for (size_t slot = 0; slot < entry.colorFormats.size(); slot++) {
+          MTLPixelFormat format = entry.colorFormats[slot];
+          if (format == MTLPixelFormatInvalid)
+            continue;
+          uint32_t bpp = 0;
+          uint64_t bytes = 0;
+          if (!iris_shadow_color_bytes(format, bpp) ||
+              (bytes = (uint64_t)packet.width * packet.height * bpp) >
+                  kIrisShadowReplayMaximumTextureBytes ||
+              !iris_shadow_add_bounded(targetBytes, bytes,
+                  kIrisShadowReplayMaximumTextureBytes)) {
+            status = 0;
+            unsupportedReason = 4;
+            @throw [NSException exceptionWithName:@"MetalRenderShadowUnsupported"
+                                           reason:@"target format unsupported"
+                                         userInfo:nil];
+          }
+          MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:format width:packet.width
+                                          height:packet.height mipmapped:NO];
+          descriptor.storageMode = MTLStorageModeShared;
+          descriptor.usage = MTLTextureUsageRenderTarget |
+                             MTLTextureUsageShaderRead;
+          if (directPresentation && slot == 0) {
+            size_t bytesPerRow = IOSurfaceAlignProperty(
+                kIOSurfaceBytesPerRow, (size_t)packet.width * 4u);
+            NSDictionary *surfaceProperties = @{
+              (id)kIOSurfaceWidth : @(packet.width),
+              (id)kIOSurfaceHeight : @(packet.height),
+              (id)kIOSurfaceBytesPerElement : @4,
+              (id)kIOSurfaceBytesPerRow : @(bytesPerRow),
+              (id)kIOSurfaceAllocSize :
+                  @(bytesPerRow * (size_t)packet.height),
+              // BGRA is the CGL-supported 8-bit IOSurface declaration. The
+              // Metal view intentionally remains RGBA8; the handoff shader
+              // applies the corresponding R/B swizzle without a copy.
+              (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+            };
+            directSurface = IOSurfaceCreate(
+                (__bridge CFDictionaryRef)surfaceProperties);
+            if (directSurface) {
+              resources.colorTargets[slot] =
+                  [g_device newTextureWithDescriptor:descriptor
+                                            iosurface:directSurface
+                                                plane:0];
+            }
+          } else {
+            resources.colorTargets[slot] =
+                [g_device newTextureWithDescriptor:descriptor];
+          }
+          if (!resources.colorTargets[slot])
+            @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                           reason:@"target allocation failed"
+                                         userInfo:nil];
+        }
+        auto newDepthStencilTarget = [&](MTLPixelFormat format) {
+          MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:format width:packet.width
+                                          height:packet.height mipmapped:NO];
+          descriptor.storageMode = MTLStorageModePrivate;
+          descriptor.usage = MTLTextureUsageRenderTarget;
+          return [g_device newTextureWithDescriptor:descriptor];
+        };
+        if (entry.depthFormat != MTLPixelFormatInvalid) {
+          resources.depthTarget = newDepthStencilTarget(entry.depthFormat);
+          if (!resources.depthTarget)
+            @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                           reason:@"depth allocation failed"
+                                         userInfo:nil];
+        }
+        if (entry.stencilFormat != MTLPixelFormatInvalid) {
+          if (entry.stencilFormat == entry.depthFormat) {
+            resources.stencilTarget = resources.depthTarget;
+          } else {
+            resources.stencilTarget =
+                newDepthStencilTarget(entry.stencilFormat);
+            if (!resources.stencilTarget)
+              @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                             reason:@"stencil allocation failed"
+                                           userInfo:nil];
+          }
+        }
+
+        for (const auto &stage : packet.stages) {
+          int prepared = iris_shadow_prepare_arguments(stage,
+              stage.stage == 0 ? entry.vertexFunction : entry.fragmentFunction,
+              resources);
+          if (prepared <= 0) {
+            status = prepared;
+            if (prepared == 0) unsupportedReason = 5;
+            @throw [NSException exceptionWithName:
+                       prepared == 0 ? @"MetalRenderShadowUnsupported"
+                                     : @"MetalRenderShadowSetup"
+                                           reason:@"argument setup failed"
+                                         userInfo:nil];
+          }
+        }
+        bool needVertexTable = !packet.vertexBuffers.empty();
+        if (needVertexTable && !resources.vertexTable) {
+          MTL4ArgumentTableDescriptor *descriptor =
+              [[MTL4ArgumentTableDescriptor alloc] init];
+          descriptor.maxBufferBindCount = 31;
+          descriptor.initializeBindings = YES;
+          NSError *error = nil;
+          resources.vertexTable =
+              [g_device newArgumentTableWithDescriptor:descriptor error:&error];
+          [descriptor release];
+          if (!resources.vertexTable)
+            @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                           reason:@"vertex table failed"
+                                         userInfo:nil];
+        }
+        for (const auto &binding : packet.vertexBuffers) {
+          [resources.vertexTable
+              setAddress:resources.buffers[binding.second].gpuAddress
+                 atIndex:binding.first];
+        }
+
+        NSUInteger allocationCount = resources.buffers.size() +
+            resources.inlineBuffers.size() + resources.argumentBuffers.size() +
+            resources.sampledTextures.size() + resources.colorTargets.size() +
+            (resources.depthTarget ? 1 : 0) +
+            (resources.stencilTarget &&
+             resources.stencilTarget != resources.depthTarget ? 1 : 0);
+        MTLResidencySetDescriptor *residencyDescriptor =
+            [[MTLResidencySetDescriptor alloc] init];
+        residencyDescriptor.label = @"MetalRender Iris packet replay";
+        residencyDescriptor.initialCapacity = std::max((NSUInteger)1,
+                                                       allocationCount);
+        NSError *residencyError = nil;
+        residency = [g_device
+            newResidencySetWithDescriptor:residencyDescriptor
+                                    error:&residencyError];
+        [residencyDescriptor release];
+        if (!residency)
+          @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                         reason:@"residency allocation failed"
+                                       userInfo:nil];
+        for (id<MTLBuffer> value : resources.buffers)
+          [residency addAllocation:(id<MTLAllocation>)value];
+        for (id<MTLBuffer> value : resources.inlineBuffers)
+          [residency addAllocation:(id<MTLAllocation>)value];
+        for (id<MTLBuffer> value : resources.argumentBuffers)
+          [residency addAllocation:(id<MTLAllocation>)value];
+        for (id<MTLTexture> value : resources.sampledTextures)
+          [residency addAllocation:(id<MTLAllocation>)value];
+        for (id<MTLTexture> value : resources.colorTargets) {
+          if (value) [residency addAllocation:(id<MTLAllocation>)value];
+        }
+        if (resources.depthTarget)
+          [residency addAllocation:(id<MTLAllocation>)resources.depthTarget];
+        if (resources.stencilTarget &&
+            resources.stencilTarget != resources.depthTarget)
+          [residency addAllocation:(id<MTLAllocation>)resources.stencilTarget];
+        [residency commit];
+        [residency requestResidency];
+
+        allocator = [g_device newCommandAllocator];
+        commandBuffer = [g_device newCommandBuffer];
+        if (!allocator || !commandBuffer)
+          @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                         reason:@"command allocation failed"
+                                       userInfo:nil];
+        [commandBuffer beginCommandBufferWithAllocator:allocator];
+        [commandBuffer useResidencySet:residency];
+        pass = [[MTL4RenderPassDescriptor alloc] init];
+        pass.defaultRasterSampleCount = 1;
+        pass.renderTargetWidth = packet.width;
+        pass.renderTargetHeight = packet.height;
+        for (size_t slot = 0; slot < resources.colorTargets.size(); slot++) {
+          if (!resources.colorTargets[slot])
+            continue;
+          MTLRenderPassColorAttachmentDescriptor *color =
+              pass.colorAttachments[slot];
+          color.texture = resources.colorTargets[slot];
+          color.loadAction = MTLLoadActionClear;
+          color.storeAction = MTLStoreActionStore;
+          color.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+        }
+        if (resources.depthTarget) {
+          pass.depthAttachment.texture = resources.depthTarget;
+          pass.depthAttachment.loadAction = MTLLoadActionClear;
+          pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+          pass.depthAttachment.clearDepth = 1.0;
+        }
+        if (resources.stencilTarget) {
+          pass.stencilAttachment.texture = resources.stencilTarget;
+          pass.stencilAttachment.loadAction = MTLLoadActionClear;
+          pass.stencilAttachment.storeAction = MTLStoreActionDontCare;
+          pass.stencilAttachment.clearStencil = 0;
+        }
+        id<MTL4RenderCommandEncoder> encoder =
+            [commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder)
+          @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                         reason:@"render encoder unavailable"
+                                       userInfo:nil];
+        [encoder setRenderPipelineState:entry.render];
+        [encoder setDepthStencilState:entry.depthStencil];
+        [encoder setCullMode:entry.cullMode];
+        [encoder setFrontFacingWinding:entry.frontFacingWinding];
+        [encoder setTriangleFillMode:entry.triangleFillMode];
+        [encoder setDepthClipMode:entry.depthClipMode];
+        uint32_t offsetBit = entry.topology == 0 ? 1u
+            : (entry.topology >= 1 && entry.topology <= 3 ? 2u : 4u);
+        if ((entry.polygonOffsetMask & offsetBit) != 0) {
+          [encoder setDepthBias:entry.depthBias slopeScale:entry.slopeScale
+                          clamp:entry.depthBiasClamp];
+        }
+        [encoder setStencilFrontReferenceValue:entry.frontStencilReference
+                            backReferenceValue:entry.backStencilReference];
+        MTLViewport viewport = {(double)packet.viewport.x,
+            (double)((int64_t)packet.height - packet.viewport.y -
+                     packet.viewport.height),
+            (double)packet.viewport.width, (double)packet.viewport.height,
+            0.0, 1.0};
+        [encoder setViewport:viewport];
+        int64_t sx0 = packet.scissorEnabled
+            ? std::max<int64_t>(0, packet.scissor.x) : 0;
+        int64_t sy0 = packet.scissorEnabled
+            ? std::max<int64_t>(0, packet.scissor.y) : 0;
+        int64_t sx1 = packet.scissorEnabled
+            ? std::min<int64_t>(packet.width,
+                (int64_t)packet.scissor.x + packet.scissor.width)
+            : packet.width;
+        int64_t sy1 = packet.scissorEnabled
+            ? std::min<int64_t>(packet.height,
+                (int64_t)packet.scissor.y + packet.scissor.height)
+            : packet.height;
+        if (sx1 <= sx0 || sy1 <= sy0) {
+          [encoder endEncoding];
+        } else {
+          MTLScissorRect scissor = {(NSUInteger)sx0,
+              (NSUInteger)((int64_t)packet.height - sy1),
+              (NSUInteger)(sx1 - sx0), (NSUInteger)(sy1 - sy0)};
+          [encoder setScissorRect:scissor];
+          if (resources.vertexTable)
+            [encoder setArgumentTable:resources.vertexTable
+                              atStages:MTLRenderStageVertex];
+          if (resources.fragmentTable)
+            [encoder setArgumentTable:resources.fragmentTable
+                              atStages:MTLRenderStageFragment];
+          if (packet.draw.kind == 1) {
+            [encoder drawPrimitives:primitiveType
+                         vertexStart:(NSUInteger)packet.draw.firstVertex
+                         vertexCount:packet.draw.vertexCount
+                       instanceCount:packet.draw.instanceCount
+                        baseInstance:packet.draw.baseInstance];
+          } else {
+            id<MTLBuffer> indices =
+                resources.buffers[(size_t)packet.indexBufferImage];
+            MTLIndexType indexType = packet.draw.indexElementBytes == 2
+                ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+            for (const auto &draw : packet.draw.indexed) {
+              uint64_t required = (uint64_t)draw.count *
+                                  packet.draw.indexElementBytes;
+              if (draw.offset % packet.draw.indexElementBytes != 0 ||
+                  draw.offset > indices.length ||
+                  required > indices.length - draw.offset) {
+                [encoder endEncoding];
+                status = 0;
+                unsupportedReason = 6;
+                @throw [NSException
+                    exceptionWithName:@"MetalRenderShadowUnsupported"
+                               reason:@"index range unsupported"
+                             userInfo:nil];
+              }
+              [encoder drawIndexedPrimitives:primitiveType
+                                  indexCount:draw.count
+                                   indexType:indexType
+                                 indexBuffer:indices.gpuAddress + draw.offset
+                           indexBufferLength:indices.length - draw.offset
+                               instanceCount:packet.draw.instanceCount
+                                  baseVertex:draw.baseVertex
+                                baseInstance:packet.draw.baseInstance];
+            }
+          }
+          [encoder endEncoding];
+        }
+        [commandBuffer endCommandBuffer];
+        g_irisMetal4PipelineDrawAttemptCount.fetch_add(
+            1, std::memory_order_relaxed);
+        submissionState = std::make_shared<Metal4ProbeState>(allocator);
+        submissionCommitted = true;
+        bool completed = metal4_commit_and_wait(
+            (id<MTL4CommandQueue>)g_metal4CommandQueue,
+            commandBuffer, submissionState, 5'000);
+        if (!completed ||
+            !submissionState->completed.load(std::memory_order_acquire) ||
+            !submissionState->succeeded.load(std::memory_order_acquire)) {
+          status = -1;
+        } else {
+          id<MTLTexture> output = nil;
+          for (id<MTLTexture> candidate : resources.colorTargets) {
+            if (candidate) { output = candidate; break; }
+          }
+          uint32_t bpp = 0;
+          if (!output || !iris_shadow_color_bytes(output.pixelFormat, bpp)) {
+            status = 0;
+            unsupportedReason = 7;
+          } else if (directPresentation) {
+            if (!directSurface ||
+                output.pixelFormat != MTLPixelFormatRGBA8Unorm) {
+              status = 0;
+              unsupportedReason = 8;
+            } else {
+              uint64_t token = g_irisMetal4CutoverSurfaceSequence.fetch_add(
+                  1, std::memory_order_relaxed);
+              if (token == 0) {
+                token = g_irisMetal4CutoverSurfaceSequence.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
+              g_irisMetal4PendingCutoverSurface = directSurface;
+              g_irisMetal4PendingCutoverWidth = packet.width;
+              g_irisMetal4PendingCutoverHeight = packet.height;
+              directSurface = nullptr;
+              outputHash = token;
+              status = 1;
+            }
+          } else {
+            size_t rowBytes = (size_t)packet.width * bpp;
+            std::vector<uint8_t> pixels(rowBytes * packet.height);
+            [output getBytes:pixels.data() bytesPerRow:rowBytes
+                  fromRegion:MTLRegionMake2D(0, 0, packet.width, packet.height)
+                 mipmapLevel:0];
+            outputHash = iris_shadow_fnv1a64(pixels.data(), pixels.size());
+            if (output.pixelFormat == MTLPixelFormatRGBA8Unorm) {
+              g_irisMetal4LastReplayRgba8 = pixels;
+            }
+            status = 1;
+          }
+        }
+      } @catch (NSException *exception) {
+        if (![exception.name isEqualToString:@"MetalRenderShadowUnsupported"])
+          dbg("WARN: Iris packet replay raised %s: %s\n",
+              exception.name.UTF8String ?: "NSException",
+              exception.reason.UTF8String ?: "unknown reason");
+      }
+      bool retired = submissionCommitted &&
+          iris_metal4_retire_replay_submission(resources, entry, residency,
+              allocator, commandBuffer, pass, options, submissionState);
+      if (options) [options release];
+      if (pass) [pass release];
+      if (commandBuffer) [commandBuffer release];
+      if (allocator) [allocator release];
+      if (residency) {
+        [residency endResidency];
+        [residency release];
+      }
+      if (directSurface) CFRelease(directSurface);
+      if (!retired)
+        releaseEntry();
+      iris_metal4_finish_input_surface_leases(inputSurfaceLeases,
+          submissionCommitted ? submissionState : nullptr);
+      return iris_shadow_result(env, status, (jlong)outputHash,
+                                packet.width, packet.height,
+                                unsupportedReason);
+    }
+    return iris_shadow_result(env, 0, 0, 0, 0, 1);
+  }
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nRunIrisMetal4ShadowReplay(
+    JNIEnv *env, jclass, jstring pipelineKeyValue, jbyteArray packetValue) {
+  return run_iris_metal4_replay(env, pipelineKeyValue, packetValue, false);
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nRunIrisMetal4FinalCutoverReplay(
+    JNIEnv *env, jclass, jstring pipelineKeyValue, jbyteArray packetValue) {
+  return run_iris_metal4_replay(env, pipelineKeyValue, packetValue, true);
+}
+
+static void destroy_iris_metal4_input_handoff(
+    IrisMetal4InputHandoff &handoff, bool hasContext) {
+  if (hasContext && handoff.copyFence) {
+    glDeleteSync(handoff.copyFence);
+  }
+  if (hasContext && handoff.readFramebuffer) {
+    glDeleteFramebuffers(1, &handoff.readFramebuffer);
+  }
+  if (hasContext && handoff.drawFramebuffer) {
+    glDeleteFramebuffers(1, &handoff.drawFramebuffer);
+  }
+  if (hasContext && handoff.rectangleTexture) {
+    glDeleteTextures(1, &handoff.rectangleTexture);
+  }
+  if (handoff.metalTexture) {
+    [handoff.metalTexture release];
+  }
+  if (handoff.surface) {
+    CFRelease(handoff.surface);
+  }
+  handoff = IrisMetal4InputHandoff{};
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUploadIrisMetal4InputTexture(
+    JNIEnv *env, jclass, jint glTexture, jlong generation, jint width,
+    jint height, jbyteArray rgba8Value) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  @autoreleasepool {
+    if (!g_device || !g_metal4CommandQueue || glTexture <= 0 ||
+        generation <= 0 || width <= 0 || height <= 0 || width > 4096 ||
+        height > 4096 || !rgba8Value) {
+      return 0;
+    }
+    uint64_t expected = (uint64_t)width * height * 4u;
+    if (expected == 0 || expected > kIrisShadowReplayMaximumTextureBytes ||
+        expected > (uint64_t)std::numeric_limits<jsize>::max() ||
+        env->GetArrayLength(rgba8Value) != (jsize)expected) {
+      return 0;
+    }
+
+    GLuint sourceTexture = (GLuint)glTexture;
+    auto existing = g_irisMetal4InputHandoffs.find(sourceTexture);
+    if (existing != g_irisMetal4InputHandoffs.end() &&
+        existing->second.kind == 3 &&
+        existing->second.sourceGeneration == (uint64_t)generation &&
+        existing->second.width == (uint32_t)width &&
+        existing->second.height == (uint32_t)height &&
+        existing->second.metalTexture) {
+      return (jlong)existing->second.token;
+    }
+    if (existing != g_irisMetal4InputHandoffs.end()) {
+      bool hasContext = CGLGetCurrentContext() != nullptr;
+      if (hasContext && (existing->second.surface ||
+                         existing->second.copyFence)) {
+        glFinish();
+      }
+      uint64_t allocationBytes = existing->second.allocationBytes;
+      destroy_iris_metal4_input_handoff(existing->second, hasContext);
+      g_irisMetal4InputHandoffs.erase(existing);
+      g_irisMetal4InputHandoffBytes =
+          allocationBytes <= g_irisMetal4InputHandoffBytes
+              ? g_irisMetal4InputHandoffBytes - allocationBytes : 0;
+    }
+    if (g_irisMetal4InputHandoffs.size() >=
+            kIrisMetal4InputHandoffLimit ||
+        expected > kIrisMetal4InputHandoffByteLimit ||
+        g_irisMetal4InputHandoffBytes >
+            kIrisMetal4InputHandoffByteLimit - expected) {
+      return 0;
+    }
+
+    std::vector<jbyte> bytes;
+    try {
+      bytes.resize((size_t)expected);
+    } catch (...) {
+      return 0;
+    }
+    env->GetByteArrayRegion(rgba8Value, 0, (jsize)expected, bytes.data());
+    if (env->ExceptionCheck()) {
+      return 0;
+    }
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:(NSUInteger)width
+                                    height:(NSUInteger)height
+                                 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [g_device newTextureWithDescriptor:descriptor];
+    if (!texture) {
+      return 0;
+    }
+    [texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
+               mipmapLevel:0 withBytes:bytes.data()
+               bytesPerRow:(NSUInteger)width * 4u];
+
+    IrisMetal4InputHandoff handoff;
+    handoff.kind = 3;
+    handoff.sourceTexture = sourceTexture;
+    handoff.sourceGeneration = (uint64_t)generation;
+    handoff.allocationBytes = expected;
+    handoff.width = (uint32_t)width;
+    handoff.height = (uint32_t)height;
+    handoff.metalTexture = texture;
+    handoff.copyReady = true;
+    handoff.token = g_irisMetal4InputHandoffSequence.fetch_add(
+        1, std::memory_order_relaxed);
+    if (handoff.token == 0) {
+      handoff.token = g_irisMetal4InputHandoffSequence.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+    uint64_t token = handoff.token;
+    g_irisMetal4InputHandoffs.emplace(sourceTexture, handoff);
+    g_irisMetal4InputHandoffBytes += expected;
+    return (jlong)token;
+  }
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUploadIrisMetal4InputBuffer(
+    JNIEnv *env, jclass, jstring digestValue, jbyteArray bytesValue) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  @autoreleasepool {
+    if (!g_device || !g_metal4CommandQueue ||
+        !g_metal4RuntimeVerified.load(std::memory_order_acquire) ||
+        !digestValue || !bytesValue) {
+      return 0;
+    }
+    const char *digestUtf8 = env->GetStringUTFChars(digestValue, nullptr);
+    if (!digestUtf8) {
+      return 0;
+    }
+    bool validDigest = valid_iris_pipeline_key(digestUtf8);
+    std::string digest = validDigest ? std::string(digestUtf8)
+                                     : std::string();
+    env->ReleaseStringUTFChars(digestValue, digestUtf8);
+    jsize length = env->GetArrayLength(bytesValue);
+    if (!validDigest || length <= 0 ||
+        (uint64_t)length > kIrisShadowReplayMaximumBufferBytes) {
+      return 0;
+    }
+    auto existing = g_irisMetal4ResidentBuffers.find(digest);
+    if (existing != g_irisMetal4ResidentBuffers.end()) {
+      return existing->second.byteLength == (uint32_t)length &&
+                     existing->second.buffer
+                 ? (jlong)existing->second.token
+                 : 0;
+    }
+    if ((uint64_t)length > kIrisMetal4ResidentBufferByteLimit ||
+        g_irisMetal4ResidentBuffers.size() >=
+            kIrisMetal4ResidentBufferLimit ||
+        g_irisMetal4ResidentBufferBytes >
+            kIrisMetal4ResidentBufferByteLimit - (uint64_t)length) {
+      return 0;
+    }
+    id<MTLBuffer> buffer = [g_device
+        newBufferWithLength:(NSUInteger)length
+                    options:MTLResourceStorageModeShared];
+    if (!buffer) {
+      return 0;
+    }
+    env->GetByteArrayRegion(bytesValue, 0, length,
+                            reinterpret_cast<jbyte *>(buffer.contents));
+    if (env->ExceptionCheck()) {
+      [buffer release];
+      return 0;
+    }
+    IrisMetal4ResidentBuffer resident;
+    resident.byteLength = (uint32_t)length;
+    resident.buffer = buffer;
+    resident.token = g_irisMetal4ResidentBufferSequence.fetch_add(
+        1, std::memory_order_relaxed);
+    if (resident.token == 0) {
+      resident.token = g_irisMetal4ResidentBufferSequence.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+    uint64_t token = resident.token;
+    g_irisMetal4ResidentBuffers.emplace(digest, resident);
+    g_irisMetal4ResidentBuffersByToken.emplace(token, resident);
+    g_irisMetal4ResidentBufferBytes += (uint64_t)length;
+    return (jlong)token;
+  }
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCaptureIrisMetal4InputSurface(
+    JNIEnv *, jclass, jint glTexture, jint width, jint height, jint kind) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  @autoreleasepool {
+    CGLContextObj context = CGLGetCurrentContext();
+    if (!context || !g_device || !g_metal4CommandQueue || glTexture <= 0 ||
+        width <= 0 || height <= 0 || width > 4096 || height > 4096 ||
+        (kind != 1 && kind != 2)) {
+      return -1;
+    }
+
+    GLuint sourceTexture = (GLuint)glTexture;
+    uint64_t captureSerial =
+        ++g_irisMetal4InputSurfaceCaptureSequences[sourceTexture];
+    if (captureSerial == 0) {
+      captureSerial = 1;
+      g_irisMetal4InputSurfaceCaptureSequences[sourceTexture] =
+          captureSerial;
+    }
+
+    IrisMetal4InputHandoff *selected = nullptr;
+    for (auto iterator = g_irisMetal4InputSurfaceHandoffs.begin();
+         iterator != g_irisMetal4InputSurfaceHandoffs.end();) {
+      IrisMetal4InputHandoff &candidate = iterator->second;
+      bool feedbackCompleted = false;
+      if (candidate.inFlightFeedback) {
+        if (@available(macOS 26.0, *)) {
+          feedbackCompleted = iris_metal4_submission_completed(
+              candidate.inFlightFeedback);
+        }
+      }
+      if (feedbackCompleted) {
+        candidate.inFlightFeedback.reset();
+      }
+      // Never reclaim a lease merely because it is old: the translator can
+      // be delayed independently of the render thread. Abandoned leases are
+      // bounded by the hard slot/byte limits and lifecycle reset, preserving
+      // fail-open correctness under worker stalls.
+      bool idle = !candidate.leased && !candidate.inFlightFeedback;
+      bool compatible = candidate.sourceTexture == sourceTexture &&
+          candidate.kind == (uint32_t)kind &&
+          candidate.width == (uint32_t)width &&
+          candidate.height == (uint32_t)height;
+      if (idle && candidate.sourceTexture == sourceTexture &&
+          !compatible) {
+        uint64_t bytes = candidate.allocationBytes;
+        destroy_iris_metal4_input_handoff(candidate, true);
+        iterator = g_irisMetal4InputSurfaceHandoffs.erase(iterator);
+        g_irisMetal4InputSurfaceBytes =
+            bytes <= g_irisMetal4InputSurfaceBytes
+                ? g_irisMetal4InputSurfaceBytes - bytes : 0;
+        continue;
+      }
+      if (!selected && idle && compatible) {
+        selected = &candidate;
+      }
+      ++iterator;
+    }
+
+    size_t bytesPerElement = kind == 1 ? 4u : 8u;
+    size_t bytesPerRow = IOSurfaceAlignProperty(
+        kIOSurfaceBytesPerRow, (size_t)width * bytesPerElement);
+    if (bytesPerRow == 0 || (size_t)height > SIZE_MAX / bytesPerRow) {
+      return -2;
+    }
+    uint64_t allocationBytes = (uint64_t)bytesPerRow * (uint64_t)height;
+
+    if (!selected) {
+      // Reclaim only completed, unleased slots. Busy surfaces are immutable
+      // until their Metal feedback reports completion.
+      while ((g_irisMetal4InputSurfaceHandoffs.size() >=
+                  kIrisMetal4InputSurfaceHandoffLimit ||
+              allocationBytes > kIrisMetal4InputSurfaceByteLimit ||
+              g_irisMetal4InputSurfaceBytes >
+                  kIrisMetal4InputSurfaceByteLimit - allocationBytes)) {
+        auto recyclable = std::find_if(
+            g_irisMetal4InputSurfaceHandoffs.begin(),
+            g_irisMetal4InputSurfaceHandoffs.end(),
+            [](const auto &entry) {
+              return !entry.second.leased &&
+                  !entry.second.inFlightFeedback;
+            });
+        if (recyclable == g_irisMetal4InputSurfaceHandoffs.end()) {
+          return -3;
+        }
+        uint64_t bytes = recyclable->second.allocationBytes;
+        destroy_iris_metal4_input_handoff(recyclable->second, true);
+        g_irisMetal4InputSurfaceHandoffs.erase(recyclable);
+        g_irisMetal4InputSurfaceBytes =
+            bytes <= g_irisMetal4InputSurfaceBytes
+                ? g_irisMetal4InputSurfaceBytes - bytes : 0;
+      }
+      IrisMetal4InputHandoff handoff;
+      handoff.kind = (uint32_t)kind;
+      handoff.width = (uint32_t)width;
+      handoff.height = (uint32_t)height;
+      handoff.sourceTexture = sourceTexture;
+      handoff.captureSerial = captureSerial;
+      handoff.allocationBytes = allocationBytes;
+      handoff.token = g_irisMetal4InputHandoffSequence.fetch_add(
+          1, std::memory_order_relaxed);
+      if (handoff.token == 0) {
+        handoff.token = g_irisMetal4InputHandoffSequence.fetch_add(
+            1, std::memory_order_relaxed);
+      }
+
+      uint32_t pixelFourcc = kind == 1 ? (uint32_t)'BGRA'
+                                      : (uint32_t)'RGhA';
+      NSDictionary *surfaceProperties = @{
+        (id)kIOSurfaceWidth : @(width),
+        (id)kIOSurfaceHeight : @(height),
+        (id)kIOSurfaceBytesPerElement : @(bytesPerElement),
+        (id)kIOSurfaceBytesPerRow : @(bytesPerRow),
+        (id)kIOSurfaceAllocSize : @(bytesPerRow * (size_t)height),
+        (id)kIOSurfacePixelFormat : @(pixelFourcc),
+      };
+      handoff.surface = IOSurfaceCreate(
+          (__bridge CFDictionaryRef)surfaceProperties);
+      if (!handoff.surface) {
+        return -4;
+      }
+
+      MTLPixelFormat metalFormat = kind == 1
+          ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA16Float;
+      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+          texture2DDescriptorWithPixelFormat:metalFormat
+                                       width:(NSUInteger)width
+                                      height:(NSUInteger)height
+                                   mipmapped:NO];
+      descriptor.storageMode = MTLStorageModeShared;
+      descriptor.usage = MTLTextureUsageShaderRead;
+      handoff.metalTexture = [g_device newTextureWithDescriptor:descriptor
+                                                       iosurface:handoff.surface
+                                                           plane:0];
+      if (!handoff.metalTexture) {
+        destroy_iris_metal4_input_handoff(handoff, true);
+        return -5;
+      }
+
+      GLint previousRectangleTexture = 0;
+      glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE,
+                    &previousRectangleTexture);
+      glGenTextures(1, &handoff.rectangleTexture);
+      glBindTexture(GL_TEXTURE_RECTANGLE, handoff.rectangleTexture);
+      GLenum internalFormat = kind == 1 ? GL_RGBA8 : GL_RGBA16F;
+      GLenum externalFormat = kind == 1 ? GL_BGRA : GL_RGBA;
+      GLenum componentType = kind == 1
+          ? GL_UNSIGNED_INT_8_8_8_8_REV : GL_HALF_FLOAT;
+      CGLError bindError = CGLTexImageIOSurface2D(
+          context, GL_TEXTURE_RECTANGLE, internalFormat, width, height,
+          externalFormat, componentType, handoff.surface, 0);
+      if (bindError != kCGLNoError) {
+        glBindTexture(GL_TEXTURE_RECTANGLE,
+                      (GLuint)previousRectangleTexture);
+        destroy_iris_metal4_input_handoff(handoff, true);
+        return -6;
+      }
+      glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_S,
+                      GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_T,
+                      GL_CLAMP_TO_EDGE);
+      glBindTexture(GL_TEXTURE_RECTANGLE,
+                    (GLuint)previousRectangleTexture);
+      glGenFramebuffers(1, &handoff.readFramebuffer);
+      glGenFramebuffers(1, &handoff.drawFramebuffer);
+      uint64_t token = handoff.token;
+      auto inserted = g_irisMetal4InputSurfaceHandoffs.emplace(
+          token, std::move(handoff));
+      if (!inserted.second) {
+        destroy_iris_metal4_input_handoff(handoff, true);
+        return -7;
+      }
+      g_irisMetal4InputSurfaceBytes += allocationBytes;
+      selected = &inserted.first->second;
+    }
+
+    IrisMetal4InputHandoff &handoff = *selected;
+    handoff.captureSerial = captureSerial;
+    handoff.leased = true;
+    if (handoff.copyFence) {
+      IrisMetal4InputHandoffReadiness priorCopy =
+          iris_metal4_ensure_input_handoff_ready(handoff);
+      if (priorCopy != IrisMetal4InputHandoffReadiness::READY) {
+        handoff.leased = false;
+        return priorCopy == IrisMetal4InputHandoffReadiness::MISSING_FENCE
+            ? -8 : -9;
+      }
+    }
+    GLint previousReadFramebuffer = 0;
+    GLint previousDrawFramebuffer = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFramebuffer);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previousDrawFramebuffer);
+    GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    bool copied = false;
+    handoff.copyReady = false;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, handoff.readFramebuffer);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, sourceTexture, 0);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, handoff.drawFramebuffer);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_RECTANGLE,
+                           handoff.rectangleTexture, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) ==
+            GL_FRAMEBUFFER_COMPLETE &&
+        glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) ==
+            GL_FRAMEBUFFER_COMPLETE) {
+      glDisable(GL_SCISSOR_TEST);
+      // Convert into the exact CGL-compatible surface format. Keep row order
+      // identical to glGetTexImage + replaceRegion: Metal's texture-coordinate
+      // translation already preserves the OpenGL convention, so flipping the
+      // IOSurface here would apply the Y conversion twice.
+      glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+      handoff.copyFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+      if (handoff.copyFence) {
+        glFlush();
+        copied = true;
+      }
+    }
+    if (scissorEnabled) glEnable(GL_SCISSOR_TEST);
+    else glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                      (GLuint)previousReadFramebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                      (GLuint)previousDrawFramebuffer);
+    if (!copied) {
+      handoff.leased = false;
+      return -10;
+    }
+    IrisMetal4InputHandoffReadiness copiedReadiness =
+        iris_metal4_ensure_input_handoff_ready(handoff);
+    if (copiedReadiness != IrisMetal4InputHandoffReadiness::READY) {
+      handoff.leased = false;
+      return copiedReadiness == IrisMetal4InputHandoffReadiness::MISSING_FENCE
+          ? -11 : -12;
+    }
+    return (jlong)handoff.token;
+  }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nBindIrisMetal4FinalCutoverSurface(
+    JNIEnv *, jclass, jint glTexture, jint width, jint height,
+    jboolean deferIfBusy) {
+  std::unique_lock<std::mutex> executionLock(g_irisMetal4ExecutionMutex,
+      std::defer_lock);
+  if (deferIfBusy == JNI_TRUE) {
+    executionLock.try_lock();
+  } else {
+    executionLock.lock();
+  }
+  if (!executionLock.owns_lock()) {
+    // The promoted IOSurface remains pending and this bind is retried. The
+    // caller can present its last fenced surface during worker contention.
+    return JNI_FALSE;
+  }
+  @autoreleasepool {
+    CGLContextObj context = CGLGetCurrentContext();
+    if (!context || glTexture <= 0 || width <= 0 || height <= 0 ||
+        !g_irisMetal4PendingCutoverSurface ||
+        g_irisMetal4PendingCutoverWidth != (uint32_t)width ||
+        g_irisMetal4PendingCutoverHeight != (uint32_t)height) {
+      return JNI_FALSE;
+    }
+
+    GLuint texture = (GLuint)glTexture;
+    auto existing = g_irisMetal4CutoverGlBindings.find(texture);
+    if (existing == g_irisMetal4CutoverGlBindings.end()) {
+      if (g_irisMetal4CutoverGlBindings.size() >=
+          kIrisMetal4CutoverBindingLimit) {
+        return JNI_FALSE;
+      }
+      existing = g_irisMetal4CutoverGlBindings.emplace(
+          texture, IrisMetal4CutoverGlBinding{}).first;
+    }
+    IrisMetal4CutoverGlBinding &binding = existing->second;
+    if (binding.completionFence) {
+      GLenum fenceStatus = glClientWaitSync(binding.completionFence, 0, 0);
+      if (fenceStatus != GL_ALREADY_SIGNALED &&
+          fenceStatus != GL_CONDITION_SATISFIED) {
+        return JNI_FALSE;
+      }
+      glDeleteSync(binding.completionFence);
+      binding.completionFence = nullptr;
+    } else if (binding.surface) {
+      // A surface without a completion fence cannot be proven idle. Retire
+      // this slot until renderer lifecycle cleanup rather than blocking or
+      // risking a use-after-release in the GL command stream.
+      return JNI_FALSE;
+    }
+    IOSurfaceRef previousSurface = binding.surface;
+    uint32_t previousWidth = binding.width;
+    uint32_t previousHeight = binding.height;
+    binding.surface = nullptr;
+    binding.width = 0;
+    binding.height = 0;
+
+    // The Java presenter binds glTexture on GL_TEXTURE0 immediately before
+    // entering JNI. Avoid querying and rebinding the same GL state here on
+    // every frame; CGLTexImageIOSurface2D operates on that current binding.
+    CGLError error = CGLTexImageIOSurface2D(
+        context, GL_TEXTURE_RECTANGLE, GL_RGBA8,
+        (GLsizei)width, (GLsizei)height, GL_BGRA,
+        GL_UNSIGNED_INT_8_8_8_8_REV,
+        g_irisMetal4PendingCutoverSurface, 0);
+    if (error != kCGLNoError) {
+      binding.surface = previousSurface;
+      binding.width = previousWidth;
+      binding.height = previousHeight;
+      return JNI_FALSE;
+    }
+
+    if (previousSurface && !iris_metal4_recycle_graph_surface(
+            previousSurface, previousWidth, previousHeight)) {
+      CFRelease(previousSurface);
+    }
+
+    binding.surface = g_irisMetal4PendingCutoverSurface;
+    binding.width = (uint32_t)width;
+    binding.height = (uint32_t)height;
+    g_irisMetal4PendingCutoverSurface = nullptr;
+    g_irisMetal4PendingCutoverWidth = 0;
+    g_irisMetal4PendingCutoverHeight = 0;
+    g_metal4DrawPathActive.store(true, std::memory_order_release);
+    return JNI_TRUE;
+  }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nFenceIrisMetal4FinalCutoverSurface(
+    JNIEnv *, jclass, jint glTexture) {
+  CGLContextObj context = CGLGetCurrentContext();
+  auto existing = g_irisMetal4CutoverGlBindings.find((GLuint)glTexture);
+  if (!context || glTexture <= 0 ||
+      existing == g_irisMetal4CutoverGlBindings.end() ||
+      !existing->second.surface) {
+    return JNI_FALSE;
+  }
+  if (existing->second.completionFence) {
+    // Refresh the fence after every read of a reusable ownership surface. GL
+    // keeps the deleted sync alive until earlier commands retire; the newest
+    // fence is therefore the exact release boundary for a future rebind.
+    glDeleteSync(existing->second.completionFence);
+    existing->second.completionFence = nullptr;
+  }
+  GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+  if (!fence) {
+    return JNI_FALSE;
+  }
+  existing->second.completionFence = fence;
+  // Submit the blit without waiting. A later reuse probes the fence with a
+  // zero timeout; a busy slot simply leaves that frame on OpenGL.
+  glFlush();
+  return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDiscardIrisMetal4FinalCutoverSurface(
+    JNIEnv *, jclass) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  if (!g_irisMetal4PendingCutoverSurface)
+    return JNI_FALSE;
+  if (!iris_metal4_recycle_graph_surface(
+          g_irisMetal4PendingCutoverSurface,
+          g_irisMetal4PendingCutoverWidth,
+          g_irisMetal4PendingCutoverHeight)) {
+    CFRelease(g_irisMetal4PendingCutoverSurface);
+  }
+  g_irisMetal4PendingCutoverSurface = nullptr;
+  g_irisMetal4PendingCutoverWidth = 0;
+  g_irisMetal4PendingCutoverHeight = 0;
+  return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nResetIrisMetal4FinalCutoverSurface(
+    JNIEnv *, jclass) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  CGLContextObj context = CGLGetCurrentContext();
+  if (context && (!g_irisMetal4CutoverGlBindings.empty() ||
+                  !g_irisMetal4InputHandoffs.empty() ||
+                  !g_irisMetal4InputSurfaceHandoffs.empty())) {
+    glFinish();
+  }
+  if (g_irisMetal4PendingCutoverSurface) {
+    CFRelease(g_irisMetal4PendingCutoverSurface);
+    g_irisMetal4PendingCutoverSurface = nullptr;
+  }
+  for (auto &entry : g_irisMetal4CutoverGlBindings) {
+    if (context && entry.second.completionFence) {
+      glDeleteSync(entry.second.completionFence);
+    }
+    if (entry.second.surface) {
+      CFRelease(entry.second.surface);
+    }
+  }
+  g_irisMetal4CutoverGlBindings.clear();
+  for (auto &entry : g_irisMetal4InputHandoffs) {
+    destroy_iris_metal4_input_handoff(entry.second, context != nullptr);
+  }
+  g_irisMetal4InputHandoffs.clear();
+  g_irisMetal4InputHandoffBytes = 0;
+  for (auto &entry : g_irisMetal4InputSurfaceHandoffs) {
+    destroy_iris_metal4_input_handoff(entry.second,
+                                      context != nullptr);
+  }
+  g_irisMetal4InputSurfaceHandoffs.clear();
+  g_irisMetal4InputSurfaceCaptureSequences.clear();
+  g_irisMetal4InputSurfaceBytes = 0;
+  for (auto &entry : g_irisMetal4ResidentBuffers) {
+    if (entry.second.buffer) {
+      [entry.second.buffer release];
+    }
+  }
+  g_irisMetal4ResidentBuffersByToken.clear();
+  g_irisMetal4ResidentBuffers.clear();
+  g_irisMetal4ResidentBufferBytes = 0;
+  g_irisMetal4LastGraphFrameRgba8.clear();
+  reset_iris_metal4_graph_resources();
+  g_irisMetal4PendingCutoverWidth = 0;
+  g_irisMetal4PendingCutoverHeight = 0;
+  g_metal4DrawPathActive.store(false, std::memory_order_release);
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nTakeIrisMetal4ShadowReplayRgba8(
+    JNIEnv *env, jclass) {
+  std::vector<uint8_t> pixels;
+  pixels.swap(g_irisMetal4LastReplayRgba8);
+  if (pixels.size() > (size_t)std::numeric_limits<jsize>::max())
+    return nullptr;
+  jbyteArray result = env->NewByteArray((jsize)pixels.size());
+  if (!result || pixels.empty())
+    return result;
+  env->SetByteArrayRegion(result, 0, (jsize)pixels.size(),
+                          reinterpret_cast<const jbyte *>(pixels.data()));
+  return env->ExceptionCheck() ? nullptr : result;
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nTakeIrisMetal4GraphFrameRgba8(
+    JNIEnv *env, jclass) {
+  std::vector<uint8_t> pixels;
+  pixels.swap(g_irisMetal4LastGraphFrameRgba8);
+  if (pixels.size() > (size_t)std::numeric_limits<jsize>::max())
+    return nullptr;
+  jbyteArray result = env->NewByteArray((jsize)pixels.size());
+  if (!result || pixels.empty())
+    return result;
+  env->SetByteArrayRegion(result, 0, (jsize)pixels.size(),
+                          reinterpret_cast<const jbyte *>(pixels.data()));
+  return env->ExceptionCheck() ? nullptr : result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nRunIrisMetal4ShadowParitySmoke(
+    JNIEnv *env, jclass, jstring pipelineKeyValue, jint width, jint height,
+    jint expectedRgba, jint channelTolerance) {
+  @autoreleasepool {
+    if (!g_device || !g_metal4CommandQueue ||
+        !g_metal4RuntimeVerified.load(std::memory_order_acquire))
+      return 0;
+    if (width <= 0 || height <= 0 || width > 1024 || height > 1024 ||
+        channelTolerance < 0 || channelTolerance > 16 || !pipelineKeyValue)
+      return -1;
+    if (@available(macOS 26.0, *)) {
+      const char *pipelineKey =
+          env->GetStringUTFChars(pipelineKeyValue, nullptr);
+      if (!pipelineKey)
+        return -1;
+      std::string key(pipelineKey);
+      bool validKey = valid_iris_pipeline_key(pipelineKey);
+      env->ReleaseStringUTFChars(pipelineKeyValue, pipelineKey);
+      if (!validKey)
+        return -1;
+
+      IrisMetal4PipelineEntry entry;
+      {
+        std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
+        auto found = g_irisMetal4Pipelines.find(key);
+        if (found == g_irisMetal4Pipelines.end() || !found->second.render)
+          return -1;
+        entry = found->second;
+        [entry.render retain];
+        if (entry.depthStencil)
+          [entry.depthStencil retain];
+      }
+      MTLPrimitiveType primitiveType = MTLPrimitiveTypeTriangle;
+      if (!iris_metal_primitive_type(entry.topology, primitiveType)) {
+        [entry.render release];
+        if (entry.depthStencil)
+          [entry.depthStencil release];
+        return 0;
+      }
+
+      g_irisMetal4PipelineDrawAttemptCount.fetch_add(
+          1, std::memory_order_relaxed);
+      id<MTLTexture> target = nil;
+      id<MTLResidencySet> residency = nil;
+      id<MTL4CommandAllocator> allocator = nil;
+      id<MTL4CommandBuffer> commandBuffer = nil;
+      MTL4RenderPassDescriptor *pass = nil;
+      MTL4CommitOptions *options = nil;
+      jint result = -1;
+      @try {
+        MTLTextureDescriptor *textureDescriptor =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                MTLPixelFormatRGBA8Unorm
+                                                        width:(NSUInteger)width
+                                                       height:(NSUInteger)height
+                                                    mipmapped:NO];
+        textureDescriptor.storageMode = MTLStorageModeShared;
+        textureDescriptor.usage = MTLTextureUsageRenderTarget |
+                                  MTLTextureUsageShaderRead;
+        target = [g_device newTextureWithDescriptor:textureDescriptor];
+
+        MTLResidencySetDescriptor *residencyDescriptor =
+            [[MTLResidencySetDescriptor alloc] init];
+        residencyDescriptor.label = @"MetalRender Iris shadow smoke";
+        residencyDescriptor.initialCapacity = 1;
+        NSError *residencyError = nil;
+        residency = [g_device
+            newResidencySetWithDescriptor:residencyDescriptor
+                                    error:&residencyError];
+        [residencyDescriptor release];
+        if (!target || !residency)
+          @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                         reason:@"offscreen allocation failed"
+                                       userInfo:nil];
+        [residency addAllocation:(id<MTLAllocation>)target];
+        [residency commit];
+        [residency requestResidency];
+
+        allocator = [g_device newCommandAllocator];
+        commandBuffer = [g_device newCommandBuffer];
+        if (!allocator || !commandBuffer)
+          @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                         reason:@"command allocation failed"
+                                       userInfo:nil];
+        [commandBuffer beginCommandBufferWithAllocator:allocator];
+        [commandBuffer useResidencySet:residency];
+        pass = [[MTL4RenderPassDescriptor alloc] init];
+        MTLRenderPassColorAttachmentDescriptor *color =
+            pass.colorAttachments[0];
+        color.texture = target;
+        color.loadAction = MTLLoadActionClear;
+        color.storeAction = MTLStoreActionStore;
+        color.clearColor = MTLClearColorMake(1.0, 0.0, 1.0, 1.0);
+        pass.renderTargetWidth = (NSUInteger)width;
+        pass.renderTargetHeight = (NSUInteger)height;
+        id<MTL4RenderCommandEncoder> encoder =
+            [commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder)
+          @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
+                                         reason:@"render encoder unavailable"
+                                       userInfo:nil];
+        [encoder setRenderPipelineState:entry.render];
+        [encoder setDepthStencilState:entry.depthStencil];
+        [encoder setCullMode:entry.cullMode];
+        [encoder setFrontFacingWinding:entry.frontFacingWinding];
+        [encoder setTriangleFillMode:entry.triangleFillMode];
+        [encoder setDepthClipMode:entry.depthClipMode];
+        uint32_t offsetBit = entry.topology == 0 ? 1u
+            : (entry.topology >= 1 && entry.topology <= 3 ? 2u : 4u);
+        if ((entry.polygonOffsetMask & offsetBit) != 0) {
+          [encoder setDepthBias:entry.depthBias
+                     slopeScale:entry.slopeScale
+                          clamp:entry.depthBiasClamp];
+        }
+        [encoder setStencilFrontReferenceValue:entry.frontStencilReference
+                            backReferenceValue:entry.backStencilReference];
+        MTLViewport viewport = {0.0, 0.0, (double)width, (double)height,
+                                0.0, 1.0};
+        [encoder setViewport:viewport];
+        MTLScissorRect scissor = {0, 0, (NSUInteger)width,
+                                  (NSUInteger)height};
+        [encoder setScissorRect:scissor];
+        [encoder drawPrimitives:primitiveType vertexStart:0 vertexCount:3];
+        [encoder endEncoding];
+        [commandBuffer endCommandBuffer];
+
+        auto state = std::make_shared<Metal4ProbeState>(allocator);
+        bool completed = metal4_commit_and_wait(
+            (id<MTL4CommandQueue>)g_metal4CommandQueue,
+            commandBuffer, state, 5'000);
+        if (!completed ||
+            !state->completed.load(std::memory_order_acquire) ||
+            !state->succeeded.load(std::memory_order_acquire)) {
+          result = -1;
+        } else {
+          size_t byteCount = (size_t)width * (size_t)height * 4u;
+          std::vector<uint8_t> pixels(byteCount);
+          MTLRegion region = MTLRegionMake2D(0, 0, (NSUInteger)width,
+                                             (NSUInteger)height);
+          [target getBytes:pixels.data()
+               bytesPerRow:(NSUInteger)width * 4u
+                fromRegion:region
+               mipmapLevel:0];
+          uint32_t expected = (uint32_t)expectedRgba;
+          uint8_t channels[] = {(uint8_t)(expected >> 24),
+                                (uint8_t)(expected >> 16),
+                                (uint8_t)(expected >> 8),
+                                (uint8_t)expected};
+          bool matches = true;
+          for (size_t offset = 0; offset < byteCount && matches;
+               offset += 4) {
+            for (size_t channel = 0; channel < 4; channel++) {
+              int delta = (int)pixels[offset + channel] - channels[channel];
+              if (std::abs(delta) > channelTolerance) {
+                matches = false;
+                break;
+              }
+            }
+          }
+          result = matches ? 1 : 2;
+        }
+      } @catch (NSException *exception) {
+        dbg("WARN: Iris Metal 4 shadow smoke raised %s: %s\n",
+            exception.name.UTF8String ?: "NSException",
+            exception.reason.UTF8String ?: "unknown reason");
+        result = -1;
+      }
+      if (options)
+        [options release];
+      if (pass)
+        [pass release];
+      if (commandBuffer)
+        [commandBuffer release];
+      if (allocator)
+        [allocator release];
+      if (residency) {
+        [residency endResidency];
+        [residency release];
+      }
+      if (target)
+        [target release];
+      [entry.render release];
+      if (entry.depthStencil)
+        [entry.depthStencil release];
+      return result;
+    }
+    return 0;
+  }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nResetIrisMetal4Pipelines(
+    JNIEnv *, jclass) {
+  @autoreleasepool {
+    std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
+    reset_iris_metal4_pipeline_cache_locked();
+  }
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nIsIrisMslCompilerReady(
     JNIEnv *, jclass) {
@@ -3019,6 +11462,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nConfigureRuntime(
     std::lock_guard<std::mutex> lock(g_metal4Mutex);
     g_metal4ScaffoldActive.store(false, std::memory_order_release);
     g_metal4RuntimeVerified.store(false, std::memory_order_release);
+    g_metal4ProbeInProgress.store(false, std::memory_order_release);
     g_metal4ProbeAttempted.store(false, std::memory_order_release);
     if (g_metal4CommandQueue) {
       [g_metal4CommandQueue release];
@@ -3067,6 +11511,8 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetBackendMode(
     mode = "METAL4";
   } else if (g_metal4RuntimeVerified.load(std::memory_order_acquire)) {
     mode = "METAL4_RUNTIME_VERIFIED_METAL3_RENDER";
+  } else if (g_metal4ProbeInProgress.load(std::memory_order_acquire)) {
+    mode = "METAL3_FALLBACK_METAL4_PROBE_PENDING";
   } else if (g_metal4ScaffoldActive.load(std::memory_order_acquire)) {
     mode = "METAL3_FALLBACK_METAL4_PROBE_PENDING";
   } else if (g_metal4Requested.load(std::memory_order_acquire) &&
@@ -5076,16 +13522,41 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetCurrentFrameCon
     bool semaphoreAcquired = false;
     if (g_frameSemaphore &&
         !g_shuttingDown.load(std::memory_order_acquire)) {
-      int waitMs = std::max(8, (int)ceilf(g_targetFrameTimeMs * 2.0f));
-      dispatch_time_t timeout =
+      // This wait is reached only after all triple-buffered frames are busy.
+      // At high refresh rates the old 8 ms floor could expire before one
+      // legitimate shader-heavy GPU frame completed, turning normal back
+      // pressure into a dropped frame. Keep the wait bounded, but scale it to
+      // the configured cadence and the depth of the in-flight queue.
+      int waitMs = std::clamp(
+          (int)ceilf(g_targetFrameTimeMs * 3.0f), 32, 100);
+      dispatch_time_t softTimeout =
           dispatch_time(DISPATCH_TIME_NOW, (int64_t)waitMs * NSEC_PER_MSEC);
-      if (dispatch_semaphore_wait(g_frameSemaphore, timeout) != 0) {
-        g_inFlightFrameTimeoutCount.fetch_add(1, std::memory_order_relaxed);
-        static int timeoutCount = 0;
-        if (++timeoutCount <= 10 || timeoutCount % 100 == 0)
-          dbg("Frame skipped: in-flight GPU limit timed out (%d)\n",
-              timeoutCount);
-        return 0;
+      if (dispatch_semaphore_wait(g_frameSemaphore, softTimeout) != 0) {
+        // A fullscreen/resize transition or temporary driver scheduling stall
+        // can exceed the normal frame-cadence window even though the command
+        // buffer is healthy.  Do not turn that transient back-pressure into a
+        // dropped Metal frame.  Completion handlers always signal the
+        // semaphore (including failed command buffers), so continue with a
+        // bounded hard wait and classify only that deadline as a native fault.
+        constexpr int kHardInFlightWaitMs = 1000;
+        int remainingMs = std::max(1, kHardInFlightWaitMs - waitMs);
+        dispatch_time_t hardTimeout = dispatch_time(
+            DISPATCH_TIME_NOW, (int64_t)remainingMs * NSEC_PER_MSEC);
+        if (dispatch_semaphore_wait(g_frameSemaphore, hardTimeout) != 0) {
+          g_inFlightFrameTimeoutCount.fetch_add(1,
+                                                std::memory_order_relaxed);
+          static int timeoutCount = 0;
+          if (++timeoutCount <= 10 || timeoutCount % 100 == 0)
+            dbg("Frame skipped: in-flight GPU hard timeout (%d)\n",
+                timeoutCount);
+          return 0;
+        }
+        static int recoveredBackpressureCount = 0;
+        if (++recoveredBackpressureCount <= 10
+            || recoveredBackpressureCount % 100 == 0) {
+          dbg("Frame pacing recovered after soft in-flight wait (%d)\n",
+              recoveredBackpressureCount);
+        }
       }
       semaphoreAcquired = true;
     }
@@ -6112,11 +14583,11 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nBindIOSurfaceToTex
   IOSurfaceRef blitSurface = g_tbIOSurface[blitSlot];
   int w = std::max(1, g_rtWidth);
   int h = std::max(1, g_rtHeight);
-  glBindTexture(GL_TEXTURE_RECTANGLE_ARB, (GLuint)glTexture);
+  glBindTexture(GL_TEXTURE_RECTANGLE, (GLuint)glTexture);
   CGLError err = CGLTexImageIOSurface2D(
-      cglCtx, GL_TEXTURE_RECTANGLE_ARB, GL_RGBA, (GLsizei)w, (GLsizei)h,
+      cglCtx, GL_TEXTURE_RECTANGLE, GL_RGBA, (GLsizei)w, (GLsizei)h,
       GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, blitSurface, 0);
-  glBindTexture(GL_TEXTURE_RECTANGLE_ARB, 0);
+  glBindTexture(GL_TEXTURE_RECTANGLE, 0);
   if (err == kCGLNoError) {
     g_tbSlotState[blitSlot].store(SurfaceSlotBoundToGL,
                                   std::memory_order_release);

@@ -2,6 +2,95 @@
 
 ## Unreleased
 
+## 0.3.0+mc26.2
+
+### Stable Stage 9 Iris-to-Metal 4 renderer
+
+- Execute the validated Iris SHADOW, GEOMETRY, DEFERRED, COMPOSITE and FINAL
+  pass graph through persistent Metal-owned resources and frame-batched MTL4
+  command buffers after strict three-frame visual parity.
+- Translate Iris' final linked GLSL through shaderc SPIR-V and SPIRV-Cross
+  MSL, compile exact render-state pipelines, and persist a device/OS/compiler
+  qualified Metal archive with stale-archive recovery.
+- Retain compatible textures and geometry in bounded Metal caches, encode
+  explicit RAW/WAR/WAW barriers, and present through a fenced IOSurface ring
+  without a CPU output copy or steady-state `glFinish`.
+- Submit graph frames off the render thread. Make status, promotion and bind
+  probes nonblocking when a previously fenced surface can be reused, while
+  keeping the first usable presentation blocking and ownership-safe.
+- Enable the full path automatically only for the packaged stable JAR on
+  Apple Silicon macOS 26+. Add
+  `-Dmetalrender.irisMetal.enabled=false` as a global safe-disable override;
+  dev/prerelease classpaths stay opt-in.
+- Validate the exact packaged candidate cold and warm in Metal 4 and forced
+  Metal 3 profiles through Iris on/off/on, Overworld, Nether, End, return to
+  Overworld, resize, fullscreen and surface suspend/restore, with zero native
+  faults or ownership failures.
+- Add a fail-closed 600-frame matched performance gate. Two opposite-order
+  stable-JAR A/B runs passed: Metal improved CPU p50 by 42.6-44.8%, CPU p95 by
+  27.1-37.4%, GPU p95 by 10.5-19.5% and GPU p99 by 11.5-32.5%. CPU p99
+  improved 38.3% in the first run and regressed only 1.5% in the reverse run,
+  within the 5% limit; every side recorded zero >=100 ms stutters.
+- Keep true 2x Retina backing, physical sleep/wake, external-display reconnect
+  and real presented 200 Hz cadence outside the validated release scope.
+
+### Stage 9 FINAL resource-residency milestone
+
+- Move compatible dynamic FINAL texture inputs through synchronized IOSurface
+  handoffs and retain static input content as native Metal textures.
+- Retain referenced vertex/index content in bounded content-addressed Metal
+  buffers and encode shared handles instead of inline geometry bytes in the
+  MRX7 replay packet. Prune captured GL bindings that the reflected argument
+  table and draw command do not consume.
+- Validate the v41 exact JAR
+  (`SHA-256 d1aa3eaf759fe8de8e8c96b29026b282e786f359c5d38884636d4cea666e050a`)
+  in Metal 4 and forced Metal 3 cold/warm runs. Metal 4 produced 197/198
+  successful visible FINAL presentations with 591/594 GPU texture references,
+  394/396 GPU buffer references, zero CPU texture or buffer payloads and zero
+  cutover failures. Forced Metal 3 made zero attempts and reported zero input
+  counters.
+- Keep `performanceEligible=false`: FINAL I/O residency is only a Stage 9
+  substage. SHADOW, GEOMETRY and COMPOSITE remain visibly owned by OpenGL, and
+  isolated Metal replay still waits synchronously for completion.
+
+### Iris FINAL selective-cutover milestone
+
+- Compare paired Iris/OpenGL and Metal FINAL output for three consecutive
+  frames; pass with zero pixels outside tolerance, worst RMSE below `0.005`
+  and maximum channel delta `1` using native row order.
+- Present the validated Metal FINAL result before cancelling its paired
+  OpenGL draw. The exact v32 JAR passed cold and warm runs with 195/197
+  successful presentations and suppressions and zero fallback/failure events.
+- Keep forced Metal 3 fail-open: the same candidate performed zero Metal
+  attempts, suppressed zero OpenGL draws and retained Iris/OpenGL ownership.
+- Replace the temporary Metal-to-CPU-to-OpenGL output upload with a direct
+  IOSurface GPU handoff. A three-slot GL fence ring avoids a blocking
+  steady-state `glFinish`; busy or unfenceable slots fail open before the
+  paired OpenGL draw is cancelled.
+- Validate the v36 exact JAR (`SHA-256 bbff76ffa74853d313c458140578b9d98038a2bbbb7a30311296aad82c7bddee`)
+  in Metal 4 and forced Metal 3 cold/warm runs. Metal 4 performed 194/195
+  visible FINAL presentations and suppressions with zero failure or fallback;
+  forced Metal 3 performed zero Metal attempts and suppressions.
+- Fix a startup race where the pre-configuration native `METAL3` state could
+  be cached permanently as unsupported before the Metal 4 probe completed.
+- Keep the historical direct-output bridge `performanceEligible=false`: at
+  this v36 boundary, live OpenGL inputs still used CPU readback/upload and only
+  the paired FINAL draw was owned by Metal.
+
+### Iris Metal offscreen execution milestone
+
+- Build and archive device-qualified MTL4 pipelines for the exact final Iris
+  shader ABI, with cold compilation, warm cache hits and stale-archive recovery.
+- Mirror bounded draw-time vertex/index buffers, sampled textures, samplers and
+  reflected argument tables into the MRX7 native replay packet.
+- Execute real Complementary Reimagined SHADOW, GEOMETRY, COMPOSITE and FINAL
+  passes offscreen through Metal 4 with 4/4 successes, zero unsupported/failed
+  attempts and zero native fault deltas in cold and warm exact-JAR runs.
+- Repack OpenGL RGB8/RGB8_SNORM texture snapshots to Metal RGBA8 while
+  preserving RGB and OpenGL's implicit alpha=1 semantics.
+- Keep non-FINAL and unsupported Iris draws on OpenGL; the remaining
+  `sky_basic` topology/index-expansion variant is fail-open.
+
 ### Iris render-graph milestone
 
 - Capture bounded, content-addressed Iris frame graphs spanning shadow,
@@ -47,9 +136,10 @@
 
 ### Boundary
 
-- Iris still owns every visible shader-pack draw. Twelve observed topology
-  variants remain deliberately execution-blocked until index expansion is
-  implemented and validated. No FPS claim is made at this stage.
+- These entries record the staged development history that preceded the stable
+  full-graph path above. The final `0.3.0` boundary supersedes their temporary
+  FINAL-only and no-performance-claim limitations for the declared supported
+  matrix; unsupported variants still remain fail-open to Iris/OpenGL.
 
 ## 0.3.0-alpha.1+mc26.2
 

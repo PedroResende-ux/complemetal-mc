@@ -16,6 +16,7 @@ import java.util.Map;
 public final class IrisGlResourceBindingTracker {
   public static final int GL_TEXTURE0 = 0x84C0;
   public static final int GL_TEXTURE_2D = 0x0DE1;
+  public static final int GL_TEXTURE_BUFFER = 0x8C2A;
   public static final int GL_UNIFORM_BUFFER = 0x8A11;
   public static final int GL_SHADER_STORAGE_BUFFER = 0x90D2;
   private static final int MAX_PROGRAMS = 4_096;
@@ -47,6 +48,12 @@ public final class IrisGlResourceBindingTracker {
     textureBuffers.clear();
     imageUnits.clear();
     indexedBuffers.clear();
+  }
+
+  public synchronized void unbindAllSamplers() {
+    for (MutableTextureUnit unit : textureUnits.values()) {
+      unit.sampler = 0;
+    }
   }
 
   public synchronized void registerProgram(int program) {
@@ -210,8 +217,7 @@ public final class IrisGlResourceBindingTracker {
     }
     MutableTextureUnit binding = textureUnits.computeIfAbsent(unit,
         ignored -> new MutableTextureUnit());
-    binding.target = target;
-    binding.texture = texture;
+    binding.bind(target, texture);
   }
 
   public synchronized void bindSamplerToUnit(int unit, int sampler) {
@@ -222,19 +228,38 @@ public final class IrisGlResourceBindingTracker {
         .sampler = sampler;
   }
 
+  /** Mirrors glDeleteTextures unbinding and prevents reused names leaking. */
+  public synchronized void deleteTexture(int texture) {
+    if (texture <= 0) {
+      return;
+    }
+    for (MutableTextureUnit unit : textureUnits.values()) {
+      unit.deleteTexture(texture);
+    }
+    textureBuffers.remove(texture);
+    imageUnits.entrySet().removeIf(
+        entry -> entry.getValue().texture() == texture);
+  }
+
   public synchronized TextureUnitBinding activeTextureBinding() {
     MutableTextureUnit binding = textureUnits.get(activeTextureUnit);
     return binding == null ? null : binding.snapshot();
   }
 
+  public synchronized TextureUnitBinding activeTextureBinding(int target) {
+    MutableTextureUnit binding = textureUnits.get(activeTextureUnit);
+    return binding == null ? null : binding.snapshot(target);
+  }
+
   public synchronized void texBuffer(int target, int internalFormat,
                                      int buffer) {
     MutableTextureUnit unit = textureUnits.get(activeTextureUnit);
-    if (unit == null || unit.texture <= 0 || target < 0
+    TextureUnitBinding binding = unit == null ? null : unit.snapshot(target);
+    if (binding == null || binding.texture() <= 0 || target < 0
         || internalFormat < 0 || buffer < 0) {
       return;
     }
-    textureBuffers.put(unit.texture,
+    textureBuffers.put(binding.texture(),
         new TextureBufferBinding(target, internalFormat, buffer));
   }
 
@@ -271,14 +296,63 @@ public final class IrisGlResourceBindingTracker {
       return null;
     }
     Map<Integer, TextureUnitBinding> textures = new HashMap<>();
+    Map<Integer, TextureUnitBinding> bufferTextureUnits = new HashMap<>();
     for (Map.Entry<Integer, MutableTextureUnit> entry
         : textureUnits.entrySet()) {
-      textures.put(entry.getKey(), entry.getValue().snapshot());
+      TextureUnitBinding binding = entry.getValue().snapshot();
+      if (binding != null) {
+        textures.put(entry.getKey(), withMirrorGenerations(binding));
+      }
+      TextureUnitBinding bufferBinding = entry.getValue().snapshot(
+          GL_TEXTURE_BUFFER);
+      if (bufferBinding != null) {
+        bufferTextureUnits.put(entry.getKey(),
+            withMirrorGenerations(bufferBinding));
+      }
+    }
+    Map<IndexedBufferBinding, BufferBinding> buffers = new HashMap<>();
+    for (Map.Entry<IndexedBufferBinding, BufferBinding> entry
+        : indexedBuffers.entrySet()) {
+      BufferBinding binding = entry.getValue();
+      long generation = binding.buffer() == 0 ? 0
+          : IrisGlBufferMirror.global().generation(binding.buffer());
+      buffers.put(entry.getKey(),
+          binding.withMirrorGeneration(generation));
+    }
+    Map<Integer, TextureBufferBinding> bufferTextures = new HashMap<>();
+    for (Map.Entry<Integer, TextureBufferBinding> entry
+        : textureBuffers.entrySet()) {
+      TextureBufferBinding binding = entry.getValue();
+      long generation = binding.buffer() == 0 ? 0
+          : IrisGlBufferMirror.global().generation(binding.buffer());
+      bufferTextures.put(entry.getKey(),
+          binding.withMirrorGeneration(generation));
+    }
+    Map<Integer, ImageUnitBinding> images = new HashMap<>();
+    for (Map.Entry<Integer, ImageUnitBinding> entry : imageUnits.entrySet()) {
+      ImageUnitBinding binding = entry.getValue();
+      long generation = binding.texture() == 0 ? 0
+          : IrisGlTextureMirror.global().generation(binding.texture());
+      images.put(entry.getKey(), binding.withMirrorGeneration(generation));
     }
     return new IrisGlResourceBindingSnapshot(currentProgram,
         bindings.uniformLocations, bindings.uniformValues,
         bindings.uniformBlockIndices, bindings.uniformBlockBindings,
-        textures, textureBuffers, imageUnits, indexedBuffers);
+        textures, bufferTextureUnits, bufferTextures, images, buffers);
+  }
+
+  private static TextureUnitBinding withMirrorGenerations(
+      TextureUnitBinding binding) {
+    long textureGeneration = binding.texture() == 0 ? 0
+        : IrisGlTextureMirror.global().generation(binding.texture());
+    long samplerGeneration = binding.sampler() > 0
+        ? IrisGlSamplerMirror.global().samplerGeneration(binding.sampler())
+        : binding.texture() > 0
+            ? IrisGlSamplerMirror.global().textureGeneration(
+                binding.texture())
+            : 0;
+    return binding.withMirrorGenerations(textureGeneration,
+        samplerGeneration);
   }
 
   private static boolean validUnit(int unit) {
@@ -300,12 +374,34 @@ public final class IrisGlResourceBindingTracker {
   }
 
   private static final class MutableTextureUnit {
-    private int target;
-    private int texture;
+    private final Map<Integer, Integer> texturesByTarget = new HashMap<>();
+    private int lastTarget;
     private int sampler;
 
+    private void bind(int target, int texture) {
+      texturesByTarget.put(target, texture);
+      lastTarget = target;
+    }
+
+    private void deleteTexture(int texture) {
+      texturesByTarget.replaceAll((target, bound) ->
+          bound == texture ? 0 : bound);
+    }
+
     private TextureUnitBinding snapshot() {
-      return new TextureUnitBinding(target, texture, sampler);
+      // OpenGL keeps one binding per texture target on every texture unit.
+      // The Iris shader-pack execution path currently supports sampled 2D
+      // images; prefer that exact binding instead of whichever unrelated
+      // target (commonly GL_TEXTURE_BUFFER) happened to be bound last.
+      int target = texturesByTarget.containsKey(GL_TEXTURE_2D)
+          ? GL_TEXTURE_2D : lastTarget;
+      return snapshot(target);
+    }
+
+    private TextureUnitBinding snapshot(int target) {
+      Integer texture = texturesByTarget.get(target);
+      return texture == null ? null
+          : new TextureUnitBinding(target, texture, sampler);
     }
   }
 }

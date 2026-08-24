@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 final class IrisShaderCacheKeyTest {
@@ -74,5 +75,22 @@ final class IrisShaderCacheKeyTest {
             new IrisTranslationProfile("translator=one;spirv=1.0")),
         IrisShaderCacheKey.from(program,
             new IrisTranslationProfile("translator=two;spirv=1.0")));
+  }
+
+  @Test
+  void packedVertexInterfaceIsPartOfTheContentAddress() {
+    IrisFinalShaderProgram program = IrisFinalShaderProgram.fromGraphicsLink(
+        "program", "vertex", null, null, null, "fragment");
+    IrisFinalShaderProgram first = program.withVertexShaderInputs(List.of(
+        new IrisVertexLayoutCapture.ShaderInput("iris_Position", 0,
+            new IrisPipelineState.DataFormat("rgb32-float"))));
+    IrisFinalShaderProgram second = program.withVertexShaderInputs(List.of(
+        new IrisVertexLayoutCapture.ShaderInput("iris_Position", 1,
+            new IrisPipelineState.DataFormat("rgb32-float"))));
+
+    assertNotEquals(IrisShaderCacheKey.from(program),
+        IrisShaderCacheKey.from(first));
+    assertNotEquals(IrisShaderCacheKey.from(first),
+        IrisShaderCacheKey.from(second));
   }
 }

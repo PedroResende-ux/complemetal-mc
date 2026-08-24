@@ -10,11 +10,16 @@
     "IrisDhLodRenderProgramMixin",
     "IrisFinalPassGraphMixin",
     "IrisFrameBufferCacheMixin",
+    "IrisGlBufferMixin",
     "IrisGlCommandEncoderMixin",
+    "IrisGpuBufferMappedViewMixin",
     "IrisGlProgramResourceMixin",
     "IrisGlRenderPassMixin",
+    "IrisGlSamplerMixin",
     "IrisGlStateManagerMixin",
     "IrisGlTextureMixin",
+    "IrisMatrixArrayUniformMixin",
+    "IrisMatrixUniformMixin",
     "IrisPartialShaderAccessor",
     "IrisProgramBuilderAccessor",
     "IrisProgramBuilderMixin",
@@ -22,7 +27,9 @@
     "IrisRenderSystemMixin",
     "IrisShaderCreatorMixin",
     "IrisShadowRendererGraphMixin",
-    "IrisSodiumGlDrawContextMixin"
+    "IrisSodiumGlDrawContextMixin",
+    "IrisUniformAccessor",
+    "IrisVertexArrayCacheMixin"
   ],
   "injectors": {
     "defaultRequire": 0

@@ -16,15 +16,28 @@ import static org.lwjgl.util.spvc.Spvc.SPVC_BACKEND_MSL;
 import static org.lwjgl.util.spvc.Spvc.SPVC_CAPTURE_MODE_TAKE_OWNERSHIP;
 import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS;
 import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER;
+import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_MSL_INVARIANT_FP_MATH;
 import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_MSL_PLATFORM;
 import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_MSL_VERSION;
+import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_FIXUP_DEPTH_CONVENTION;
+import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_FLIP_VERTEX_Y;
 import static org.lwjgl.util.spvc.Spvc.SPVC_MSL_PLATFORM_MACOS;
+import static org.lwjgl.util.spvc.Spvc.SPVC_MSL_SHADER_INPUT_FORMAT_ANY16;
+import static org.lwjgl.util.spvc.Spvc.SPVC_MSL_SHADER_INPUT_FORMAT_ANY32;
+import static org.lwjgl.util.spvc.Spvc.SPVC_MSL_SHADER_INPUT_FORMAT_OTHER;
+import static org.lwjgl.util.spvc.Spvc.SPVC_MSL_SHADER_INPUT_FORMAT_UINT16;
+import static org.lwjgl.util.spvc.Spvc.SPVC_MSL_SHADER_INPUT_FORMAT_UINT8;
+import static org.lwjgl.util.spvc.Spvc.SPVC_MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+import static org.lwjgl.util.spvc.Spvc.SPVC_RESOURCE_TYPE_STAGE_INPUT;
 import static org.lwjgl.util.spvc.Spvc.SPVC_SUCCESS;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.IntBuffer;
 import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.lwjgl.PointerBuffer;
@@ -32,6 +45,8 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.util.shaderc.Shaderc;
 import org.lwjgl.util.spvc.Spvc;
+import org.lwjgl.util.spvc.SpvcMslShaderInterfaceVar2;
+import org.lwjgl.util.spvc.SpvcReflectedResource;
 
 /**
  * Preferred in-process translator using Minecraft 26.2's LWJGL 3.4.1
@@ -49,6 +64,7 @@ public final class LwjglShadercSpvcBackend
   private static final String SPVC_CLASS = "org.lwjgl.util.spvc.Spvc";
   private static final Pattern GLSL_VERSION = Pattern.compile(
       "(?m)^(\\s*#\\s*version\\s+)(\\d+)([^\\r\\n]*)");
+  private static final int SPV_DECORATION_LOCATION = 30;
 
   private final ExecutionPolicy executionPolicy;
 
@@ -165,7 +181,8 @@ public final class LwjglShadercSpvcBackend
           continue;
         }
         byte[] spirv = compileSpirv(compiler, options, stage, source);
-        String msl = compileMsl(stage, spirv);
+        String msl = compileMsl(stage, spirv,
+            program.vertexShaderInputs());
         stages.put(stage,
             new IrisShaderTranslation.StageArtifacts(spirv, msl));
       }
@@ -250,7 +267,8 @@ public final class LwjglShadercSpvcBackend
         + source.substring(matcher.end(2));
   }
 
-  private static String compileMsl(IrisShaderStage stage, byte[] spirv)
+  private static String compileMsl(IrisShaderStage stage, byte[] spirv,
+      List<IrisVertexLayoutCapture.ShaderInput> vertexShaderInputs)
       throws IrisShaderTranslationException {
     if (spirv.length % Integer.BYTES != 0) {
       throw new IrisShaderTranslationException(
@@ -279,6 +297,12 @@ public final class LwjglShadercSpvcBackend
               "create MSL compiler");
           long compiler = compilerPointer.get(0);
 
+          if (stage == IrisShaderStage.VERTEX
+              && !vertexShaderInputs.isEmpty()) {
+            configureVertexInputs(context, compiler, stack,
+                vertexShaderInputs);
+          }
+
           PointerBuffer optionsPointer = stack.mallocPointer(1);
           checkSpvc(Spvc.spvc_compiler_create_compiler_options(compiler,
               optionsPointer), context, "create MSL options");
@@ -296,6 +320,24 @@ public final class LwjglShadercSpvcBackend
           checkSpvc(Spvc.spvc_compiler_options_set_uint(options,
               SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER, 1), context,
               "select MSL argument-buffer tier 2");
+          checkSpvc(Spvc.spvc_compiler_options_set_bool(options,
+              SPVC_COMPILER_OPTION_FIXUP_DEPTH_CONVENTION, true), context,
+              "convert OpenGL clip depth to Metal");
+          checkSpvc(Spvc.spvc_compiler_options_set_bool(options,
+              SPVC_COMPILER_OPTION_FLIP_VERTEX_Y, true), context,
+              "convert OpenGL framebuffer Y to Metal");
+          /*
+           * Do not force invariant math globally. SPIRV-Cross implements that
+           * option by routing every floating-point add/subtract/multiply
+           * through [[clang::optnone]] helper functions. Besides blocking
+           * Metal's normal shader optimization, that is stronger than the
+           * source contract: shaderc already emits NoContraction for GLSL
+           * operations that are explicitly precise, and SPIRV-Cross preserves
+           * those operations even with this global option disabled.
+           */
+          checkSpvc(Spvc.spvc_compiler_options_set_bool(options,
+              SPVC_COMPILER_OPTION_MSL_INVARIANT_FP_MATH, false), context,
+              "preserve only explicitly invariant floating-point math");
           checkSpvc(Spvc.spvc_compiler_install_compiler_options(compiler,
               options), context, "install MSL options");
 
@@ -315,6 +357,107 @@ public final class LwjglShadercSpvcBackend
     } finally {
       MemoryUtil.memFree(storage);
     }
+  }
+
+  /**
+   * Replays Iris' pre-link attribute locations into SPIR-V and tells
+   * SPIRV-Cross which packed buffer type Metal must widen to the GLSL type.
+   */
+  private static void configureVertexInputs(long context, long compiler,
+      MemoryStack stack,
+      List<IrisVertexLayoutCapture.ShaderInput> capturedInputs)
+      throws IrisShaderTranslationException {
+    Map<String, IrisVertexLayoutCapture.ShaderInput> byName =
+        new HashMap<>();
+    for (IrisVertexLayoutCapture.ShaderInput input : capturedInputs) {
+      if (byName.put(input.linkedName(), input) != null) {
+        throw new IrisShaderTranslationException(
+            "duplicate captured vertex shader input");
+      }
+    }
+
+    PointerBuffer resourcesPointer = stack.mallocPointer(1);
+    checkSpvc(Spvc.spvc_compiler_create_shader_resources(
+        compiler, resourcesPointer), context,
+        "reflect vertex shader inputs");
+    PointerBuffer listPointer = stack.mallocPointer(1);
+    PointerBuffer countPointer = stack.mallocPointer(1);
+    checkSpvc(Spvc.spvc_resources_get_resource_list_for_type(
+        resourcesPointer.get(0), SPVC_RESOURCE_TYPE_STAGE_INPUT,
+        listPointer, countPointer), context,
+        "list vertex shader inputs");
+    long countValue = countPointer.get(0);
+    if (countValue < 0 || countValue > IrisPipelineState.MAX_VERTEX_ATTRIBUTES) {
+      throw new IrisShaderTranslationException(
+          "vertex shader input count exceeds the Metal bound");
+    }
+
+    SpvcReflectedResource.Buffer reflected = SpvcReflectedResource.create(
+        listPointer.get(0), (int) countValue);
+    for (int index = 0; index < reflected.capacity(); index++) {
+      SpvcReflectedResource resource = reflected.get(index);
+      String name = resource.nameString();
+      IrisVertexLayoutCapture.ShaderInput input = byName.get(name);
+      if (input == null) {
+        throw new IrisShaderTranslationException(
+            "vertex shader input is not present in the linked Iris format");
+      }
+      Spvc.spvc_compiler_set_decoration(compiler, resource.id(),
+          SPV_DECORATION_LOCATION, input.location());
+
+      long type = Spvc.spvc_compiler_get_type_handle(
+          compiler, resource.type_id());
+      int shaderVectorSize = Spvc.spvc_type_get_vector_size(type);
+      int packedVectorSize = vectorSize(input.format().cacheName());
+      if (shaderVectorSize <= 0 || shaderVectorSize > 4
+          || packedVectorSize <= 0 || packedVectorSize > 4) {
+        throw new IrisShaderTranslationException(
+            "packed vertex input cannot satisfy the GLSL vector size");
+      }
+      SpvcMslShaderInterfaceVar2 variable =
+          SpvcMslShaderInterfaceVar2.calloc(stack);
+      Spvc.spvc_msl_shader_interface_var_init_2(variable);
+      variable.location(input.location());
+      variable.format(mslShaderInputFormat(input.format().cacheName()));
+      variable.vecsize(packedVectorSize);
+      variable.rate(SPVC_MSL_SHADER_VARIABLE_RATE_PER_VERTEX);
+      checkSpvc(Spvc.spvc_compiler_msl_add_shader_input_2(
+          compiler, variable), context,
+          "configure packed vertex shader input");
+    }
+  }
+
+  private static int vectorSize(String format) {
+    if (format.startsWith("rgba")) {
+      return 4;
+    }
+    if (format.startsWith("rgb")) {
+      return 3;
+    }
+    if (format.startsWith("rg")) {
+      return 2;
+    }
+    if (format.startsWith("r")) {
+      return 1;
+    }
+    throw new IllegalArgumentException("unsupported vertex format vector");
+  }
+
+  private static int mslShaderInputFormat(String format) {
+    if (format.endsWith("8-uint")) {
+      return SPVC_MSL_SHADER_INPUT_FORMAT_UINT8;
+    }
+    if (format.endsWith("16-uint")) {
+      return SPVC_MSL_SHADER_INPUT_FORMAT_UINT16;
+    }
+    if (format.endsWith("16-sint") || format.endsWith("16-float")) {
+      return SPVC_MSL_SHADER_INPUT_FORMAT_ANY16;
+    }
+    if (format.endsWith("32-uint") || format.endsWith("32-sint")
+        || format.endsWith("32-float")) {
+      return SPVC_MSL_SHADER_INPUT_FORMAT_ANY32;
+    }
+    return SPVC_MSL_SHADER_INPUT_FORMAT_OTHER;
   }
 
   private static void checkSpvc(int result, long context, String operation)

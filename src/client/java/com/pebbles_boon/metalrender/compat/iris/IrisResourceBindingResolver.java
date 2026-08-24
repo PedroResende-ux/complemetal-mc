@@ -69,8 +69,9 @@ public final class IrisResourceBindingResolver {
       return "sampled-unit-missing";
     }
     int unit = (int) value.rawBits()[0];
+    boolean bufferTexture = isBufferTexture(resource);
     IrisGlResourceBindingSnapshot.TextureUnitBinding binding =
-        snapshot.textureUnits().get(unit);
+        snapshot.sampledTextureBinding(unit, bufferTexture);
     if (binding == null) {
       return detail("sampled-texture-missing", name) + ":unit-" + unit;
     }
@@ -82,7 +83,7 @@ public final class IrisResourceBindingResolver {
     if (binding.texture() == 0) {
       return null;
     }
-    if (isBufferTexture(resource)) {
+    if (bufferTexture) {
       IrisGlResourceBindingSnapshot.TextureBufferBinding textureBuffer =
           snapshot.textureBuffers().get(binding.texture());
       if (textureBuffer == null || textureBuffer.buffer() <= 0) {
@@ -149,7 +150,7 @@ public final class IrisResourceBindingResolver {
         ? "unnamed" : name);
   }
 
-  private static boolean isBufferTexture(ResourceBinding resource) {
+  static boolean isBufferTexture(ResourceBinding resource) {
     if (resource.baseType() instanceof SampledImageType sampled) {
       return sampled.imageType().dimension() == ImageDimension.BUFFER;
     }

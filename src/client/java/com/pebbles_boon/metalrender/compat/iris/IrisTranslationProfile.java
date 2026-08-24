@@ -13,14 +13,15 @@ public record IrisTranslationProfile(String canonicalValue) {
   public static final IrisTranslationProfile
       LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS =
       new IrisTranslationProfile(
-          "metalrender-translator=5;lwjgl=3.4.1;shaderc-source=glsl;"
+          "metalrender-translator=8;lwjgl=3.4.1;shaderc-source=glsl;"
               + "shaderc-env=opengl4.5;spirv=1.0;"
               + "glsl-version-floor=330;"
               + "debug-names=retain-for-resource-binding;"
               + "optimization=performance;auto-bind-uniforms=true;"
               + "auto-map-locations=true;entry=main;spvc=3.4.1;"
               + "msl-platform=macos;msl=3.0;argument-buffers=true;"
-              + "argument-buffer-tier=2");
+              + "argument-buffer-tier=2;fixup-depth-convention=true;"
+              + "flip-vertex-y=true;invariant-fp-math=explicit-only");
 
   public IrisTranslationProfile {
     Objects.requireNonNull(canonicalValue, "canonicalValue");

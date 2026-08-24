@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender.nativebridge;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -622,6 +623,174 @@ public final class NativeBridge {
   public static native long nGetIrisMslCompileFailureCount();
 
   public static native long nGetIrisMslLiveLibraryCount();
+
+  /** Device/OS/Metal-runtime identity used only as pipeline-cache key input. */
+  public static native String nGetIrisMetal4PipelineCacheIdentity();
+
+  public static native int nConfigureIrisMetal4PipelineCache(
+      String archivePath);
+
+  /** Creates and retains a pipeline object; this method never encodes a draw. */
+  public static native int nCompileIrisMetal4Pipeline(String pipelineKey,
+      String shaderKey, byte[] descriptor, byte[] vertexMsl,
+      byte[] fragmentMsl, byte[] computeMsl);
+
+  public static native boolean nFlushIrisMetal4PipelineCache();
+
+  public static native long nGetIrisMetal4PipelineAttemptCount();
+
+  public static native long nGetIrisMetal4PipelineCompileCount();
+
+  public static native long nGetIrisMetal4PipelineCacheHitCount();
+
+  public static native long nGetIrisMetal4PipelineFailureCount();
+
+  public static native long nGetIrisMetal4PipelineStaleRecoveryCount();
+
+  public static native long nGetIrisMetal4LivePipelineCount();
+
+  public static native long nGetIrisMetal4PipelineDrawAttemptCount();
+
+  /**
+   * Executes a bounded offscreen MTL4 draw with a retained Iris pipeline and
+   * compares every output pixel with the expected RGBA8 value.
+   */
+  public static native int nRunIrisMetal4ShadowParitySmoke(
+      String pipelineKey, int width, int height, int expectedRgba,
+      int channelTolerance);
+
+  /**
+   * Executes one strict MRX7 packet offscreen. The result is
+   * {status, FNV-1a-64 output hash, width, height, reason code}; status is 1
+   * for success, 0 for an unsupported runtime case, and -1 for
+   * malformed/failure.
+   */
+  public static native long[] nRunIrisMetal4ShadowReplay(
+      String pipelineKey, byte[] packet);
+
+  /**
+   * Executes the same strict packet into an IOSurface-backed RGBA8 target.
+   * The successful result token identifies completion, not a CPU pixel hash.
+   */
+  public static native long[] nRunIrisMetal4FinalCutoverReplay(
+      String pipelineKey, byte[] packet);
+
+  /**
+   * Copies one GL 2D input into a reusable IOSurface entirely on the GPU.
+   * Kind 1 is RGBA8; kind 2 converts RG11B10F to RGBA16F.
+   */
+  public static native long nCaptureIrisMetal4InputSurface(
+      int glTexture, int width, int height, int kind);
+
+  /** Uploads one immutable RGBA8 mirror generation into resident Metal. */
+  public static native long nUploadIrisMetal4InputTexture(
+      int glTexture, long generation, int width, int height, byte[] rgba8);
+
+  /** Uploads one content-addressed immutable draw buffer into resident Metal. */
+  public static native long nUploadIrisMetal4InputBuffer(
+      String sha256, byte[] bytes);
+
+  /**
+   * Creates or reuses one private Metal texture for a generation-qualified
+   * Iris graph attachment. The returned token is opaque and calling-thread
+   * scoped; zero means fail-open to Iris/OpenGL.
+   */
+  public static native long nEnsureIrisMetal4GraphTexture(
+      long contextGeneration, int glTexture, long resourceGeneration,
+      String format, int sampleCount, int width, int height,
+      int depthOrLayers, int mipLevels, int usage);
+
+  public static native int nGetIrisMetal4GraphTextureCount();
+
+  public static native long nGetIrisMetal4GraphTextureBytes();
+
+  public static native void nResetIrisMetal4GraphResources();
+
+  /**
+   * Executes one strict MGF9 clear/barrier/transfer/draw batch in one MTL4
+   * command buffer. The result is {status, steps, clears, transfers,
+   * barriers, readbackHash, reason}.
+   */
+  public static native long[] nRunIrisMetal4GraphFrame(byte[] packet,
+      int diagnosticReadbackMipLevel);
+
+  /** Submits one presentation-mode MGF9 frame without waiting for the GPU. */
+  public static native long[] nSubmitIrisMetal4GraphFrame(byte[] packet);
+
+  /**
+   * Direct-buffer variant used by the production frame path to avoid a large
+   * per-frame Java heap array and primitive-array pin.
+   */
+  public static native long[] nSubmitIrisMetal4GraphFrameDirect(
+      ByteBuffer packet, int length);
+
+  /**
+   * Returns {status, token, width, height, reason} for an async frame.
+   * A nonblocking PENDING probe may return zero width and height.
+   */
+  public static native long[] nGetIrisMetal4GraphPresentationStatus(
+      long token);
+
+  /** Promotes a completed async frame into the existing GL IOSurface binder. */
+  public static native boolean nPromoteIrisMetal4GraphPresentation(
+      long token, int width, int height);
+
+  /** Discards one pending or completed async presentation token. */
+  public static native boolean nDiscardIrisMetal4GraphPresentation(
+      long token);
+
+  /**
+   * Returns process-lifetime full-graph timing counters:
+   * {gpuSamples, lastGpuNs, totalGpuNs, maxGpuNs, feedbackErrors,
+   * cpuSamples, lastCpuNs, totalCpuNs, maxCpuNs,
+   * lastQueueNs, totalQueueNs, maxQueueNs}.
+   */
+  public static native long[] nGetIrisMetal4GraphTiming();
+
+  /** Cumulative native CPU phase timing for submitted MGF9 frames. */
+  public static native long[] nGetIrisMetal4GraphCpuProfile();
+
+  /**
+   * Starts a fresh exact-QA-only raw MTL4 commit-feedback sample window.
+   * Returns false when the bounded native sample buffer cannot be prepared.
+   */
+  public static native boolean nResetIrisMetal4GraphPerformanceSamples();
+
+  /**
+   * Drains raw full-graph GPU nanoseconds. Element zero is the number of
+   * samples dropped since the previous drain; remaining elements are samples.
+   */
+  public static native long[] nDrainIrisMetal4GraphPerformanceSamples();
+
+  /** Takes the RGBA8 output of the last successful graph on this thread. */
+  public static native byte[] nTakeIrisMetal4GraphFrameRgba8();
+
+  /**
+   * Binds the completed calling-thread cutover IOSurface to a GL rectangle.
+   * The caller must have glTexture bound to GL_TEXTURE_RECTANGLE on the
+   * current context before entering JNI. When deferIfBusy is true, native
+   * submission contention leaves the promoted surface pending for a retry.
+   */
+  public static native boolean nBindIrisMetal4FinalCutoverSurface(
+      int glTexture, int width, int height, boolean deferIfBusy);
+
+  /** Fences the GL use of one bound cutover surface without waiting. */
+  public static native boolean nFenceIrisMetal4FinalCutoverSurface(
+      int glTexture);
+
+  /** Drops a promoted surface that was not consumed by a GL binding. */
+  public static native boolean nDiscardIrisMetal4FinalCutoverSurface();
+
+  /** Releases calling-thread cutover surfaces after the GL texture is gone. */
+  public static native void nResetIrisMetal4FinalCutoverSurface();
+
+  /**
+   * Takes and clears the RGBA8 bytes produced by the last successful replay
+   * on this calling thread. Other output formats return an empty array.
+   */
+  public static native byte[] nTakeIrisMetal4ShadowReplayRgba8();
+
+  public static native void nResetIrisMetal4Pipelines();
 
   public static native void nDrawOITPass(long frameContext);
 

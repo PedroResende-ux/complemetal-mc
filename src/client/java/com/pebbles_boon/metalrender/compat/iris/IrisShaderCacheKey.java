@@ -16,7 +16,7 @@ import java.util.Objects;
  */
 public record IrisShaderCacheKey(String sha256) {
   private static final byte[] DOMAIN =
-      "metalrender.iris.final-glsl.v1".getBytes(StandardCharsets.US_ASCII);
+      "metalrender.iris.final-glsl.v2".getBytes(StandardCharsets.US_ASCII);
 
   public IrisShaderCacheKey {
     Objects.requireNonNull(sha256, "sha256");
@@ -42,6 +42,15 @@ public record IrisShaderCacheKey(String sha256) {
     for (IrisShaderStage stage : IrisShaderStage.values()) {
       putString(digest, stage.cacheName());
       putNullableString(digest, program.source(stage));
+    }
+    putBytes(digest, ByteBuffer.allocate(Integer.BYTES)
+        .putInt(program.vertexShaderInputs().size()).array());
+    for (IrisVertexLayoutCapture.ShaderInput input
+        : program.vertexShaderInputs()) {
+      putString(digest, input.linkedName());
+      putBytes(digest, ByteBuffer.allocate(Integer.BYTES)
+          .putInt(input.location()).array());
+      putString(digest, input.format().cacheName());
     }
     return new IrisShaderCacheKey(HexFormat.of().formatHex(digest.digest()));
   }

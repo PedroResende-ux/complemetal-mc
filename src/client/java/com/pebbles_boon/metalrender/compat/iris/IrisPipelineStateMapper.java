@@ -547,20 +547,58 @@ public final class IrisPipelineStateMapper {
 
   private static List<String> executionBlockers(ResolvedProgram program,
       IrisPipelineState state) {
-    ArrayList<String> blockers = new ArrayList<>(3);
+    ArrayList<String> blockers = new ArrayList<>(8);
     if (program.stages().contains(IrisShaderStage.TESS_CONTROL)) {
       blockers.add("tessellation-stage-not-supported");
     }
     if (program.stages().contains(IrisShaderStage.GEOMETRY)) {
       blockers.add("geometry-stage-not-supported");
     }
-    if (state.primitive().topology() == PrimitiveTopology.LINE_LOOP) {
-      blockers.add("line-loop-requires-index-expansion");
+    // LINE_LOOP and TRIANGLE_FAN are retained in the pipeline identity but
+    // their draw-time indices are expanded exactly before Metal replay.
+    if (state.primitive().topology() == PrimitiveTopology.PATCH) {
+      blockers.add("patch-topology-not-supported");
     }
-    if (state.primitive().topology() == PrimitiveTopology.TRIANGLE_FAN) {
-      blockers.add("triangle-fan-requires-index-expansion");
+    if (state.primitive().restartMode()
+        != IrisPipelineState.PrimitiveRestartMode.NONE) {
+      blockers.add("primitive-restart-requires-index-expansion");
+    }
+    if (state.raster().cullMode() == IrisPipelineState.CullMode.FRONT_AND_BACK) {
+      blockers.add("front-and-back-cull-not-supported");
+    }
+    if (state.raster().frontFillMode() != state.raster().backFillMode()) {
+      blockers.add("asymmetric-polygon-mode-not-supported");
+    }
+    if (state.raster().frontFillMode() == IrisPipelineState.FillMode.POINTS
+        || state.raster().backFillMode()
+        == IrisPipelineState.FillMode.POINTS) {
+      blockers.add("point-polygon-mode-not-supported");
+    }
+    if (state.sampleCoverageEnabled()) {
+      blockers.add("sample-coverage-not-supported");
+    }
+    if (state.sampleMask() != -1L) {
+      blockers.add("sample-mask-not-supported");
+    }
+    if (state.colorAttachments().stream().anyMatch(attachment ->
+        attachment.blend().enabled()
+            && (usesBlendConstant(attachment.blend().rgb())
+                || usesBlendConstant(attachment.blend().alpha())))) {
+      blockers.add("blend-constant-dynamic-state-unobserved");
     }
     return List.copyOf(blockers);
+  }
+
+  private static boolean usesBlendConstant(BlendEquation equation) {
+    return usesBlendConstant(equation.source())
+        || usesBlendConstant(equation.destination());
+  }
+
+  private static boolean usesBlendConstant(BlendFactor factor) {
+    return factor == BlendFactor.CONSTANT_COLOR
+        || factor == BlendFactor.ONE_MINUS_CONSTANT_COLOR
+        || factor == BlendFactor.CONSTANT_ALPHA
+        || factor == BlendFactor.ONE_MINUS_CONSTANT_ALPHA;
   }
 
   private static BlendOperation blendOperation(int gl) {

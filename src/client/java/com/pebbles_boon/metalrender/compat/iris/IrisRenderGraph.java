@@ -61,6 +61,11 @@ public record IrisRenderGraph(List<Resource> resources, List<Node> nodes,
         .count();
   }
 
+  public long clearCount() {
+    return nodes.stream().filter(node -> node.kind() == NodeKind.CLEAR)
+        .count();
+  }
+
   public long transferCount() {
     return nodes.stream().filter(node -> node.kind().transfer()).count();
   }
@@ -110,9 +115,16 @@ public record IrisRenderGraph(List<Resource> resources, List<Node> nodes,
   }
 
   public record Resource(int id, ResourceKind kind, String format,
-                         int sampleCount) {
+                         int sampleCount, int width, int height,
+                         int depthOrLayers, int mipLevels) {
+    public Resource(int id, ResourceKind kind, String format,
+        int sampleCount) {
+      this(id, kind, format, sampleCount, 0, 0, 0, 0);
+    }
+
     public Resource {
-      if (id < 0 || sampleCount < 0) {
+      if (id < 0 || sampleCount < 0 || width < 0 || height < 0
+          || depthOrLayers < 0 || mipLevels < 0) {
         throw new IllegalArgumentException("invalid graph resource");
       }
       Objects.requireNonNull(kind, "kind");
@@ -120,6 +132,11 @@ public record IrisRenderGraph(List<Resource> resources, List<Node> nodes,
       if (format.isBlank() || format.length() > 128) {
         throw new IllegalArgumentException("invalid graph resource format");
       }
+    }
+
+    public boolean allocationComplete() {
+      return kind == ResourceKind.TEXTURE && sampleCount > 0 && width > 0
+          && height > 0 && depthOrLayers > 0 && mipLevels > 0;
     }
   }
 
@@ -192,6 +209,7 @@ public record IrisRenderGraph(List<Resource> resources, List<Node> nodes,
   public enum NodeKind {
     DRAW(false),
     DISPATCH(false),
+    CLEAR(false),
     BARRIER(false),
     BLIT(true),
     COPY_TEXTURE(true),

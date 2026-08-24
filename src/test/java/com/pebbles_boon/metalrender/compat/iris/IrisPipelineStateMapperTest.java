@@ -112,7 +112,16 @@ final class IrisPipelineStateMapperTest {
             tracker.snapshotDraw(GL_TRIANGLE_STRIP), program, constants));
     IrisPipelineState state = mapped.state();
 
-    assertTrue(mapped.metalExecutionSupported());
+    assertFalse(mapped.metalExecutionSupported());
+    assertEquals(List.of(
+            "primitive-restart-requires-index-expansion",
+            "front-and-back-cull-not-supported",
+            "asymmetric-polygon-mode-not-supported",
+            "point-polygon-mode-not-supported",
+            "sample-coverage-not-supported",
+            "sample-mask-not-supported",
+            "blend-constant-dynamic-state-unobserved"),
+        mapped.executionBlockers());
     assertEquals(program.pass(), state.pass());
     assertEquals(program.descriptor().vertexBuffers(), state.vertexBuffers());
     assertEquals(program.descriptor().vertexAttributes(),
@@ -261,7 +270,7 @@ final class IrisPipelineStateMapperTest {
   }
 
   @Test
-  void mapsIndexExpansionTopologiesButBlocksMetalExecution() {
+  void mapsIndexExpansionTopologiesForMetalExecution() {
     ResolvedProgram program = graphicsProgram(List.of(
         IrisShaderStage.VERTEX, IrisShaderStage.FRAGMENT));
 
@@ -271,9 +280,8 @@ final class IrisPipelineStateMapperTest {
             List.of()));
     assertEquals(PrimitiveTopology.LINE_LOOP,
         lineLoop.state().primitive().topology());
-    assertFalse(lineLoop.metalExecutionSupported());
-    assertEquals(List.of("line-loop-requires-index-expansion"),
-        lineLoop.executionBlockers());
+    assertTrue(lineLoop.metalExecutionSupported());
+    assertEquals(List.of(), lineLoop.executionBlockers());
 
     Complete triangleFan = assertInstanceOf(Complete.class,
         IrisPipelineStateMapper.map(
@@ -281,9 +289,48 @@ final class IrisPipelineStateMapperTest {
             program, List.of()));
     assertEquals(PrimitiveTopology.TRIANGLE_FAN,
         triangleFan.state().primitive().topology());
-    assertFalse(triangleFan.metalExecutionSupported());
-    assertEquals(List.of("triangle-fan-requires-index-expansion"),
-        triangleFan.executionBlockers());
+    assertTrue(triangleFan.metalExecutionSupported());
+    assertEquals(List.of(), triangleFan.executionBlockers());
+  }
+
+  @Test
+  void blocksRasterStateThatMetalCannotRepresentExactly() {
+    ResolvedProgram program = graphicsProgram(List.of(
+        IrisShaderStage.VERTEX, IrisShaderStage.FRAGMENT));
+
+    IrisGlStateTracker asymmetric = completeGraphicsTracker(1);
+    asymmetric.polygonMode(GL_FRONT, GL_LINE);
+    Complete asymmetricMapped = assertInstanceOf(Complete.class,
+        IrisPipelineStateMapper.map(
+            asymmetric.snapshotDraw(GL_TRIANGLES), program, List.of()));
+    assertEquals(List.of("asymmetric-polygon-mode-not-supported"),
+        asymmetricMapped.executionBlockers());
+
+    IrisGlStateTracker point = completeGraphicsTracker(1);
+    point.polygonMode(GL_FRONT_AND_BACK, GL_POINT);
+    Complete pointMapped = assertInstanceOf(Complete.class,
+        IrisPipelineStateMapper.map(
+            point.snapshotDraw(GL_TRIANGLES), program, List.of()));
+    assertEquals(List.of("point-polygon-mode-not-supported"),
+        pointMapped.executionBlockers());
+
+    IrisGlStateTracker coverage = completeGraphicsTracker(4);
+    coverage.capability(IrisGlStateTracker.GL_SAMPLE_COVERAGE, true);
+    coverage.sampleCoverage(0.75F, false);
+    Complete coverageMapped = assertInstanceOf(Complete.class,
+        IrisPipelineStateMapper.map(
+            coverage.snapshotDraw(GL_TRIANGLES), program, List.of()));
+    assertEquals(List.of("sample-coverage-not-supported"),
+        coverageMapped.executionBlockers());
+
+    IrisGlStateTracker sampleMask = completeGraphicsTracker(4);
+    sampleMask.capability(IrisGlStateTracker.GL_SAMPLE_MASK, true);
+    sampleMask.sampleMask(0, 0x7);
+    Complete sampleMaskMapped = assertInstanceOf(Complete.class,
+        IrisPipelineStateMapper.map(
+            sampleMask.snapshotDraw(GL_TRIANGLES), program, List.of()));
+    assertEquals(List.of("sample-mask-not-supported"),
+        sampleMaskMapped.executionBlockers());
   }
 
   @Test

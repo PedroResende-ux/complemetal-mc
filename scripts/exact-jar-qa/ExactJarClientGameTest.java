@@ -1,7 +1,13 @@
 package com.pebbles_boon.metalrender.exactjarqa;
 
+import com.mojang.blaze3d.platform.Window;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
+import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraph;
+import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture;
+import com.pebbles_boon.metalrender.compat.iris.IrisShaderCapture;
+import com.pebbles_boon.metalrender.compat.iris.IrisMetalFeatureFlags;
+import com.pebbles_boon.metalrender.compat.iris.IrisStage9PerformanceSampler;
 import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import com.pebbles_boon.metalrender.render.MetalRenderHookState;
@@ -14,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.Locale;
@@ -25,6 +32,7 @@ import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContex
 import net.fabricmc.loader.api.FabricLoader;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.api.v0.IrisApi;
+import org.lwjgl.glfw.GLFW;
 
 /**
  * Black-box release smoke test. This class is compiled into a standalone
@@ -37,6 +45,11 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
   private static final int SHADER_TIMEOUT_TICKS = 3_600;
   private static final long EXPECTED_COMPLEMENTARY_PROGRAMS = 231;
   private static final long EXPECTED_COMPLEMENTARY_STAGES = 462;
+  private static final int MINIMUM_PERFORMANCE_SAMPLES = 600;
+  private static final long PERFORMANCE_STUTTER_NANOS = 100_000_000L;
+  private static final int LIFECYCLE_PRESENTATIONS_PER_TRANSITION = 20;
+  private static final int MAXIMUM_LIFECYCLE_INVALIDATIONS = 16;
+  private static volatile long lastReadinessDiagnosticNanos;
 
   @Override
   public void runTest(ClientGameTestContext context) {
@@ -56,13 +69,70 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         requiredProperty("metalrender.exactJar.backend");
     require(cacheExpectation.equals("cold") || cacheExpectation.equals("warm"),
         "invalid cache expectation: " + cacheExpectation);
-    require(Boolean.getBoolean(
+    require(IrisMetalFeatureFlags.enabled(
             "metalrender.experimental.irisMetalLibraryValidation"),
         "exact-JAR QA requires Iris MSL library validation opt-in");
+    require(IrisMetalFeatureFlags.enabled(
+            "metalrender.experimental.irisMetalPipelineCompilation"),
+        "exact-JAR QA requires Iris Metal pipeline compilation opt-in");
+    require(IrisMetalFeatureFlags.enabled(
+            "metalrender.experimental.irisMetalShadowReplay"),
+        "exact-JAR QA requires Iris Metal shadow replay opt-in");
+    require(IrisMetalFeatureFlags.enabled(
+            "metalrender.experimental.irisMetalVisualParity"),
+        "exact-JAR QA requires Iris/Metal visual parity opt-in");
+    boolean diagnosticDisableFinalCutover = Boolean.getBoolean(
+        "metalrender.exactJar.diagnosticDisableFinalCutover");
+    require(IrisMetalFeatureFlags.enabled(
+            "metalrender.experimental.irisMetalFinalCutover")
+            || diagnosticDisableFinalCutover,
+        "exact-JAR QA requires Iris FINAL cutover opt-in");
+    if (diagnosticDisableFinalCutover) {
+      System.out.println(
+          "[MetalRender exact-JAR diagnostic] FINAL cutover disabled; "
+              + "this run cannot qualify as release acceptance");
+    }
+    require(IrisMetalFeatureFlags.enabled(
+            "metalrender.experimental.irisMetalGraphResources"),
+        "exact-JAR QA requires Iris Metal graph resource opt-in");
+    require(IrisMetalFeatureFlags.enabled(
+            "metalrender.experimental.irisMetalGraphExecution"),
+        "exact-JAR QA requires full Iris Metal graph execution opt-in");
     require(backendExpectation.equals("metal4")
             || backendExpectation.equals("metal3"),
         "invalid backend expectation: " + backendExpectation);
     boolean expectMetal4 = backendExpectation.equals("metal4");
+    boolean requireGraphOwnership = Boolean.getBoolean(
+        "metalrender.exactJar.requireGraphOwnership");
+    require(!requireGraphOwnership || expectMetal4,
+        "full graph ownership requires the Metal 4 QA profile");
+    require(IrisMetalFeatureFlags.enabled(
+            "metalrender.experimental.irisMetalGraphOwnership")
+            == requireGraphOwnership,
+        "graph ownership runtime opt-in does not match QA expectation");
+    String performanceSide = System.getProperty(
+        IrisStage9PerformanceSampler.SIDE_PROPERTY, "").trim()
+        .toLowerCase(Locale.ROOT);
+    int performanceSamples = integerProperty(
+        "metalrender.exactJar.performanceSamples", 0);
+    require(performanceSide.isEmpty() || performanceSide.equals("opengl")
+            || performanceSide.equals("metal"),
+        "invalid Stage 9 performance side: " + performanceSide);
+    require(performanceSide.isEmpty()
+            ? performanceSamples == 0
+            : performanceSamples >= MINIMUM_PERFORMANCE_SAMPLES
+                && performanceSamples
+                    <= IrisStage9PerformanceSampler.MAX_SAMPLES,
+        "invalid Stage 9 performance sample count: " + performanceSamples);
+    require(IrisStage9PerformanceSampler.enabled()
+            == !performanceSide.isEmpty(),
+        "Stage 9 sampler activation does not match the exact-JAR profile");
+    require(!performanceSide.equals("metal")
+            || expectMetal4 && requireGraphOwnership,
+        "Metal performance capture requires full Metal 4 graph ownership");
+    require(!performanceSide.equals("opengl")
+            || !expectMetal4 && !requireGraphOwnership,
+        "OpenGL performance capture requires the Metal 3 fallback profile");
     require(expectedSha.equals(sha256(exactJar)),
         "loaded release JAR SHA-256 differs from the prepared artifact");
     require(System.getProperty("java.version", "").startsWith("25."),
@@ -134,6 +204,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     Path shadersOn;
     Path shadersOff;
     Path shadersReenabled;
+    Path shadersCutover;
     long frames;
     long framesWithShadersOff;
     long metalPresentationsWithShadersOff;
@@ -141,6 +212,10 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
              context.worldBuilder().setUseConsistentSettings(true).create()) {
       singleplayer.getServer().runCommand("time set noon");
       singleplayer.getServer().runCommand("weather clear");
+      singleplayer.getServer().runCommand(
+          "gamerule doDaylightCycle false");
+      singleplayer.getServer().runCommand(
+          "gamerule doWeatherCycle false");
 
       context.waitFor(client -> client.level != null
           && client.player != null
@@ -248,6 +323,11 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           + ", failed=" + earlyPipelineStatus.pipelineStatesFailed()
           + ", incomplete="
           + earlyPipelineStatus.pipelineIncompleteVariants()
+          + ", captureFailures=" + earlyPipelineStatus.captureFailures()
+          + ", captureFailureReasons="
+          + IrisShaderCapture.captureFailureReasonSummary()
+          + ", translationFailureReasons="
+          + earlyPipelineStatus.translationFailureReasonSummary()
           + ", lastFailure="
           + earlyPipelineStatus.pipelineStateLastFailure());
       IrisTranslationCoordinator.RenderGraphStatus earlyGraphStatus =
@@ -261,27 +341,21 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           + earlyGraphStatus.graphsAttempted() + ", unsupported="
           + earlyGraphStatus.graphsUnsupported() + ", failed="
           + earlyGraphStatus.graphsFailed() + ", barriers="
-          + earlyGraphStatus.barriersRepresented() + ", transfers="
+          + earlyGraphStatus.barriersRepresented() + ", clears="
+          + earlyGraphStatus.clearsRepresented() + ", transfers="
           + earlyGraphStatus.transfersRepresented() + ", pingPong="
           + earlyGraphStatus.pingPongResourcesRepresented() + ", phases="
           + earlyGraphStatus.phaseSummary() + ", lastFailure="
           + earlyGraphStatus.lastFailure());
-      context.waitFor(client -> {
-        IrisTranslationCoordinator.Status status =
-            IrisTranslationCoordinator.status();
-        return status.running() && status.queued() == 0
-            && status.libraryValidationEnabled()
-            && status.libraryValidationReady()
-            && status.libraryValidationComplete()
-            && status.compiledArtifactSetComplete()
-            && status.libraryStagesPending() == 0
-            && status.libraryStagesInFlight() == 0
-            && IrisTranslationCoordinator.renderGraphStatus().complete();
-      }, SHADER_TIMEOUT_TICKS);
+      context.waitFor(client -> acceptanceSettled(
+          expectMetal4, requireGraphOwnership),
+          SHADER_TIMEOUT_TICKS);
       context.waitTicks(100);
-      IrisTranslationCoordinator.Status translationStatus =
+      IrisTranslationCoordinator.AcceptanceStatus acceptanceStatus =
           context.computeOnClient(
-              client -> IrisTranslationCoordinator.status());
+              client -> IrisTranslationCoordinator.acceptanceStatus());
+      IrisTranslationCoordinator.Status translationStatus =
+          acceptanceStatus.translation();
       require(translationStatus.running(),
           "Iris final-GLSL translation worker is not running");
       require(translationStatus.attempted() > 0
@@ -322,9 +396,85 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       requireMslLibraryValidation(translationStatus, cacheExpectation);
       requireResourceReflection(translationStatus);
       IrisTranslationCoordinator.RenderGraphStatus renderGraphStatus =
-          context.computeOnClient(
-              client -> IrisTranslationCoordinator.renderGraphStatus());
+          acceptanceStatus.renderGraph();
       requireRenderGraph(renderGraphStatus);
+      IrisTranslationCoordinator.MetalGraphResourceStatus graphResourceStatus =
+          acceptanceStatus.graphResources();
+      requireMetalGraphResources(graphResourceStatus, renderGraphStatus,
+          expectMetal4);
+      IrisTranslationCoordinator.FullGraphStatus fullGraphStatus =
+          acceptanceStatus.fullGraph();
+      requireFullGraph(fullGraphStatus, expectMetal4,
+          requireGraphOwnership);
+      IrisTranslationCoordinator.ShadowPlanStatus shadowPlanStatus =
+          acceptanceStatus.shadowPlan();
+      requireShadowPlanCapture(shadowPlanStatus, renderGraphStatus);
+      IrisTranslationCoordinator.MetalPipelineCacheStatus
+          metalPipelineStatus = acceptanceStatus.metalPipelines();
+      requireMetalPipelineCache(metalPipelineStatus, expectMetal4,
+          cacheExpectation);
+      IrisTranslationCoordinator.ShadowReplayStatus shadowReplayStatus =
+          acceptanceStatus.shadowReplay();
+      requireShadowReplay(shadowReplayStatus, metalPipelineStatus,
+          expectMetal4, requireGraphOwnership);
+      IrisTranslationCoordinator.VisualParityStatus visualParityStatus =
+          acceptanceStatus.visualParity();
+      requireVisualParity(visualParityStatus, expectMetal4);
+      LifecycleEvidence lifecycleEvidence = LifecycleEvidence.notRequired();
+      if (expectMetal4) {
+        if (requireGraphOwnership) {
+          context.waitFor(client -> {
+            IrisTranslationCoordinator.FullGraphStatus ownership =
+                IrisTranslationCoordinator.fullGraphStatus();
+            return ownership.performanceEligible()
+                && ownership.ownershipFramesPresented() >= 30;
+          }, SHADER_TIMEOUT_TICKS);
+          lifecycleEvidence = verifyStage9WindowLifecycle(context);
+          writeLifecycleEvidence(lifecycleEvidence);
+        } else {
+          context.waitFor(client -> {
+            IrisTranslationCoordinator.CutoverStatus cutover =
+                IrisTranslationCoordinator.cutoverStatus();
+            return cutover.activeAndHealthy()
+                && cutover.presentations() >= 30;
+          }, SHADER_TIMEOUT_TICKS);
+        }
+        context.waitTicks(20);
+        long cutoverScreenshotCapture = screenshotCaptureCount(context);
+        shadersCutover = context.takeScreenshot(
+            "metalrender-exact-jar-" + cacheExpectation
+                + (requireGraphOwnership
+                    ? "-shaders-metal-full-graph"
+                    : "-shaders-metal-final-cutover"));
+        requireScreenshot(shadersCutover);
+        requireScreenshotFrame(context, cutoverScreenshotCapture, false,
+            "Metal FINAL cutover screenshot");
+      } else {
+        shadersCutover = shadersReenabled;
+      }
+      IrisTranslationCoordinator.CutoverStatus cutoverStatus =
+          context.computeOnClient(
+              client -> IrisTranslationCoordinator.cutoverStatus());
+      requireFinalCutover(cutoverStatus, expectMetal4,
+          requireGraphOwnership);
+      CutoverVisualMetrics cutoverVisual = validateCutoverScreenshot(
+          shadersReenabled, shadersCutover, expectMetal4);
+      if (!performanceSide.isEmpty()) {
+        PerformanceEvidence performanceEvidence = captureStage9Performance(
+            context, performanceSide, performanceSamples, expectedSha,
+            expectedShaderPack);
+        writePerformanceEvidence(performanceEvidence);
+      }
+      if (requireGraphOwnership) {
+        fullGraphStatus = context.computeOnClient(
+            client -> IrisTranslationCoordinator.fullGraphStatus());
+        requireFullGraph(fullGraphStatus, true, true);
+        cutoverStatus = context.computeOnClient(
+            client -> IrisTranslationCoordinator.cutoverStatus());
+        requireFinalCutover(cutoverStatus, true, true);
+        require(lifecycleEvidence.status().equals("PASS"),
+            "Stage 9 lifecycle evidence was not completed");
+      }
       System.out.println("[MetalRender exact-JAR] programs="
           + translationStatus.attempted() + ", stages="
           + translationStatus.libraryStagesAttempted()
@@ -358,6 +508,36 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           + ", graphNodes=" + renderGraphStatus.nodesRepresented()
           + ", graphEdges=" + renderGraphStatus.edgesRepresented()
           + ", graphPhases=" + renderGraphStatus.phaseSummary()
+          + ", graphResources=" + graphResourceStatus.plansComplete() + "/"
+          + graphResourceStatus.plansObserved()
+          + ", fullGraph=" + fullGraphStatus.framesSucceeded() + "/"
+          + fullGraphStatus.framesAttempted() + ", fullGraphDraws="
+          + fullGraphStatus.draws() + ", fullGraphOwnership="
+          + fullGraphStatus.ownershipMode()
+          + ", graphNativeTextures="
+          + graphResourceStatus.nativeTextureCount()
+          + ", graphNativeBytes=" + graphResourceStatus.nativeTextureBytes()
+          + ", shadowPlans=" + shadowPlanStatus.structurallyComplete()
+          + "/" + shadowPlanStatus.plansObserved()
+          + ", shadowBlocked=" + shadowPlanStatus.blocked()
+          + ", shadowSteps=" + shadowPlanStatus.executionSteps()
+          + ", metalPipelines="
+          + metalPipelineStatus.pipelineIdentityCount() + "/"
+          + metalPipelineStatus.candidatesObserved()
+          + ", metalPipelineCompiled=" + metalPipelineStatus.compiled()
+          + ", metalPipelineCacheHits=" + metalPipelineStatus.cacheHits()
+          + ", shadowReplay=" + shadowReplayStatus.drawsSucceeded() + "/"
+          + shadowReplayStatus.drawsAttempted()
+          + ", shadowReplayBlocked=" + shadowReplayStatus.drawsBlocked()
+          + ", shadowReplayPhases="
+          + shadowReplayStatus.successfulPhaseSummary()
+          + ", visualParity=" + visualParityStatus.framesPassed() + "/"
+          + visualParityStatus.framesCompared()
+          + ", visualParityValidated="
+          + visualParityStatus.validated()
+          + ", cutover=" + cutoverStatus.presentations() + "/"
+          + cutoverStatus.openGlDrawsSuppressed()
+          + ", cutoverBridge=" + cutoverStatus.bridge()
           + ", pipelineLastFailure="
           + translationStatus.pipelineStateLastFailure());
       requirePipelineStateCapture(translationStatus);
@@ -373,7 +553,12 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       writeEvidence(exactJar, expectedSha, frames, framesWithShadersOff,
           metalPresentationsWithShadersOff, shadersOn, shadersOff,
           shadersReenabled, visualMetrics, translationStatus,
-          renderGraphStatus, cacheExpectation, backendExpectation,
+          renderGraphStatus, graphResourceStatus, shadowPlanStatus,
+          fullGraphStatus, metalPipelineStatus,
+          shadowReplayStatus, visualParityStatus, cutoverStatus,
+          shadersCutover, cutoverVisual,
+          cacheExpectation,
+          backendExpectation,
           nativeFaultBaseline,
           nativeFaultEnd, nativeFaultDelta);
     }
@@ -382,7 +567,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
   private static void visitDimension(TestSingleplayerContext singleplayer,
       ClientGameTestContext context, String dimension, int y) {
     singleplayer.getServer().runCommand("execute as @a in " + dimension
-        + " run tp @s 0 " + y + " 0");
+        + " run tp @s 0 " + y + " 0 0 20");
     context.waitFor(client -> client.level != null
         && client.level.dimension().identifier().toString().equals(dimension),
         WORLD_TIMEOUT_TICKS);
@@ -500,10 +685,482 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             + status.graphsUnsupported());
     require(status.graphsFailed() == 0,
         "Iris render graph processing failed: " + status.graphsFailed());
+    require(status.clearsRepresented() > 0,
+        "Iris render graph captured no executable clear commands");
     require(status.graphIdentityCount() > 0,
         "Iris render graph produced no content identity");
     require(status.graphSetSha256().matches("[0-9a-f]{64}"),
         "Iris render graph digest is invalid");
+  }
+
+  private static void requireMetalGraphResources(
+      IrisTranslationCoordinator.MetalGraphResourceStatus status,
+      IrisTranslationCoordinator.RenderGraphStatus graph,
+      boolean expectMetal4) {
+    require(status.enabled(), "Iris Metal graph resources are not enabled");
+    require(status.plansObserved() == graph.graphsSucceeded(),
+        "Metal attachment plans do not cover every graph: "
+            + status.plansObserved() + "/" + graph.graphsSucceeded());
+    require(status.plansComplete() == status.plansObserved()
+            && status.plansBlocked() == 0,
+        "Metal attachment plans are incomplete: " + status.blockerSummary());
+    require(status.allocationsRequested() > 0,
+        "Metal attachment plans requested no writable textures");
+    require(status.blockerCount() == 0 && status.blockerSetComplete(),
+        "Metal attachment blocker set is not empty/complete");
+    if (expectMetal4) {
+      require(status.complete(),
+          "Metal 4 graph attachments did not become resident: "
+              + status.blockerSummary());
+    } else {
+      require(status.safeUnsupportedFallback(),
+          "Metal 3 graph attachment path did not remain a safe fallback");
+    }
+  }
+
+  private static void requireFullGraph(
+      IrisTranslationCoordinator.FullGraphStatus status,
+      boolean expectMetal4, boolean requireGraphOwnership) {
+    require(status.enabled(), "full Iris Metal graph execution is disabled");
+    if (expectMetal4 && requireGraphOwnership) {
+      require(status.framesPending() <= 2,
+          "full Iris Metal graph production queue exceeded its bound: "
+              + status.framesPending());
+    } else {
+      require(!status.captureActive() && status.framesPending() == 0,
+          "full Iris Metal graph queue did not drain");
+    }
+    require(status.blockerSetComplete(),
+        "full Iris Metal graph blocker set exceeded its bound");
+    if (!expectMetal4) {
+      require(!status.ownershipOptedIn() && !status.performanceEligible(),
+          "forced Metal 3 unexpectedly enabled graph ownership");
+      require(status.ownershipMode().equals("OPENGL_VISIBLE_VALIDATION"),
+          "unexpected Metal 3 graph ownership mode: "
+              + status.ownershipMode());
+      require(!status.runtimeAvailable() && !status.validated(),
+          "forced Metal 3 unexpectedly validated the MTL4 graph");
+      require(status.captureRequests() == 0 && status.framesObserved() == 0
+              && status.framesPlanned() == 0
+              && status.framesAttempted() == 0
+              && status.framesSucceeded() == 0
+              && status.framesUnsupported() == 0
+              && status.framesFailed() == 0
+              && status.blockerCount() == 0,
+          "forced Metal 3 did not keep the full graph draw-free");
+      return;
+    }
+    require(status.runtimeAvailable(),
+        "Metal 4 full graph runtime is unavailable");
+    require(status.validated(),
+        "full Iris Metal graph did not validate: "
+            + status.blockerSummary() + " last=" + status.lastFailure());
+    require(status.framesSucceeded() >= status.minimumSuccessFrames()
+            && status.framesAttempted() == status.framesSucceeded()
+            && status.framesUnsupported() == 0
+            && status.framesFailed() == 0,
+        "full graph frame accounting is not clean");
+    require(status.operations() > 0 && status.draws() > 0
+            && status.clears() > 0 && status.transfers() > 0
+            && status.barriers() > 0,
+        "full graph did not execute every operation category");
+    require(status.initializedResources() > 0
+            && !status.lastOutputHashUnsigned().equals("0")
+            && status.blockerCount() == 0,
+        "full graph residency/output evidence is incomplete");
+    if (!requireGraphOwnership) {
+      require(!status.ownershipOptedIn() && !status.performanceEligible(),
+          "validation-only full graph must not claim ownership");
+      require(status.ownershipMode().equals("OPENGL_VISIBLE_VALIDATION"),
+          "unexpected validation graph ownership mode: "
+              + status.ownershipMode());
+      require(status.ownershipSubmissions() == 0
+              && status.ownershipReady() == 0
+              && status.ownershipFramesArmed() == 0
+              && status.ownershipFramesPresented() == 0
+              && status.ownershipFramesReused() == 0
+              && status.ownershipFramesInvalidated() == 0
+              && status.ownershipCommandsSuppressed() == 0
+              && status.ownershipFailures() == 0
+              && status.ownershipLastFailure().isEmpty(),
+          "validation-only graph retained ownership telemetry");
+      return;
+    }
+    require(status.ownershipOptedIn() && status.performanceEligible(),
+        "full Metal graph ownership is not performance eligible: "
+            + status.ownershipLastFailure());
+    require(status.ownershipMode().equals("METAL_FULL_GRAPH_OWNERSHIP"),
+        "unexpected Stage 9 ownership mode: " + status.ownershipMode());
+    require(status.ownershipSubmissions() > 0
+            && status.ownershipReady() > 0
+            && status.ownershipFramesArmed() >= 30
+            && status.ownershipFramesPresented() >= 30
+            && status.ownershipCommandsSuppressed() > 0,
+        "Stage 9 ownership telemetry is incomplete");
+    require(status.framesPlanned() == status.framesAttempted()
+            + status.ownershipSubmissions()
+            + status.ownershipFramesInvalidated() + status.framesPending(),
+        "Stage 9 validation/presentation frame accounting is inconsistent");
+    require(status.ownershipFramesReused()
+            <= status.ownershipFramesPresented(),
+        "Stage 9 surface reuse exceeds presented frames");
+    require(status.ownershipFailures() == 0
+            && status.ownershipLastFailure().isEmpty(),
+        "Stage 9 ownership recorded a failure: "
+            + status.ownershipLastFailure());
+  }
+
+  private static void requireMetalPipelineCache(
+      IrisTranslationCoordinator.MetalPipelineCacheStatus status,
+      boolean expectMetal4, String cacheExpectation) {
+    require(status.enabled(), "Iris Metal pipeline cache is not enabled");
+    require(status.executionBlockedCandidates() == 0,
+        "Iris pipeline candidates still have Metal execution blockers: "
+            + status.executionBlockedCandidates());
+    require(status.pending() == 0,
+        "Iris Metal pipeline queue did not drain: " + status.pending());
+    if (!expectMetal4) {
+      require(status.safeUnsupportedFallback(),
+          "forced Metal 3 did not retain the safe pipeline fallback: "
+              + status.lastFailure());
+      return;
+    }
+    require(status.complete(),
+        "Iris MTL4 pipeline cache did not complete: "
+            + status.lastFailure());
+    require(status.pipelineSetSha256().matches("[0-9a-f]{64}"),
+        "Iris MTL4 pipeline digest is invalid");
+    require(status.failureReasonCount() == 0,
+        "Iris MTL4 pipeline failures were retained");
+    require(status.nativeStatus().staleArchivesRecovered() >= 0,
+        "Iris MTL4 stale recovery counter is invalid");
+    if (cacheExpectation.equals("cold")) {
+      require(status.compiled() == status.candidatesObserved()
+              && status.cacheHits() == 0
+              && status.newVariantsCompiled() == status.compiled()
+              && status.knownArchiveMisses() == 0,
+          "cold MTL4 run did not compile every pipeline candidate");
+    } else {
+      require(status.knownArchiveMisses() == 0
+              && status.compiled() == status.newVariantsCompiled()
+              && status.cacheHits() + status.newVariantsCompiled()
+                  == status.candidatesObserved(),
+          "warm MTL4 run missed a previously known archived pipeline");
+    }
+  }
+
+  private static boolean shadowReplaySettled(boolean expectMetal4) {
+    IrisTranslationCoordinator.ShadowReplayStatus status =
+        IrisTranslationCoordinator.shadowReplayStatus();
+    IrisTranslationCoordinator.VisualParityStatus parity =
+        IrisTranslationCoordinator.visualParityStatus();
+    if (!status.enabled() || status.drawsObserved() <= 0
+        || status.drawsAttempted() != status.drawsSucceeded()
+            + status.drawsUnsupported() + status.drawsFailed()) {
+      return false;
+    }
+    return expectMetal4 ? status.drawsSucceeded() > 0
+        && status.drawsUnsupported() == 0 && status.drawsFailed() == 0
+        && requiredReplayPhaseCoverage(status) && parity.validated()
+        : status.drawsBlocked() > 0 && status.drawsAttempted() == 0
+            && parity.samplesHandled()
+                >= IrisRenderGraphCapture.MAX_REPLAY_SAMPLES_PER_PHASE;
+  }
+
+  private static boolean requiredReplayPhaseCoverage(
+      IrisTranslationCoordinator.ShadowReplayStatus status) {
+    String phases = status.successfulPhaseSummary();
+    return status.successfulPhaseCount() >= 4
+        && phases.contains(IrisRenderGraph.Phase.SHADOW.name())
+        && phases.contains(IrisRenderGraph.Phase.GEOMETRY.name())
+        && phases.contains(IrisRenderGraph.Phase.COMPOSITE.name())
+        && phases.contains(IrisRenderGraph.Phase.FINAL.name());
+  }
+
+  private static boolean acceptanceSettled(
+      boolean expectMetal4, boolean requireGraphOwnership) {
+    IrisTranslationCoordinator.Status translation =
+        IrisTranslationCoordinator.status();
+    IrisTranslationCoordinator.RenderGraphStatus graph =
+        IrisTranslationCoordinator.renderGraphStatus();
+    IrisTranslationCoordinator.MetalPipelineCacheStatus pipelines =
+        IrisTranslationCoordinator.metalPipelineCacheStatus();
+    IrisTranslationCoordinator.ShadowReplayStatus replay =
+        IrisTranslationCoordinator.shadowReplayStatus();
+    IrisTranslationCoordinator.FullGraphStatus fullGraph =
+        IrisTranslationCoordinator.fullGraphStatus();
+    boolean translationReady = translation.running()
+        && translation.queued() == 0
+        && translation.libraryValidationEnabled()
+        && translation.libraryValidationReady()
+        && translation.libraryValidationComplete()
+        && translation.compiledArtifactSetComplete()
+        && translation.libraryStagesPending() == 0
+        && translation.libraryStagesInFlight() == 0;
+    boolean graphReady = graph.complete();
+    boolean replayReady = shadowReplaySettled(expectMetal4);
+    boolean pipelinesReady = expectMetal4 ? pipelines.complete()
+        : pipelines.safeUnsupportedFallback();
+    boolean fullGraphReady = expectMetal4
+        ? requireGraphOwnership
+            ? fullGraph.validated() && fullGraph.performanceEligible()
+                && fullGraph.ownershipFramesPresented() >= 30
+                && fullGraph.ownershipFailures() == 0
+            : fullGraph.validated()
+        : fullGraph.enabled() && !fullGraph.runtimeAvailable()
+            && fullGraph.framesAttempted() == 0;
+    if (!(translationReady && graphReady && replayReady && pipelinesReady
+        && fullGraphReady)) {
+      long now = System.nanoTime();
+      if (now - lastReadinessDiagnosticNanos >= 5_000_000_000L) {
+        lastReadinessDiagnosticNanos = now;
+        System.out.println("[MetalRender exact-JAR readiness] translation="
+            + translationReady + " queue=" + translation.queued()
+            + " programs=" + translation.attempted() + "/"
+            + translation.libraryProgramsSucceeded()
+            + " stages=" + translation.libraryStagesSucceeded() + "/"
+            + translation.libraryStagesAttempted() + " pending="
+            + translation.libraryStagesPending() + " inFlight="
+            + translation.libraryStagesInFlight() + " live="
+            + translation.libraryLiveLibraries() + " artifactSet="
+            + translation.compiledArtifactSetComplete()
+            + " graph=" + graphReady + " frames="
+            + graph.framesCompleted() + "/" + graph.framesStarted()
+            + " rejected=" + graph.framesRejected() + " pending="
+            + graph.framesPending() + " frozen=" + graph.captureFrozen()
+            + " graphs=" + graph.graphsSucceeded() + "/"
+            + graph.graphsAttempted() + " unsupported="
+            + graph.graphsUnsupported() + " failed=" + graph.graphsFailed()
+            + " nodes=" + graph.nodesRepresented() + " edges="
+            + graph.edgesRepresented() + " barriers="
+            + graph.barriersRepresented() + " clears="
+            + graph.clearsRepresented() + " transfers="
+            + graph.transfersRepresented() + " pingPong="
+            + graph.pingPongResourcesRepresented() + " phases="
+            + graph.phaseSummary() + " graphFailure=" + graph.lastFailure()
+            + " pipelines=" + pipelinesReady + " candidates="
+            + pipelines.candidatesObserved() + " compiled="
+            + pipelines.compiled() + " hits=" + pipelines.cacheHits()
+            + " readiness=" + pipelines.readiness() + " backend="
+            + NativeBridge.nGetBackendMode() + " nativeAttempts="
+            + pipelines.nativeStatus().attempts()
+            + " pending=" + pipelines.pending() + " failed="
+            + pipelines.failed() + " pipelineFailure="
+            + pipelines.lastFailure() + " replay=" + replayReady
+            + " observed=" + replay.drawsObserved() + " ready="
+            + replay.drawsReady() + " attempted="
+            + replay.drawsAttempted() + " succeeded="
+            + replay.drawsSucceeded() + " unsupported="
+            + replay.drawsUnsupported() + " failed="
+            + replay.drawsFailed() + " blocked=" + replay.drawsBlocked()
+            + " phases=" + replay.successfulPhaseSummary()
+            + " replayBlockers=" + replay.blockerSummary());
+        System.out.println("[MetalRender exact-JAR full graph readiness] ready="
+            + fullGraphReady + " active=" + fullGraph.captureActive()
+            + " requests=" + fullGraph.captureRequests() + " observed="
+            + fullGraph.framesObserved() + " planned="
+            + fullGraph.framesPlanned() + " pending="
+            + fullGraph.framesPending() + " attempted="
+            + fullGraph.framesAttempted() + " succeeded="
+            + fullGraph.framesSucceeded() + " unsupported="
+            + fullGraph.framesUnsupported() + " failed="
+            + fullGraph.framesFailed() + " draws=" + fullGraph.draws()
+            + " operations=" + fullGraph.operations() + " mode="
+            + fullGraph.ownershipMode() + " submissions="
+            + fullGraph.ownershipSubmissions() + " ready="
+            + fullGraph.ownershipReady() + " armed="
+            + fullGraph.ownershipFramesArmed() + " presented="
+            + fullGraph.ownershipFramesPresented() + " reused="
+            + fullGraph.ownershipFramesReused() + " suppressed="
+            + fullGraph.ownershipCommandsSuppressed() + " ownershipFailed="
+            + fullGraph.ownershipFailures() + " ownershipLast="
+            + fullGraph.ownershipLastFailure() + " blockers="
+            + fullGraph.blockerSummary() + " last="
+            + fullGraph.lastFailure());
+      }
+    }
+    return translationReady && graphReady && replayReady && pipelinesReady
+        && fullGraphReady;
+  }
+
+  private static void requireShadowReplay(
+      IrisTranslationCoordinator.ShadowReplayStatus status,
+      IrisTranslationCoordinator.MetalPipelineCacheStatus pipelines,
+      boolean expectMetal4, boolean requireGraphOwnership) {
+    require(status.enabled(), "Iris native shadow replay is not enabled");
+    require(status.drawsObserved() > 0,
+        "Iris native shadow replay observed no sampled draws");
+    require(status.drawsAttempted() == status.drawsSucceeded()
+            + status.drawsUnsupported() + status.drawsFailed(),
+        "Iris native shadow replay counters do not account for attempts");
+    require(status.candidateCount() == status.drawsAttempted(),
+        "Iris native shadow replay candidate count is inconsistent");
+    require(status.candidateSetComplete(),
+        "Iris native shadow replay exceeded its candidate bound");
+    require(status.blockerSetComplete(),
+        "Iris native shadow replay blocker diagnostics were truncated");
+    require(status.blockerSetSha256().matches("[0-9a-f]{64}"),
+        "Iris native shadow replay blocker digest is invalid");
+    require((status.blockerCount() == 0)
+            == status.blockerSummary().isEmpty(),
+        "Iris native shadow replay blocker count and summary disagree");
+    require(NativeBridge.nIsMetal4DrawPathActive()
+            == requireGraphOwnership,
+        requireGraphOwnership
+            ? "Stage 9 ownership did not activate the visible MTL4 draw path"
+            : "offscreen shadow replay activated the visible MTL4 draw path");
+    if (!expectMetal4) {
+      require(status.drawsAttempted() == 0
+              && status.drawsSucceeded() == 0
+              && status.drawsFailed() == 0
+              && status.drawsBlocked() > 0
+              && pipelines.nativeStatus().drawAttempts() == 0,
+          "forced Metal 3 did not retain a draw-free replay fallback");
+      return;
+    }
+    require(status.drawsSucceeded() > 0,
+        "no captured Iris draw completed through offscreen MTL4 replay");
+    require(status.drawsUnsupported() == 0,
+        "offscreen MTL4 Iris replay retained unsupported draws: "
+            + status.blockerSummary());
+    require(requiredReplayPhaseCoverage(status),
+        "offscreen MTL4 Iris replay missed a required phase: "
+            + status.successfulPhaseSummary());
+    require(status.drawsFailed() == 0,
+        "offscreen MTL4 Iris replay reported failures");
+    require(!status.lastColorHashUnsigned().equals("0")
+            && status.lastWidth() > 0 && status.lastHeight() > 0,
+        "offscreen MTL4 Iris replay produced no validated color hash");
+    require(pipelines.nativeStatus().drawAttempts()
+            >= status.drawsSucceeded(),
+        "native MTL4 draw telemetry is below successful replay count");
+  }
+
+  private static void requireVisualParity(
+      IrisTranslationCoordinator.VisualParityStatus status,
+      boolean expectMetal4) {
+    require(status.enabled(), "Iris/Metal visual parity is not enabled");
+    require(status.captureScheduled() > 0,
+        "visual parity scheduled no FINAL readbacks");
+    require(status.captureSucceeded() > 0,
+        "visual parity captured no OpenGL FINAL output");
+    require(status.captureFailed() == 0 && status.captureDropped() == 0,
+        "visual parity OpenGL capture failed or overflowed: "
+            + status.captureLastFailure());
+    require(status.blockerSetComplete(),
+        "visual parity blocker diagnostics were truncated");
+    require(status.blockerSetSha256().matches("[0-9a-f]{64}"),
+        "visual parity blocker digest is invalid");
+    if (!expectMetal4) {
+      require(!status.validated() && status.framesCompared() == 0
+              && status.samplesHandled()
+                  >= IrisRenderGraphCapture.MAX_REPLAY_SAMPLES_PER_PHASE,
+          "forced Metal 3 did not retain a bounded parity fallback");
+      return;
+    }
+    require(status.validated(),
+        "FINAL Iris/Metal visual parity did not validate: "
+            + status.blockerSummary());
+    require(status.framesCompared() >= status.minimumFrames()
+            && status.framesPassed() == status.framesCompared()
+            && status.framesFailed() == 0
+            && status.consecutivePasses()
+                >= status.requiredConsecutivePasses(),
+        "FINAL Iris/Metal visual parity window is incomplete");
+    require(status.missingOpenGlFrames() == 0
+            && status.missingMetalFrames() == 0
+            && status.dimensionMismatches() == 0
+            && status.replayFailures() == 0
+            && status.blockerCount() == 0,
+        "FINAL Iris/Metal visual parity retained blockers: "
+            + status.blockerSummary());
+    require(status.orientation().equals("native-row-order"),
+        "visual parity used an unexpected coordinate orientation");
+  }
+
+  private static void requireFinalCutover(
+      IrisTranslationCoordinator.CutoverStatus status,
+      boolean expectMetal4, boolean requireGraphOwnership) {
+    require(status.enabled(), "Iris FINAL cutover is not enabled");
+    require(status.failureReasonSetComplete(),
+        "Iris FINAL cutover diagnostics were truncated");
+    require(status.failureReasonSetSha256().matches("[0-9a-f]{64}"),
+        "Iris FINAL cutover failure digest is invalid");
+    require(status.bridge().equals("iosurface-gpu-handoff"),
+        "unexpected Iris FINAL cutover bridge: " + status.bridge());
+    if (!expectMetal4) {
+      require(status.mode().equals("SHADOW")
+              && status.presentations() == 0
+              && status.openGlDrawsSuppressed() == 0
+              && status.metalAttempts() == 0
+              && status.gpuInputTextures() == 0
+              && status.gpuInputBytes() == 0
+              && status.cpuInputTextures() == 0
+              && status.cpuInputBytes() == 0
+              && status.gpuInputBuffers() == 0
+              && status.gpuInputBufferBytes() == 0
+              && status.cpuInputBuffers() == 0
+              && status.cpuInputBufferBytes() == 0,
+          "forced Metal 3 did not retain the OpenGL FINAL fallback");
+      return;
+    }
+    if (requireGraphOwnership) {
+      require(NativeBridge.nIsMetal4DrawPathActive(),
+          "Stage 9 graph ownership never activated the native draw path");
+      require(!status.frameFallback() && status.failures() == 0,
+          "selective cutover reported a failure before Stage 9 ownership: "
+              + status.lastFailure());
+      return;
+    }
+    require(status.activeAndHealthy(),
+        "Iris FINAL cutover is not active and healthy: "
+            + status.lastFailure() + " / " + status.failureReasonSummary());
+    require(status.presentations() >= 30,
+        "Iris FINAL cutover did not replace enough real frames");
+    require(status.gpuInputTextures() >= status.presentations() * 3
+            && status.gpuInputBytes() > 0
+            && status.cpuInputTextures() == 0
+            && status.cpuInputBytes() == 0,
+        "Iris FINAL cutover did not keep all sampled inputs on the GPU");
+    require(status.gpuInputBuffers() >= status.presentations() * 2
+            && status.gpuInputBufferBytes() > 0
+            && status.cpuInputBuffers() == 0
+            && status.cpuInputBufferBytes() == 0,
+        "Iris FINAL cutover did not keep all geometry buffers resident: gpu="
+            + status.gpuInputBuffers() + "/"
+            + status.gpuInputBufferBytes() + "B cpu="
+            + status.cpuInputBuffers() + "/"
+            + status.cpuInputBufferBytes() + "B presentations="
+            + status.presentations());
+    require(status.drawsObserved() >= status.drawsEligible()
+            && status.drawsEligible() == status.metalAttempts()
+            && status.metalAttempts() == status.metalSucceeded()
+            && status.metalSucceeded() == status.presentations()
+            && status.presentations() == status.openGlDrawsSuppressed(),
+        "Iris FINAL cutover counters do not account for every replacement");
+    require(status.frameFallbacks() == 0 && status.lifecycleResets() == 0,
+        "Iris FINAL cutover unexpectedly entered rollback during baseline QA");
+  }
+
+  private static void requireShadowPlanCapture(
+      IrisTranslationCoordinator.ShadowPlanStatus status,
+      IrisTranslationCoordinator.RenderGraphStatus graph) {
+    require(status.plansObserved() > 0,
+        "no transient Iris shadow execution plan was retained");
+    require(status.plansObserved()
+            == status.structurallyComplete() + status.blocked(),
+        "shadow plan counters do not account for every plan");
+    require(status.plansObserved() == graph.graphsSucceeded(),
+        "shadow plan count does not match successful render graphs");
+    require(status.executionSteps() >= status.plansObserved(),
+        "shadow execution plan did not retain commands");
+    require(status.blockerSetComplete(),
+        "shadow blocker diagnostics exceeded their hard capacity");
+    require(status.blockerSetSha256().matches("[0-9a-f]{64}"),
+        "shadow blocker-set digest is invalid");
+    require((status.blockerCount() == 0)
+            == status.blockerSummary().isEmpty(),
+        "shadow blocker count and summary disagree");
   }
 
   private static void requireMslLibraryValidation(
@@ -715,6 +1372,387 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     }
   }
 
+  private static LifecycleEvidence verifyStage9WindowLifecycle(
+      ClientGameTestContext context) {
+    int[] original = context.computeOnClient(client -> {
+      Window window = client.getWindow();
+      require(!window.isFullscreen(),
+          "Stage 9 lifecycle must start in a window");
+      require(window.getScreenWidth() > 0 && window.getScreenHeight() > 0
+              && window.getWidth() > 0 && window.getHeight() > 0,
+          "Stage 9 lifecycle started with invalid window dimensions");
+      return new int[] {window.getScreenWidth(), window.getScreenHeight(),
+          window.getWidth(), window.getHeight()};
+    });
+    int resizedWidth = original[0] == 960 && original[1] == 540 ? 800 : 960;
+    int resizedHeight = original[0] == 960 && original[1] == 540 ? 450 : 540;
+    IrisTranslationCoordinator.FullGraphStatus started =
+        currentFullGraphStatus(context);
+    require(started.performanceEligible() && started.ownershipFailures() == 0,
+        "Stage 9 ownership was not healthy before lifecycle testing");
+    long presentationStart = started.ownershipFramesPresented();
+    long suppressionStart = started.ownershipCommandsSuppressed();
+    long invalidationStart = started.ownershipFramesInvalidated();
+    long failures = started.ownershipFailures();
+
+    context.runOnClient(client ->
+        client.getWindow().setWindowed(resizedWidth, resizedHeight));
+    context.waitFor(client -> {
+      Window window = client.getWindow();
+      return !window.isFullscreen()
+          && window.getScreenWidth() == resizedWidth
+          && window.getScreenHeight() == resizedHeight
+          && window.getWidth() > 0 && window.getHeight() > 0;
+    }, WORLD_TIMEOUT_TICKS);
+    IrisTranslationCoordinator.FullGraphStatus afterResize =
+        waitForOwnershipAdvance(context, presentationStart, failures,
+            "window resize");
+
+    context.runOnClient(client -> {
+      Window window = client.getWindow();
+      GLFW.glfwSetWindowPos(window.handle(), 0, 0);
+      window.toggleFullScreen();
+      window.updateFullscreenIfChanged();
+    });
+    context.waitFor(client -> {
+      Window window = client.getWindow();
+      return window.isFullscreen()
+          && window.getWidth() > 0 && window.getHeight() > 0;
+    }, WORLD_TIMEOUT_TICKS);
+    IrisTranslationCoordinator.FullGraphStatus afterFullscreen =
+        waitForOwnershipAdvance(context,
+            afterResize.ownershipFramesPresented(), failures, "fullscreen");
+
+    context.runOnClient(client ->
+        client.getWindow().setWindowed(original[0], original[1]));
+    context.waitFor(client -> {
+      Window window = client.getWindow();
+      return !window.isFullscreen()
+          && window.getScreenWidth() == original[0]
+          && window.getScreenHeight() == original[1]
+          && window.getWidth() == original[2]
+          && window.getHeight() == original[3];
+    }, WORLD_TIMEOUT_TICKS);
+    IrisTranslationCoordinator.FullGraphStatus afterRestore =
+        waitForOwnershipAdvance(context,
+            afterFullscreen.ownershipFramesPresented(), failures,
+            "windowed restore");
+
+    boolean surfaceSuspended = context.computeOnClient(client -> {
+      Window window = client.getWindow();
+      GLFW.glfwHideWindow(window.handle());
+      GLFW.glfwPollEvents();
+      return GLFW.glfwGetWindowAttrib(window.handle(), GLFW.GLFW_VISIBLE)
+          == GLFW.GLFW_FALSE;
+    });
+    require(surfaceSuspended,
+        "GLFW did not acknowledge the Stage 9 surface suspension");
+    context.runOnClient(client -> {
+      Window window = client.getWindow();
+      GLFW.glfwShowWindow(window.handle());
+      GLFW.glfwRestoreWindow(window.handle());
+    });
+    context.waitFor(client -> {
+      Window window = client.getWindow();
+      return GLFW.glfwGetWindowAttrib(window.handle(), GLFW.GLFW_VISIBLE)
+              == GLFW.GLFW_TRUE
+          && !window.isIconified() && !window.isFullscreen()
+          && window.getScreenWidth() == original[0]
+          && window.getScreenHeight() == original[1]
+          && window.getWidth() == original[2]
+          && window.getHeight() == original[3];
+    }, WORLD_TIMEOUT_TICKS);
+    IrisTranslationCoordinator.FullGraphStatus completed =
+        waitForOwnershipAdvance(context,
+            afterRestore.ownershipFramesPresented(), failures,
+            "surface suspend/restore");
+    long presentationDelta =
+        completed.ownershipFramesPresented() - presentationStart;
+    long suppressionDelta =
+        completed.ownershipCommandsSuppressed() - suppressionStart;
+    long invalidationDelta =
+        completed.ownershipFramesInvalidated() - invalidationStart;
+    require(presentationDelta
+            >= 4L * LIFECYCLE_PRESENTATIONS_PER_TRANSITION,
+        "Stage 9 lifecycle did not present enough recovery frames");
+    require(suppressionDelta > 0,
+        "Stage 9 lifecycle stopped suppressing upstream OpenGL commands");
+    require(completed.ownershipFailures() == failures,
+        "Stage 9 ownership failures advanced during lifecycle testing");
+    require(invalidationDelta >= 0
+            && invalidationDelta <= MAXIMUM_LIFECYCLE_INVALIDATIONS,
+        "Stage 9 lifecycle invalidated too many queued frames: "
+            + invalidationDelta);
+    System.out.println("METALRENDER_STAGE9_LIFECYCLE PASS"
+        + " resize=true fullscreen=true restore=true"
+        + " surfaceSuspendRestore=true"
+        + " presentations=" + presentationDelta
+        + " suppressed=" + suppressionDelta
+        + " invalidated=" + invalidationDelta + " failures=0");
+    return new LifecycleEvidence("PASS", true, true, true, true,
+        original[0], original[1], original[2], original[3],
+        resizedWidth, resizedHeight, presentationDelta, suppressionDelta,
+        invalidationDelta, completed.ownershipFailures() - failures);
+  }
+
+  private static IrisTranslationCoordinator.FullGraphStatus
+      waitForOwnershipAdvance(ClientGameTestContext context,
+          long presentationBaseline, long failureBaseline, String stage) {
+    context.waitFor(client -> {
+      IrisTranslationCoordinator.FullGraphStatus status =
+          IrisTranslationCoordinator.fullGraphStatus();
+      require(status.ownershipFailures() == failureBaseline,
+          "Stage 9 ownership failed during " + stage + ": "
+              + status.ownershipLastFailure());
+      return status.performanceEligible()
+          && status.ownershipFramesPresented()
+              >= presentationBaseline
+                  + LIFECYCLE_PRESENTATIONS_PER_TRANSITION;
+    }, WORLD_TIMEOUT_TICKS);
+    return currentFullGraphStatus(context);
+  }
+
+  private static IrisTranslationCoordinator.FullGraphStatus
+      currentFullGraphStatus(ClientGameTestContext context) {
+    return context.computeOnClient(
+        client -> IrisTranslationCoordinator.fullGraphStatus());
+  }
+
+  private static PerformanceEvidence captureStage9Performance(
+      ClientGameTestContext context, String side, int requestedSamples,
+      String exactSha, String shaderPack) {
+    context.waitTicks(120);
+    context.runOnClient(client -> IrisStage9PerformanceSampler.reset());
+    context.waitFor(client -> {
+      IrisStage9PerformanceSampler.Snapshot snapshot =
+          IrisStage9PerformanceSampler.snapshot();
+      require(snapshot.side().equals(side),
+          "Stage 9 sampler reported the wrong side: " + snapshot.side());
+      require(snapshot.instrumentationErrors() == 0,
+          "Stage 9 timing instrumentation failed");
+      require(snapshot.metalFeedbackErrors() == 0,
+          "MTL4 commit feedback reported an error");
+      require(snapshot.droppedGpuSamples() == 0,
+          "Stage 9 GPU timing samples were dropped: "
+              + snapshot.droppedGpuSamples());
+      return snapshot.pairedSamples() >= requestedSamples;
+    }, SHADER_TIMEOUT_TICKS);
+    IrisStage9PerformanceSampler.Snapshot snapshot =
+        context.computeOnClient(
+            client -> IrisStage9PerformanceSampler.snapshot());
+    require(snapshot.cpuNanos().length >= requestedSamples
+            && snapshot.gpuNanos().length >= requestedSamples,
+        "Stage 9 sampler did not retain the requested raw samples");
+    long[] cpu = Arrays.copyOf(snapshot.cpuNanos(), requestedSamples);
+    long[] gpu = Arrays.copyOf(snapshot.gpuNanos(), requestedSamples);
+    String scenario = context.computeOnClient(client -> {
+      Window window = client.getWindow();
+      require(client.level != null
+              && client.level.dimension().identifier().toString()
+                  .equals("minecraft:overworld"),
+          "performance capture left the fixed Overworld scene");
+      return "schema=stage9-v1\n"
+          + "minecraft=26.2\n"
+          + "exactJarSha256=" + exactSha + "\n"
+          + "shaderPack=" + shaderPack + "\n"
+          + "dimension=minecraft:overworld\n"
+          + "framebuffer=" + window.getWidth() + "x" + window.getHeight()
+          + "\nwindow=" + window.getScreenWidth() + "x"
+          + window.getScreenHeight() + "\n"
+          + "renderDistance=8\nsimulationDistance=5\n"
+          + "time=noon\nweather=clear\n"
+          + "player=0,102,0\ncameraYawPitch=0,20\n";
+    });
+    long cpuStutters = countAtLeast(cpu, PERFORMANCE_STUTTER_NANOS);
+    long gpuStutters = countAtLeast(gpu, PERFORMANCE_STUTTER_NANOS);
+    FrameMetrics metrics = new FrameMetrics(requestedSamples,
+        percentile(cpu, 0.50), percentile(cpu, 0.95),
+        percentile(cpu, 0.99), percentile(gpu, 0.50),
+        percentile(gpu, 0.95), percentile(gpu, 0.99),
+        Math.max(cpuStutters, gpuStutters));
+    PerformanceEvidence evidence = new PerformanceEvidence("PASS", side,
+        scenario, sha256(scenario), cpu, gpu, metrics,
+        snapshot.droppedGpuSamples(), snapshot.instrumentationErrors(),
+        cpuStutters, gpuStutters, snapshot.metalFeedbackErrors());
+    System.out.println("METALRENDER_STAGE9_PERFORMANCE PASS side=" + side
+        + " samples=" + requestedSamples + " scenario="
+        + evidence.scenarioSha256() + " cpuP50Ms="
+        + nanosToMillis(metrics.cpuP50Nanos()) + " cpuP95Ms="
+        + nanosToMillis(metrics.cpuP95Nanos()) + " gpuP50Ms="
+        + nanosToMillis(metrics.gpuP50Nanos()) + " gpuP95Ms="
+        + nanosToMillis(metrics.gpuP95Nanos()));
+    return evidence;
+  }
+
+  private static long percentile(long[] values, double percentile) {
+    long[] sorted = values.clone();
+    Arrays.sort(sorted);
+    int index = (int) Math.ceil(percentile * sorted.length) - 1;
+    return sorted[Math.max(0, index)];
+  }
+
+  private static long countAtLeast(long[] values, long threshold) {
+    return Arrays.stream(values).filter(value -> value >= threshold).count();
+  }
+
+  private static double nanosToMillis(long nanos) {
+    return nanos / 1_000_000.0;
+  }
+
+  private static void writeLifecycleEvidence(LifecycleEvidence evidence) {
+    String json = String.format(Locale.ROOT, """
+        {
+          "schemaVersion": 1,
+          "status": %s,
+          "resizePassed": %s,
+          "fullscreenPassed": %s,
+          "windowedRestorePassed": %s,
+          "surfaceSuspendRestorePassed": %s,
+          "originalWindowWidth": %d,
+          "originalWindowHeight": %d,
+          "originalFramebufferWidth": %d,
+          "originalFramebufferHeight": %d,
+          "resizedWindowWidth": %d,
+          "resizedWindowHeight": %d,
+          "ownershipPresentationDelta": %d,
+          "openGlSuppressionDelta": %d,
+          "ownershipInvalidationDelta": %d,
+          "ownershipFailureDelta": %d
+        }
+        """, quote(evidence.status()), evidence.resizePassed(),
+        evidence.fullscreenPassed(), evidence.windowedRestorePassed(),
+        evidence.surfaceSuspendRestorePassed(), evidence.originalWindowWidth(),
+        evidence.originalWindowHeight(), evidence.originalFramebufferWidth(),
+        evidence.originalFramebufferHeight(), evidence.resizedWindowWidth(),
+        evidence.resizedWindowHeight(), evidence.ownershipPresentationDelta(),
+        evidence.openGlSuppressionDelta(),
+        evidence.ownershipInvalidationDelta(),
+        evidence.ownershipFailureDelta());
+    writeAtomicJson("metalrender.exactJar.lifecycleEvidencePath", json);
+  }
+
+  private static void writePerformanceEvidence(
+      PerformanceEvidence evidence) {
+    FrameMetrics metrics = evidence.metrics();
+    String json = String.format(Locale.ROOT, """
+        {
+          "schemaVersion": 1,
+          "status": %s,
+          "side": %s,
+          "scenarioSha256": %s,
+          "scenarioDescriptor": %s,
+          "samples": %d,
+          "cpuNanos": %s,
+          "gpuNanos": %s,
+          "metrics": {
+            "cpuP50Nanos": %d,
+            "cpuP95Nanos": %d,
+            "cpuP99Nanos": %d,
+            "gpuP50Nanos": %d,
+            "gpuP95Nanos": %d,
+            "gpuP99Nanos": %d,
+            "stutters": %d
+          },
+          "droppedGpuSamples": %d,
+          "instrumentationErrors": %d,
+          "cpuStutters": %d,
+          "gpuStutters": %d,
+          "metalFeedbackErrors": %d
+        }
+        """, quote(evidence.status()), quote(evidence.side()),
+        quote(evidence.scenarioSha256()),
+        quote(evidence.scenarioDescriptor()), evidence.cpuNanos().length,
+        longArrayJson(evidence.cpuNanos()),
+        longArrayJson(evidence.gpuNanos()), metrics.cpuP50Nanos(),
+        metrics.cpuP95Nanos(), metrics.cpuP99Nanos(),
+        metrics.gpuP50Nanos(), metrics.gpuP95Nanos(),
+        metrics.gpuP99Nanos(), metrics.stutters(),
+        evidence.droppedGpuSamples(), evidence.instrumentationErrors(),
+        evidence.cpuStutters(), evidence.gpuStutters(),
+        evidence.metalFeedbackErrors());
+    writeAtomicJson("metalrender.exactJar.performanceEvidencePath", json);
+  }
+
+  private static String longArrayJson(long[] values) {
+    StringBuilder result = new StringBuilder(values.length * 12 + 2);
+    result.append('[');
+    for (int index = 0; index < values.length; index++) {
+      if (index != 0) {
+        result.append(',');
+      }
+      result.append(values[index]);
+    }
+    return result.append(']').toString();
+  }
+
+  private static void writeAtomicJson(String pathProperty, String json) {
+    Path result = Path.of(requiredProperty(pathProperty)).toAbsolutePath();
+    Path temporary = result.resolveSibling(result.getFileName() + ".tmp");
+    try {
+      Files.createDirectories(result.getParent());
+      Files.writeString(temporary, json, StandardCharsets.UTF_8);
+      Files.move(temporary, result, StandardCopyOption.REPLACE_EXISTING,
+          StandardCopyOption.ATOMIC_MOVE);
+    } catch (Exception error) {
+      throw new AssertionError("could not write exact-JAR sidecar " + result,
+          error);
+    }
+  }
+
+  private record LifecycleEvidence(String status, boolean resizePassed,
+                                   boolean fullscreenPassed,
+                                   boolean windowedRestorePassed,
+                                   boolean surfaceSuspendRestorePassed,
+                                   int originalWindowWidth,
+                                   int originalWindowHeight,
+                                   int originalFramebufferWidth,
+                                   int originalFramebufferHeight,
+                                   int resizedWindowWidth,
+                                   int resizedWindowHeight,
+                                   long ownershipPresentationDelta,
+                                   long openGlSuppressionDelta,
+                                   long ownershipInvalidationDelta,
+                                   long ownershipFailureDelta) {
+    private static LifecycleEvidence notRequired() {
+      return new LifecycleEvidence("NOT_REQUIRED", false, false, false,
+          false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+  }
+
+  private record FrameMetrics(int samples, long cpuP50Nanos,
+                              long cpuP95Nanos, long cpuP99Nanos,
+                              long gpuP50Nanos, long gpuP95Nanos,
+                              long gpuP99Nanos, long stutters) {
+  }
+
+  private record PerformanceEvidence(String status, String side,
+                                     String scenarioDescriptor,
+                                     String scenarioSha256,
+                                     long[] cpuNanos, long[] gpuNanos,
+                                     FrameMetrics metrics,
+                                     long droppedGpuSamples,
+                                     long instrumentationErrors,
+                                     long cpuStutters, long gpuStutters,
+                                     long metalFeedbackErrors) {
+    private PerformanceEvidence {
+      cpuNanos = cpuNanos.clone();
+      gpuNanos = gpuNanos.clone();
+      require(cpuNanos.length == metrics.samples()
+              && gpuNanos.length == metrics.samples(),
+          "performance evidence arrays do not match their metrics");
+    }
+
+    @Override
+    public long[] cpuNanos() {
+      return cpuNanos.clone();
+    }
+
+    @Override
+    public long[] gpuNanos() {
+      return gpuNanos.clone();
+    }
+  }
+
   private static Path exactReleaseJar() {
     try {
       URI codeSource = MetalRenderClient.class.getProtectionDomain()
@@ -739,6 +1777,14 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       Path shadersReenabled, VisualMetrics visualMetrics,
       IrisTranslationCoordinator.Status translationStatus,
       IrisTranslationCoordinator.RenderGraphStatus renderGraphStatus,
+      IrisTranslationCoordinator.MetalGraphResourceStatus graphResourceStatus,
+      IrisTranslationCoordinator.ShadowPlanStatus shadowPlanStatus,
+      IrisTranslationCoordinator.FullGraphStatus fullGraphStatus,
+      IrisTranslationCoordinator.MetalPipelineCacheStatus metalPipelineStatus,
+      IrisTranslationCoordinator.ShadowReplayStatus shadowReplayStatus,
+      IrisTranslationCoordinator.VisualParityStatus visualParityStatus,
+      IrisTranslationCoordinator.CutoverStatus cutoverStatus,
+      Path shadersCutover, CutoverVisualMetrics cutoverVisual,
       String cacheExpectation, String backendExpectation,
       NativeFaultCounters nativeFaultBaseline,
       NativeFaultCounters nativeFaultEnd,
@@ -751,6 +1797,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     String version = FabricLoader.getInstance()
         .getModContainer("metalrender").orElseThrow()
         .getMetadata().getVersion().getFriendlyString();
+    boolean graphOwnershipRequired = Boolean.getBoolean(
+        "metalrender.exactJar.requireGraphOwnership");
     String renderGraphJson = String.format(Locale.ROOT, """
         {
           "complete": %s,
@@ -767,6 +1815,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "nodesRepresented": %d,
           "edgesRepresented": %d,
           "barriersRepresented": %d,
+          "clearsRepresented": %d,
           "transfersRepresented": %d,
           "pingPongResourcesRepresented": %d,
           "phaseSummary": %s,
@@ -777,7 +1826,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "unsupportedReasonSetComplete": %s,
           "unsupportedReasonSetSha256": %s,
           "lastFailure": %s,
-          "generatedMslExecuted": false
+          "offscreenGeneratedMslReplayObserved": %s,
+          "visibleMetalExecution": %s
         }
         """,
         Boolean.toString(renderGraphStatus.complete()),
@@ -789,6 +1839,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         renderGraphStatus.resourcesRepresented(),
         renderGraphStatus.nodesRepresented(), renderGraphStatus.edgesRepresented(),
         renderGraphStatus.barriersRepresented(),
+        renderGraphStatus.clearsRepresented(),
         renderGraphStatus.transfersRepresented(),
         renderGraphStatus.pingPongResourcesRepresented(),
         quote(renderGraphStatus.phaseSummary()),
@@ -798,10 +1849,401 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         renderGraphStatus.unsupportedReasonCount(),
         Boolean.toString(renderGraphStatus.unsupportedReasonSetComplete()),
         quote(renderGraphStatus.unsupportedReasonSetSha256()),
-        quote(renderGraphStatus.lastFailure()));
+        quote(renderGraphStatus.lastFailure()),
+        Boolean.toString(shadowReplayStatus.drawsSucceeded() > 0),
+        Boolean.toString(cutoverStatus.presentations() > 0
+            || fullGraphStatus.ownershipFramesPresented() > 0));
+    String graphResourceJson = String.format(Locale.ROOT, """
+        {
+          "enabled": %s,
+          "runtimeAvailable": %s,
+          "complete": %s,
+          "safeUnsupportedFallback": %s,
+          "plansObserved": %d,
+          "plansComplete": %d,
+          "plansBlocked": %d,
+          "allocationsRequested": %d,
+          "nativeAttempts": %d,
+          "nativeSucceeded": %d,
+          "nativeFailed": %d,
+          "nativeTextureCount": %d,
+          "nativeTextureBytes": %d,
+          "blockerCount": %d,
+          "blockerSetComplete": %s,
+          "blockerSetSha256": %s,
+          "blockerSummary": %s,
+          "storageMode": "private",
+          "identity": "context-generation/gl-name/resource-generation"
+        }
+        """,
+        Boolean.toString(graphResourceStatus.enabled()),
+        Boolean.toString(graphResourceStatus.runtimeAvailable()),
+        Boolean.toString(graphResourceStatus.complete()),
+        Boolean.toString(graphResourceStatus.safeUnsupportedFallback()),
+        graphResourceStatus.plansObserved(),
+        graphResourceStatus.plansComplete(),
+        graphResourceStatus.plansBlocked(),
+        graphResourceStatus.allocationsRequested(),
+        graphResourceStatus.nativeAttempts(),
+        graphResourceStatus.nativeSucceeded(),
+        graphResourceStatus.nativeFailed(),
+        graphResourceStatus.nativeTextureCount(),
+        graphResourceStatus.nativeTextureBytes(),
+        graphResourceStatus.blockerCount(),
+        Boolean.toString(graphResourceStatus.blockerSetComplete()),
+        quote(graphResourceStatus.blockerSetSha256()),
+        quote(graphResourceStatus.blockerSummary()));
+    String fullGraphJson = String.format(Locale.ROOT, """
+        {
+          "enabled": %s,
+          "runtimeAvailable": %s,
+          "captureActive": %s,
+          "captureRequests": %d,
+          "framesObserved": %d,
+          "framesPlanned": %d,
+          "framesPending": %d,
+          "framesAttempted": %d,
+          "framesSucceeded": %d,
+          "framesUnsupported": %d,
+          "framesFailed": %d,
+          "operations": %d,
+          "draws": %d,
+          "clears": %d,
+          "transfers": %d,
+          "barriers": %d,
+          "capturedBytes": %d,
+          "initializedResources": %d,
+          "lastOutputHashUnsigned": %s,
+          "minimumSuccessFrames": %d,
+          "validated": %s,
+          "ownershipMode": %s,
+          "performanceEligible": %s,
+          "ownershipOptedIn": %s,
+          "ownershipSubmissions": %d,
+          "ownershipReady": %d,
+          "ownershipFramesArmed": %d,
+          "ownershipFramesPresented": %d,
+          "ownershipFramesReused": %d,
+          "ownershipFramesInvalidated": %d,
+          "ownershipCommandsSuppressed": %d,
+          "ownershipFailures": %d,
+          "ownershipLastFailure": %s,
+          "blockerCount": %d,
+          "blockerSetComplete": %s,
+          "blockerSetSha256": %s,
+          "blockerSummary": %s,
+          "lastFailure": %s
+        }
+        """,
+        Boolean.toString(fullGraphStatus.enabled()),
+        Boolean.toString(fullGraphStatus.runtimeAvailable()),
+        Boolean.toString(fullGraphStatus.captureActive()),
+        fullGraphStatus.captureRequests(), fullGraphStatus.framesObserved(),
+        fullGraphStatus.framesPlanned(), fullGraphStatus.framesPending(),
+        fullGraphStatus.framesAttempted(), fullGraphStatus.framesSucceeded(),
+        fullGraphStatus.framesUnsupported(), fullGraphStatus.framesFailed(),
+        fullGraphStatus.operations(), fullGraphStatus.draws(),
+        fullGraphStatus.clears(), fullGraphStatus.transfers(),
+        fullGraphStatus.barriers(), fullGraphStatus.capturedBytes(),
+        fullGraphStatus.initializedResources(),
+        quote(fullGraphStatus.lastOutputHashUnsigned()),
+        fullGraphStatus.minimumSuccessFrames(),
+        Boolean.toString(fullGraphStatus.validated()),
+        quote(fullGraphStatus.ownershipMode()),
+        Boolean.toString(fullGraphStatus.performanceEligible()),
+        Boolean.toString(fullGraphStatus.ownershipOptedIn()),
+        fullGraphStatus.ownershipSubmissions(),
+        fullGraphStatus.ownershipReady(),
+        fullGraphStatus.ownershipFramesArmed(),
+        fullGraphStatus.ownershipFramesPresented(),
+        fullGraphStatus.ownershipFramesReused(),
+        fullGraphStatus.ownershipFramesInvalidated(),
+        fullGraphStatus.ownershipCommandsSuppressed(),
+        fullGraphStatus.ownershipFailures(),
+        quote(fullGraphStatus.ownershipLastFailure()),
+        fullGraphStatus.blockerCount(),
+        Boolean.toString(fullGraphStatus.blockerSetComplete()),
+        quote(fullGraphStatus.blockerSetSha256()),
+        quote(fullGraphStatus.blockerSummary()),
+        quote(fullGraphStatus.lastFailure()));
+    String shadowPlanJson = String.format(Locale.ROOT, """
+        {
+          "complete": %s,
+          "plansObserved": %d,
+          "structurallyComplete": %d,
+          "blocked": %d,
+          "executionSteps": %d,
+          "blockerCount": %d,
+          "blockerSetComplete": %s,
+          "blockerSetSha256": %s,
+          "blockerSummary": %s,
+          "offscreenIrisReplayExecuted": %s,
+          "openGlDrawsSuppressed": %d
+        }
+        """,
+        Boolean.toString(shadowPlanStatus.complete()),
+        shadowPlanStatus.plansObserved(),
+        shadowPlanStatus.structurallyComplete(), shadowPlanStatus.blocked(),
+        shadowPlanStatus.executionSteps(), shadowPlanStatus.blockerCount(),
+        Boolean.toString(shadowPlanStatus.blockerSetComplete()),
+        quote(shadowPlanStatus.blockerSetSha256()),
+        quote(shadowPlanStatus.blockerSummary()),
+        Boolean.toString(shadowReplayStatus.drawsSucceeded() > 0),
+        graphOwnershipRequired
+            ? fullGraphStatus.ownershipCommandsSuppressed()
+            : cutoverStatus.openGlDrawsSuppressed());
+    String shadowReplayJson = String.format(Locale.ROOT, """
+        {
+          "enabled": %s,
+          "executionComplete": %s,
+          "drawsObserved": %d,
+          "drawsReady": %d,
+          "drawsAttempted": %d,
+          "drawsSucceeded": %d,
+          "drawsUnsupported": %d,
+          "drawsFailed": %d,
+          "drawsBlocked": %d,
+          "candidateCount": %d,
+          "candidateSetComplete": %s,
+          "successfulPhaseCount": %d,
+          "successfulPhaseSummary": %s,
+          "lastColorHashUnsigned": %s,
+          "lastWidth": %d,
+          "lastHeight": %d,
+          "blockerCount": %d,
+          "blockerSetComplete": %s,
+          "blockerSetSha256": %s,
+          "blockerSummary": %s,
+          "offscreenOnly": true,
+          "openGlDrawsSuppressed": 0,
+          "visualParityValidated": %s
+        }
+        """,
+        Boolean.toString(shadowReplayStatus.enabled()),
+        Boolean.toString(shadowReplayStatus.executionComplete()),
+        shadowReplayStatus.drawsObserved(), shadowReplayStatus.drawsReady(),
+        shadowReplayStatus.drawsAttempted(),
+        shadowReplayStatus.drawsSucceeded(),
+        shadowReplayStatus.drawsUnsupported(),
+        shadowReplayStatus.drawsFailed(), shadowReplayStatus.drawsBlocked(),
+        shadowReplayStatus.candidateCount(),
+        Boolean.toString(shadowReplayStatus.candidateSetComplete()),
+        shadowReplayStatus.successfulPhaseCount(),
+        quote(shadowReplayStatus.successfulPhaseSummary()),
+        quote(shadowReplayStatus.lastColorHashUnsigned()),
+        shadowReplayStatus.lastWidth(), shadowReplayStatus.lastHeight(),
+        shadowReplayStatus.blockerCount(),
+        Boolean.toString(shadowReplayStatus.blockerSetComplete()),
+        quote(shadowReplayStatus.blockerSetSha256()),
+        quote(shadowReplayStatus.blockerSummary()),
+        Boolean.toString(visualParityStatus.validated()));
+    String visualParityJson = String.format(Locale.ROOT, """
+        {
+          "enabled": %s,
+          "validated": %s,
+          "channelTolerance": %d,
+          "maxDifferentPixelRatio": %.8f,
+          "maxRootMeanSquareError": %.8f,
+          "minimumFrames": %d,
+          "requiredConsecutivePasses": %d,
+          "captureScheduled": %d,
+          "captureSucceeded": %d,
+          "captureFailed": %d,
+          "captureDropped": %d,
+          "capturePending": %d,
+          "captureLastFailure": %s,
+          "samplesHandled": %d,
+          "missingOpenGlFrames": %d,
+          "missingMetalFrames": %d,
+          "dimensionMismatches": %d,
+          "replayFailures": %d,
+          "framesCompared": %d,
+          "framesPassed": %d,
+          "framesFailed": %d,
+          "consecutivePasses": %d,
+          "worstDifferentPixelRatio": %.8f,
+          "worstRootMeanSquareError": %.8f,
+          "worstChannelDelta": %d,
+          "orientation": %s,
+          "blockerCount": %d,
+          "blockerSetComplete": %s,
+          "blockerSetSha256": %s,
+          "blockerSummary": %s,
+          "comparisonTarget": "iris-opengl-final-vs-offscreen-metal-final"
+        }
+        """,
+        Boolean.toString(visualParityStatus.enabled()),
+        Boolean.toString(visualParityStatus.validated()),
+        visualParityStatus.channelTolerance(),
+        visualParityStatus.maxDifferentPixelRatio(),
+        visualParityStatus.maxRootMeanSquareError(),
+        visualParityStatus.minimumFrames(),
+        visualParityStatus.requiredConsecutivePasses(),
+        visualParityStatus.captureScheduled(),
+        visualParityStatus.captureSucceeded(),
+        visualParityStatus.captureFailed(), visualParityStatus.captureDropped(),
+        visualParityStatus.capturePending(),
+        quote(visualParityStatus.captureLastFailure()),
+        visualParityStatus.samplesHandled(),
+        visualParityStatus.missingOpenGlFrames(),
+        visualParityStatus.missingMetalFrames(),
+        visualParityStatus.dimensionMismatches(),
+        visualParityStatus.replayFailures(),
+        visualParityStatus.framesCompared(), visualParityStatus.framesPassed(),
+        visualParityStatus.framesFailed(),
+        visualParityStatus.consecutivePasses(),
+        visualParityStatus.worstDifferentPixelRatio(),
+        visualParityStatus.worstRootMeanSquareError(),
+        visualParityStatus.worstChannelDelta(),
+        quote(visualParityStatus.orientation()),
+        visualParityStatus.blockerCount(),
+        Boolean.toString(visualParityStatus.blockerSetComplete()),
+        quote(visualParityStatus.blockerSetSha256()),
+        quote(visualParityStatus.blockerSummary()));
+    String metalPipelineJson = String.format(Locale.ROOT, """
+        {
+          "activeGatePassed": %s,
+          "complete": %s,
+          "safeUnsupportedFallback": %s,
+          "enabled": %s,
+          "readiness": %s,
+          "deviceCompilerSha256": %s,
+          "candidatesObserved": %d,
+          "executionBlockedCandidates": %d,
+          "pending": %d,
+          "attempted": %d,
+          "compiled": %d,
+          "cacheHits": %d,
+          "newVariantsCompiled": %d,
+          "knownArchiveMisses": %d,
+          "unsupported": %d,
+          "failed": %d,
+          "queueRejected": %d,
+          "archiveFlushed": %s,
+          "archiveFlushFailures": %d,
+          "pipelineIdentityCount": %d,
+          "pipelineIdentitySetComplete": %s,
+          "pipelineSetSha256": %s,
+          "failureReasonCount": %d,
+          "failureReasonSetComplete": %s,
+          "failureReasonSetSha256": %s,
+          "lastFailure": %s,
+          "nativeAttempts": %d,
+          "nativeCompiled": %d,
+          "nativeCacheHits": %d,
+          "nativeFailures": %d,
+          "nativeStaleArchivesRecovered": %d,
+          "nativeLivePipelines": %d,
+          "nativeDrawAttempts": %d,
+          "offscreenGeneratedMslReplayObserved": %s,
+          "visibleMetalExecution": %s
+        }
+        """,
+        Boolean.toString(backendExpectation.equals("metal4")
+            ? metalPipelineStatus.complete()
+            : metalPipelineStatus.safeUnsupportedFallback()),
+        Boolean.toString(metalPipelineStatus.complete()),
+        Boolean.toString(metalPipelineStatus.safeUnsupportedFallback()),
+        Boolean.toString(metalPipelineStatus.enabled()),
+        quote(metalPipelineStatus.readiness()),
+        quote(metalPipelineStatus.deviceCompilerSha256()),
+        metalPipelineStatus.candidatesObserved(),
+        metalPipelineStatus.executionBlockedCandidates(),
+        metalPipelineStatus.pending(), metalPipelineStatus.attempted(),
+        metalPipelineStatus.compiled(), metalPipelineStatus.cacheHits(),
+        metalPipelineStatus.newVariantsCompiled(),
+        metalPipelineStatus.knownArchiveMisses(),
+        metalPipelineStatus.unsupported(), metalPipelineStatus.failed(),
+        metalPipelineStatus.queueRejected(),
+        Boolean.toString(metalPipelineStatus.archiveFlushed()),
+        metalPipelineStatus.archiveFlushFailures(),
+        metalPipelineStatus.pipelineIdentityCount(),
+        Boolean.toString(metalPipelineStatus.pipelineIdentitySetComplete()),
+        quote(metalPipelineStatus.pipelineSetSha256()),
+        metalPipelineStatus.failureReasonCount(),
+        Boolean.toString(metalPipelineStatus.failureReasonSetComplete()),
+        quote(metalPipelineStatus.failureReasonSetSha256()),
+        quote(metalPipelineStatus.lastFailure()),
+        metalPipelineStatus.nativeStatus().attempts(),
+        metalPipelineStatus.nativeStatus().compiled(),
+        metalPipelineStatus.nativeStatus().cacheHits(),
+        metalPipelineStatus.nativeStatus().failures(),
+        metalPipelineStatus.nativeStatus().staleArchivesRecovered(),
+        metalPipelineStatus.nativeStatus().livePipelines(),
+        metalPipelineStatus.nativeStatus().drawAttempts(),
+        Boolean.toString(shadowReplayStatus.drawsSucceeded() > 0),
+        Boolean.toString(cutoverStatus.presentations() > 0
+            || fullGraphStatus.ownershipFramesPresented() > 0));
+    String cutoverJson = String.format(Locale.ROOT, """
+        {
+          "enabled": %s,
+          "active": %s,
+          "mode": %s,
+          "currentFrame": %d,
+          "contextGeneration": %d,
+          "frameFallback": %s,
+          "drawsObserved": %d,
+          "drawsEligible": %d,
+          "metalAttempts": %d,
+          "metalSucceeded": %d,
+          "presentations": %d,
+          "openGlDrawsSuppressed": %d,
+          "frameFallbacks": %d,
+          "lifecycleResets": %d,
+          "failures": %d,
+          "bridge": %s,
+          "performanceEligible": false,
+          "gpuInputTextures": %d,
+          "gpuInputBytes": %d,
+          "cpuInputTextures": %d,
+          "cpuInputBytes": %d,
+          "gpuInputBuffers": %d,
+          "gpuInputBufferBytes": %d,
+          "cpuInputBuffers": %d,
+          "cpuInputBufferBytes": %d,
+          "pipelineLookupCount": %d,
+          "failureReasonCount": %d,
+          "failureReasonSetComplete": %s,
+          "failureReasonSetSha256": %s,
+          "failureReasonSummary": %s,
+          "lastFailure": %s,
+          "screenshotCaptured": %s,
+          "screenshotSampledUniqueColors": %d,
+          "screenshotLuminanceStdDev": %.8f,
+          "screenshotReferenceMad": %.8f,
+          "screenshotPath": %s
+        }
+        """,
+        Boolean.toString(cutoverStatus.enabled()),
+        Boolean.toString(cutoverStatus.activeAndHealthy()),
+        quote(cutoverStatus.mode()), cutoverStatus.currentFrame(),
+        cutoverStatus.contextGeneration(),
+        Boolean.toString(cutoverStatus.frameFallback()),
+        cutoverStatus.drawsObserved(), cutoverStatus.drawsEligible(),
+        cutoverStatus.metalAttempts(), cutoverStatus.metalSucceeded(),
+        cutoverStatus.presentations(),
+        cutoverStatus.openGlDrawsSuppressed(),
+        cutoverStatus.frameFallbacks(), cutoverStatus.lifecycleResets(),
+        cutoverStatus.failures(), quote(cutoverStatus.bridge()),
+        cutoverStatus.gpuInputTextures(), cutoverStatus.gpuInputBytes(),
+        cutoverStatus.cpuInputTextures(), cutoverStatus.cpuInputBytes(),
+        cutoverStatus.gpuInputBuffers(),
+        cutoverStatus.gpuInputBufferBytes(),
+        cutoverStatus.cpuInputBuffers(),
+        cutoverStatus.cpuInputBufferBytes(),
+        cutoverStatus.pipelineLookupCount(),
+        cutoverStatus.failureReasonCount(),
+        Boolean.toString(cutoverStatus.failureReasonSetComplete()),
+        quote(cutoverStatus.failureReasonSetSha256()),
+        quote(cutoverStatus.failureReasonSummary()),
+        quote(cutoverStatus.lastFailure()),
+        Boolean.toString(cutoverVisual.screenshotCaptured()),
+        cutoverVisual.sampledUniqueColors(),
+        cutoverVisual.luminanceStdDev(), cutoverVisual.referenceMad(),
+        quote(shadersCutover.toAbsolutePath().toString()));
     String json = String.format(Locale.ROOT, """
         {
-          "schemaVersion": 6,
+          "schemaVersion": 14,
           "status": "PASS",
           "environment": "production-fabric",
           "javaMajor": 25,
@@ -810,6 +2252,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "exactJarSha256": %s,
           "cacheExpectation": %s,
           "backendExpectation": %s,
+          "graphOwnershipRequired": %s,
           "backendMode": %s,
           "metal4Active": %s,
           "metal4DrawPathActive": %s,
@@ -817,13 +2260,15 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "irisLoaded": true,
           "irisRuntimeOwnership": {
             "evidenceKind": "indirect-runtime-ownership-check",
-            "assertedDrawBackend": "OPENGL",
+            "assertedDrawBackend": %s,
             "measuredAtRuntime": true,
             "passed": true
           },
           "generatedMslExecutionBoundary": {
-            "runtimeTelemetryAvailable": false,
-            "assertedStaticBoundary": "library-compile-resolve-release-only"
+            "runtimeTelemetryAvailable": true,
+            "assertedStaticBoundary": %s,
+            "nativeDrawAttempts": %d,
+            "visibleOpenGlDrawsSuppressed": %d
           },
           "shaderPack": %s,
           "shaderPackInitiallyLoaded": true,
@@ -847,7 +2292,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             "rejected": %d,
             "captureFailures": %d,
             "queuedAtEvidence": %d,
-            "pipelineStatus": "pending"
+            "pipelineStatus": %s
           },
           "irisPipelineStateCapture": {
             "complete": %s,
@@ -871,7 +2316,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             "stateSetSha256": %s,
             "stateSetComplete": %s,
             "lastFailure": %s,
-            "pipelineStatus": "pending",
+            "pipelineStatus": %s,
             "irisOpenGlActive": true
           },
           "irisResourceReflection": {
@@ -897,6 +2342,13 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             "runtimeBindingsCaptured": true
           },
           "irisRenderGraph": %s,
+          "irisMetalGraphResources": %s,
+          "irisMetalFullGraph": %s,
+          "irisShadowExecutionPlan": %s,
+          "irisMetalShadowReplay": %s,
+          "irisMetalVisualParity": %s,
+          "irisMetalFinalCutover": %s,
+          "irisMetalPipelineCache": %s,
           "generatedMslLibraryValidation": {
             "enabled": %s,
             "ready": %s,
@@ -959,7 +2411,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "screenshots": {
             "shadersOn": %s,
             "shadersOff": %s,
-            "shadersReenabled": %s
+            "shadersReenabled": %s,
+            "metalFinalCutover": %s
           }
         }
         """,
@@ -968,9 +2421,23 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         quote(exactSha),
         quote(cacheExpectation),
         quote(backendExpectation),
+        Boolean.toString(graphOwnershipRequired),
         quote(NativeBridge.nGetBackendMode()),
         Boolean.toString(NativeBridge.nIsMetal4Active()),
         Boolean.toString(NativeBridge.nIsMetal4DrawPathActive()),
+        quote(graphOwnershipRequired
+            ? "METAL4_FULL_GRAPH_OWNERSHIP"
+            : cutoverStatus.presentations() > 0
+                ? "METAL4_FINAL_CUTOVER_WITH_OPENGL_FALLBACK" : "OPENGL"),
+        quote(graphOwnershipRequired
+            ? "full-graph-metal-ownership"
+            : cutoverStatus.presentations() > 0
+                ? "selective-final-cutover"
+                : "offscreen-shadow-replay-only"),
+        metalPipelineStatus.nativeStatus().drawAttempts(),
+        graphOwnershipRequired
+            ? fullGraphStatus.ownershipCommandsSuppressed()
+            : cutoverStatus.openGlDrawsSuppressed(),
         quote(shaderPack),
         frames,
         framesWithShadersOff,
@@ -982,6 +2449,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         translationStatus.rejected(),
         translationStatus.captureFailures(),
         translationStatus.queued(),
+        quote(backendExpectation.equals("metal4")
+            ? "cached" : "unsupported-safe-fallback"),
         Boolean.toString(translationStatus.pipelineStateCaptureComplete()),
         translationStatus.pipelineDrawsObserved(),
         translationStatus.pipelineDispatchesObserved(),
@@ -1004,6 +2473,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         quote(translationStatus.pipelineStateSetSha256()),
         Boolean.toString(translationStatus.pipelineStateSetComplete()),
         quote(translationStatus.pipelineStateLastFailure()),
+        quote(backendExpectation.equals("metal4")
+            ? "cached" : "unsupported-safe-fallback"),
         Boolean.toString(translationStatus.resourceReflectionComplete()),
         translationStatus.resourceProgramsAttempted(),
         translationStatus.resourceProgramsSucceeded(),
@@ -1025,6 +2496,13 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         quote(translationStatus.resourceBindingIncompleteReasonSetSha256()),
         quote(translationStatus.resourceBindingIncompleteReasonSummary()),
         renderGraphJson,
+        graphResourceJson,
+        fullGraphJson,
+        shadowPlanJson,
+        shadowReplayJson,
+        visualParityJson,
+        cutoverJson,
+        metalPipelineJson,
         Boolean.toString(translationStatus.libraryValidationEnabled()),
         Boolean.toString(translationStatus.libraryValidationReady()),
         Boolean.toString(translationStatus.libraryValidationComplete()),
@@ -1068,7 +2546,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         visualMetrics.onVsReenabledMad(),
         quote(shadersOn.toAbsolutePath().toString()),
         quote(shadersOff.toAbsolutePath().toString()),
-        quote(shadersReenabled.toAbsolutePath().toString()));
+        quote(shadersReenabled.toAbsolutePath().toString()),
+        quote(shadersCutover.toAbsolutePath().toString()));
     try {
       Files.createDirectories(result.getParent());
       Files.writeString(temporary, json, StandardCharsets.UTF_8);
@@ -1140,6 +2619,40 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     }
   }
 
+  private static CutoverVisualMetrics validateCutoverScreenshot(
+      Path irisReference, Path cutover, boolean expectMetal4) {
+    try {
+      BufferedImage reference = ImageIO.read(irisReference.toFile());
+      BufferedImage candidate = ImageIO.read(cutover.toFile());
+      require(reference != null && candidate != null,
+          "cutover screenshot is not a decodable PNG image");
+      require(reference.getWidth() == candidate.getWidth()
+              && reference.getHeight() == candidate.getHeight(),
+          "cutover screenshot dimensions differ from Iris reference");
+      SampleStats stats = sampleStats(candidate);
+      require(stats.uniqueColors() >= 64
+              && stats.luminanceStdDev() >= 0.02,
+          "cutover screenshot is visually uniform or corrupted");
+      double difference = meanAbsoluteDifference(reference, candidate);
+      if (expectMetal4) {
+        // The paired per-draw parity gate is authoritative. This looser whole-
+        // frame check catches presentation flips, channel swaps and stale
+        // frames while tolerating normal animation between screenshots.
+        require(difference < 0.20,
+            "visible Metal FINAL cutover diverged from the Iris scene");
+      } else {
+        require(difference == 0.0,
+            "Metal 3 fallback unexpectedly changed its reference image");
+      }
+      return new CutoverVisualMetrics(stats.uniqueColors(),
+          stats.luminanceStdDev(), difference, expectMetal4);
+    } catch (AssertionError error) {
+      throw error;
+    } catch (Exception error) {
+      throw new AssertionError("could not validate cutover screenshot", error);
+    }
+  }
+
   private static SampleStats sampleStats(BufferedImage image) {
     Set<Integer> colors = new HashSet<>();
     double luminanceSum = 0.0;
@@ -1203,6 +2716,12 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
                                double onVsReenabledMad) {
   }
 
+  private record CutoverVisualMetrics(int sampledUniqueColors,
+                                      double luminanceStdDev,
+                                      double referenceMad,
+                                      boolean screenshotCaptured) {
+  }
+
   private static String sha256(Path path) {
     try (InputStream input = Files.newInputStream(path)) {
       MessageDigest digest = MessageDigest.getInstance("SHA-256");
@@ -1214,6 +2733,29 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       return HexFormat.of().formatHex(digest.digest());
     } catch (Exception error) {
       throw new AssertionError("could not hash " + path, error);
+    }
+  }
+
+  private static String sha256(String value) {
+    try {
+      MessageDigest digest = MessageDigest.getInstance("SHA-256");
+      return HexFormat.of().formatHex(
+          digest.digest(value.getBytes(StandardCharsets.UTF_8)));
+    } catch (Exception error) {
+      throw new AssertionError("could not hash Stage 9 scenario", error);
+    }
+  }
+
+  private static int integerProperty(String name, int fallback) {
+    String value = System.getProperty(name);
+    if (value == null || value.isBlank()) {
+      return fallback;
+    }
+    try {
+      return Integer.parseInt(value);
+    } catch (NumberFormatException error) {
+      throw new AssertionError("invalid integer system property " + name,
+          error);
     }
   }
 

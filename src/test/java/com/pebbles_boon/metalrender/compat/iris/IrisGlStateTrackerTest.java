@@ -232,6 +232,74 @@ final class IrisGlStateTrackerTest {
   }
 
   @Test
+  void retainsExactTextureAllocationMetadataAcrossAttachmentLookup() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    ResourceHandle texture = tracker.defineTexture(44, "rgba16-float", 1,
+        1920, 1080, 1, 6);
+    IrisGlStateTracker.TextureMetadata metadata =
+        tracker.textureMetadata(texture).orElseThrow();
+
+    assertTrue(metadata.complete());
+    assertEquals(1920, metadata.width());
+    assertEquals(1080, metadata.height());
+    assertEquals(6, metadata.mipLevels());
+    assertTrue(tracker.deleteTexture(texture));
+    assertTrue(tracker.textureMetadata(texture).isEmpty());
+  }
+
+  @Test
+  void exposesCompleteGenerationSafeFramebufferAttachmentMetadata() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    tracker.registerFramebuffer(7);
+    ResourceHandle color = tracker.defineTexture(44, "rgba16-float", 1,
+        1920, 1080, 1, 1);
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 44, 0));
+
+    IrisGlStateTracker.FramebufferMetadata metadata =
+        tracker.framebufferMetadata(7).orElseThrow();
+    assertTrue(metadata.complete());
+    assertEquals(1, metadata.attachments().size());
+    assertEquals(IrisGlStateTracker.GL_COLOR_ATTACHMENT0,
+        metadata.attachments().getFirst().attachment());
+    assertEquals(color,
+        metadata.attachments().getFirst().texture().handle());
+    assertEquals(1920, metadata.attachments().getFirst().texture().width());
+
+    assertTrue(tracker.deleteTexture(color));
+    assertFalse(tracker.framebufferMetadata(7).orElseThrow().complete());
+    assertFalse(tracker.framebufferMetadata(0).orElseThrow().complete());
+  }
+
+  @Test
+  void tracksReadAndDrawFramebufferBindingsIndependently() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    tracker.initializeOpenGlDefaults();
+    ResourceHandle read = tracker.registerFramebuffer(7);
+    ResourceHandle draw = tracker.registerFramebuffer(8);
+    ResourceHandle texture = tracker.defineTexture(44, "rgba8-unorm", 1,
+        32, 16, 1, 1);
+
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_READ_FRAMEBUFFER, read);
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_DRAW_FRAMEBUFFER, draw);
+    assertEquals(read, tracker.readFramebufferHandle().orElseThrow());
+    assertEquals(draw, tracker.drawFramebufferHandle().orElseThrow());
+    assertTrue(tracker.framebufferTexture2D(
+        IrisGlStateTracker.GL_READ_FRAMEBUFFER,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 44, 0));
+    assertEquals(texture, tracker.framebufferMetadata(7).orElseThrow()
+        .attachments().getFirst().texture().handle());
+
+    assertTrue(tracker.deleteFramebuffer(read));
+    assertEquals(0, tracker.readFramebufferHandle().orElseThrow().name());
+    assertEquals(draw, tracker.drawFramebufferHandle().orElseThrow());
+
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_FRAMEBUFFER, 8);
+    assertEquals(draw, tracker.readFramebufferHandle().orElseThrow());
+    assertEquals(draw, tracker.drawFramebufferHandle().orElseThrow());
+  }
+
+  @Test
   void isBoundedAndRejectsMoreThanEightColorTargets() {
     IrisGlStateTracker tracker = new IrisGlStateTracker(1, 1, 1);
     tracker.registerProgram(1);
