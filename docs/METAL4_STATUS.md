@@ -30,6 +30,29 @@ claim.
 | External display reconnect | Not validated; outside stable scope |
 | Real presented 200 Hz | Not validated; outside stable scope |
 
+## Post-`0.3.0` display lifecycle follow-up
+
+The development branch now has an explicit GLFW display-state observer and a
+display-only native reset. Monitor topology, active monitor, backing scale,
+framebuffer size, visibility/iconification, window recreation and a likely
+sleep/wake gap invalidate the presentation bridge fail-open. Translation,
+pipeline archives, in-flight graph presentation tokens, persistent graph
+attachments and resident Metal inputs remain intact.
+
+Cold and warm exact-JAR runs passed on the active 200 Hz VX24G10. Around the
+actual Minecraft `GlSurface.present()` call, 600 samples measured 199.53 Hz
+and 198.71 Hz respectively; p50 stayed at 5.000/5.016 ms, with zero >=100 ms
+stalls and zero Metal ownership failures. The passing profile is explicitly
+`software-paced-vsync-off`: it verifies a high-refresh path rather than a
+60 Hz clamp, but not guaranteed or VSync-synchronised 200 Hz scanout.
+
+Only one 1x display was exposed to GLFW during the run. The implementation and
+strict QA gates for a 2x framebuffer and two-monitor migration are present,
+but those gates cannot pass until a Retina/second display is active. The
+resume-gap recovery path is unit tested, while physical sleep/wake remains an
+unperformed hardware action. Exact evidence and reproduction commands are in
+[`DISPLAY_LIFECYCLE_QA.md`](DISPLAY_LIFECYCLE_QA.md).
+
 ## Production activation
 
 The complete Iris-to-Metal path defaults on only when all static conditions

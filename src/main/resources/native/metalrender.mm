@@ -11122,6 +11122,45 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nDiscardIrisMetal4F
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nResetIrisMetal4PresentationBindings(
+    JNIEnv *, jclass) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  CGLContextObj context = CGLGetCurrentContext();
+  if (context && (!g_irisMetal4CutoverGlBindings.empty() ||
+                  g_irisMetal4PendingCutoverSurface)) {
+    // Display transitions are rare. Complete outstanding GL reads before
+    // recycling their IOSurfaces, but preserve in-flight graph tokens and all
+    // persistent graph/input resources.
+    glFinish();
+  }
+  if (g_irisMetal4PendingCutoverSurface) {
+    if (!iris_metal4_recycle_graph_surface(
+            g_irisMetal4PendingCutoverSurface,
+            g_irisMetal4PendingCutoverWidth,
+            g_irisMetal4PendingCutoverHeight)) {
+      CFRelease(g_irisMetal4PendingCutoverSurface);
+    }
+    g_irisMetal4PendingCutoverSurface = nullptr;
+  }
+  g_irisMetal4PendingCutoverWidth = 0;
+  g_irisMetal4PendingCutoverHeight = 0;
+  for (auto &entry : g_irisMetal4CutoverGlBindings) {
+    IrisMetal4CutoverGlBinding &binding = entry.second;
+    if (context && binding.completionFence) {
+      glDeleteSync(binding.completionFence);
+      binding.completionFence = nullptr;
+    }
+    if (binding.surface && !iris_metal4_recycle_graph_surface(
+            binding.surface, binding.width, binding.height)) {
+      CFRelease(binding.surface);
+    }
+    binding.surface = nullptr;
+  }
+  g_irisMetal4CutoverGlBindings.clear();
+  g_metal4DrawPathActive.store(false, std::memory_order_release);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nResetIrisMetal4FinalCutoverSurface(
     JNIEnv *, jclass) {
   std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);

@@ -5,6 +5,8 @@ import com.pebbles_boon.metalrender.command.MetalRenderCommands;
 import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.culling.AsyncCullTask;
+import com.pebbles_boon.metalrender.display.DisplayLifecycleTracker;
+import com.pebbles_boon.metalrender.display.DisplayPresentationTracker;
 import com.pebbles_boon.metalrender.gui.MetalDebugEntry;
 import com.pebbles_boon.metalrender.gui.MetalRenderProfilerOverlay;
 import com.pebbles_boon.metalrender.gui.MetalRenderSettingsScreen;
@@ -89,6 +91,7 @@ public class MetalRenderClient implements ClientModInitializer {
         cfgSyncPending = false;
         syncCfg(mc);
       }
+      pollDisplayLifecycle(mc);
       applyDeferredRuntimeChanges(mc);
       requestDisplayTargetRefreshIfNeeded();
       applyFpsPriorityMode(mc);
@@ -569,6 +572,42 @@ public class MetalRenderClient implements ClientModInitializer {
     }
   }
 
+  private static void pollDisplayLifecycle(Minecraft minecraft) {
+    if (minecraft == null || minecraft.getWindow() == null) {
+      return;
+    }
+    DisplayLifecycleTracker.DisplayTransition transition;
+    try {
+      transition = DisplayLifecycleTracker.poll(minecraft.getWindow());
+    } catch (RuntimeException | LinkageError error) {
+      MetalLogger.warn("display lifecycle detection failed: %s",
+          error.getMessage());
+      return;
+    }
+    if (!transition.changed() || transition.initialized()) {
+      return;
+    }
+    if (transition.requiresRuntimeRefresh()) {
+      runtimeApplyPending = true;
+      displayTargetPollTicks = 0;
+    }
+    if (transition.requiresPresentationReset()) {
+      IrisTranslationCoordinator.invalidateDisplayPresentation(
+          transition.reason());
+      if (renderer != null) {
+        renderer.refreshRuntimeScale(minecraft.getWindow().getWidth(),
+            minecraft.getWindow().getHeight());
+      }
+    }
+    DisplayLifecycleTracker.DisplayState state = transition.current();
+    MetalLogger.info(
+        "display transition=%s monitor=%s refresh=%dHz window=%dx%d framebuffer=%dx%d scale=%.2fx%.2f",
+        transition.reason(), state.monitorName(), state.refreshRate(),
+        state.windowWidth(), state.windowHeight(), state.framebufferWidth(),
+        state.framebufferHeight(), state.framebufferScaleX(),
+        state.framebufferScaleY());
+  }
+
   private static void shutdownRenderer() {
     if (worldRenderer != null) {
       drainRenderer();
@@ -612,6 +651,8 @@ public class MetalRenderClient implements ClientModInitializer {
     metalUp = false;
     displayTargetPollTicks = 0;
     lastConfiguredTargetFrameRate = -1;
+    DisplayLifecycleTracker.reset();
+    DisplayPresentationTracker.reset();
   }
 
   private static void shutdownForClientExit() {

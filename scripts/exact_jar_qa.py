@@ -44,6 +44,8 @@ SUPPORTED_BACKENDS = ("metal4", "metal3")
 SUPPORTED_PERFORMANCE_SIDES = ("opengl", "metal")
 MINIMUM_PERFORMANCE_SAMPLES = 600
 MAXIMUM_PERFORMANCE_SAMPLES = 36_000
+MINIMUM_PRESENTATION_SAMPLES = 120
+MAXIMUM_PRESENTATION_SAMPLES = 5_000
 LIFECYCLE_MINIMUM_PRESENTATIONS = 80
 LIFECYCLE_MAXIMUM_INVALIDATIONS = 16
 QA_MOD_ID = "metalrender-exact-jar-qa"
@@ -614,10 +616,16 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         performance_side = args.performance_side or ""
         performance_samples = (
             args.performance_samples if performance_side else 0)
+        hardware_display = args.hardware_display
+        presentation_samples = (
+            args.presentation_samples if hardware_display else 0)
+        minimum_refresh_hz = (
+            args.minimum_refresh_hz if hardware_display else 0)
         (game / "options.txt").write_text(
-            f"enableVsync:{'false' if performance_side else 'true'}\n"
+            f"enableVsync:{'false' if performance_side or hardware_display else 'true'}\n"
             "fullscreen:false\n"
-            f"maxFps:{260 if performance_side else 60}\n"
+            f"maxFps:{260 if performance_side or hardware_display else 60}\n"
+            f"inactivityFpsLimit:{'\"minimized\"' if hardware_display else '\"afk\"'}\n"
             "renderDistance:8\n"
             "simulationDistance:5\n"
             "pauseOnLostFocus:false\n"
@@ -647,10 +655,15 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             require_graph_ownership=args.require_graph_ownership,
             performance_side=performance_side,
             performance_samples=performance_samples,
+            hardware_display=hardware_display,
+            require_retina=args.require_retina,
+            require_display_migration=args.require_display_migration,
+            minimum_refresh_hz=minimum_refresh_hz,
+            presentation_samples=presentation_samples,
         )
 
         manifest = {
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "status": "PREPARED",
             "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
             "networkDownloadsRequired": False,
@@ -665,6 +678,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "graphOwnershipRequired": args.require_graph_ownership,
             "performanceSide": performance_side,
             "performanceSamples": performance_samples,
+            "hardwareDisplay": hardware_display,
+            "requireRetina": args.require_retina,
+            "requireDisplayMigration": args.require_display_migration,
+            "minimumRefreshHz": minimum_refresh_hz,
+            "presentationSamples": presentation_samples,
             "irisMetalActivation": (
                 "packaged-stable-default"
                 if uses_packaged_stable_iris_metal_defaults(
@@ -772,7 +790,7 @@ def artifact_record(path: Path, metadata: dict[str, Any]) -> dict[str, str]:
 
 
 def verify_prepared_runtime(manifest: dict[str, Any]) -> None:
-    if (manifest.get("schemaVersion") != 3
+    if (manifest.get("schemaVersion") != 4
             or manifest.get("status") != "PREPARED"):
         raise HarnessError("prepared manifest has an unsupported schema/status")
     backend = manifest.get("qaBackend")
@@ -813,6 +831,31 @@ def verify_prepared_runtime(manifest: dict[str, Any]) -> None:
                  or manifest["graphOwnershipRequired"])):
         raise HarnessError(
             "prepared OpenGL performance profile is not Metal 3 fallback")
+    hardware_display = manifest.get("hardwareDisplay")
+    require_retina = manifest.get("requireRetina")
+    require_display_migration = manifest.get("requireDisplayMigration")
+    minimum_refresh_hz = manifest.get("minimumRefreshHz")
+    presentation_samples = manifest.get("presentationSamples")
+    if (type(hardware_display) is not bool
+            or type(require_retina) is not bool
+            or type(require_display_migration) is not bool
+            or type(minimum_refresh_hz) is not int
+            or type(presentation_samples) is not int):
+        raise HarnessError(
+            "prepared manifest has an invalid hardware display profile")
+    if hardware_display:
+        if (backend != "metal4" or not manifest["graphOwnershipRequired"]
+                or performance_side != ""
+                or minimum_refresh_hz < 0
+                or not MINIMUM_PRESENTATION_SAMPLES
+                    <= presentation_samples
+                    <= MAXIMUM_PRESENTATION_SAMPLES):
+            raise HarnessError(
+                "prepared hardware display profile is inconsistent")
+    elif (require_retina or require_display_migration
+          or minimum_refresh_hz != 0 or presentation_samples != 0):
+        raise HarnessError(
+            "prepared non-hardware profile contains display requirements")
     release = manifest.get("release")
     if not isinstance(release, dict):
         raise HarnessError("prepared manifest has no release attestation")
@@ -1872,6 +1915,67 @@ def stage9_lifecycle_is_valid(value: Any) -> bool:
     )
 
 
+def hardware_display_is_valid(
+    value: Any,
+    require_retina: bool,
+    require_display_migration: bool,
+    minimum_refresh_hz: int,
+    expected_samples: int,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    reported_refresh = value.get("reportedRefreshHz")
+    measured_refresh = value.get("measuredPresentationHz")
+    p50 = value.get("presentationIntervalP50Nanos")
+    p95 = value.get("presentationIntervalP95Nanos")
+    p99 = value.get("presentationIntervalP99Nanos")
+    if (type(reported_refresh) is not int or reported_refresh <= 0
+            or not isinstance(measured_refresh, (int, float))
+            or type(measured_refresh) is bool or measured_refresh <= 0
+            or type(p50) is not int or type(p95) is not int
+            or type(p99) is not int or not 0 < p50 <= p95 <= p99):
+        return False
+    expected_period = 1_000_000_000 / reported_refresh
+    required_cadence = minimum_refresh_hz or reported_refresh
+    retina_valid = (
+        value.get("retinaRequired") is require_retina
+        and (not require_retina or (
+            value.get("retinaPassed") is True
+            and isinstance(value.get("retinaMonitor"), str)
+            and value.get("retinaFramebufferScaleX", 0) >= 1.5
+            and value.get("retinaFramebufferScaleY", 0) >= 1.5
+        ))
+    )
+    return (
+        value.get("schemaVersion") == 1
+        and value.get("status") == "PASS"
+        and type(value.get("connectedDisplays")) is int
+        and value["connectedDisplays"] >= (2 if require_display_migration else 1)
+        and value.get("displayMigrationRequired") is require_display_migration
+        and (not require_display_migration
+             or value.get("displayMigrationPassed") is True)
+        and retina_valid
+        and value.get("minimumRefreshHz") == minimum_refresh_hz
+        and reported_refresh >= max(1, minimum_refresh_hz)
+        and isinstance(value.get("refreshMonitor"), str)
+        and value.get("presentationMode") == "software-paced-vsync-off"
+        and value.get("presentationSamples") == expected_samples
+        and p50 <= round(expected_period * 1.35)
+        and p95 <= round(expected_period * 3.0)
+        and measured_refresh >= required_cadence * 0.80
+        and type(value.get("presentCallP50Nanos")) is int
+        and value["presentCallP50Nanos"] > 0
+        and value.get("presentationStutters") == 0
+        and type(value.get("ownershipPresentationDelta")) is int
+        and value["ownershipPresentationDelta"] >= expected_samples
+        and type(value.get("displayTransitionDelta")) is int
+        and value["displayTransitionDelta"] > 0
+        and type(value.get("displayResetDelta")) is int
+        and value["displayResetDelta"] > 0
+        and value.get("ownershipFailureDelta") == 0
+    )
+
+
 def percentile_nanos(values: list[int], percentile: int) -> int:
     ordered = sorted(values)
     index = (percentile * len(ordered) + 99) // 100 - 1
@@ -1944,6 +2048,11 @@ def build_launch_command(
     require_graph_ownership: bool,
     performance_side: str,
     performance_samples: int,
+    hardware_display: bool,
+    require_retina: bool,
+    require_display_migration: bool,
+    minimum_refresh_hz: int,
+    presentation_samples: int,
 ) -> list[str]:
     game = runtime / "game"
     natives = runtime / "natives"
@@ -1976,6 +2085,16 @@ def build_launch_command(
         f"{runtime / 'evidence' / 'performance-result.json'}",
         f"-Dmetalrender.exactJar.performanceSide={performance_side}",
         f"-Dmetalrender.exactJar.performanceSamples={performance_samples}",
+        "-Dmetalrender.exactJar.hardwareDisplay="
+        f"{'true' if hardware_display else 'false'}",
+        f"-Dmetalrender.exactJar.hardwareDisplayEvidencePath="
+        f"{runtime / 'evidence' / 'hardware-display-result.json'}",
+        "-Dmetalrender.exactJar.requireRetina="
+        f"{'true' if require_retina else 'false'}",
+        "-Dmetalrender.exactJar.requireDisplayMigration="
+        f"{'true' if require_display_migration else 'false'}",
+        f"-Dmetalrender.exactJar.minimumRefreshHz={minimum_refresh_hz}",
+        f"-Dmetalrender.exactJar.presentationSamples={presentation_samples}",
         f"-Dmetalrender.exactJar.shaderPack={shader_pack}",
         "-Dmetalrender.exactJar.fastIrisDrain=true",
         "-Dmetalrender.exactJar.diagnosticDisableFinalCutover=false",
@@ -2407,6 +2526,24 @@ def run_harness(
                 != requested_performance_samples):
         raise HarnessError(
             "requested performance profile does not match prepared runtime")
+    hardware_display = manifest.get("hardwareDisplay", False)
+    requested_hardware_display = args.hardware_display
+    requested_presentation_samples = (
+        args.presentation_samples if requested_hardware_display else 0)
+    requested_minimum_refresh_hz = (
+        args.minimum_refresh_hz if requested_hardware_display else 0)
+    if (hardware_display is not requested_hardware_display
+            or manifest.get("requireRetina", False) is not
+                args.require_retina
+            or manifest.get("requireDisplayMigration", False) is not
+                args.require_display_migration
+            or manifest.get("minimumRefreshHz", 0)
+                != requested_minimum_refresh_hz
+            or manifest.get("presentationSamples", 0)
+                != requested_presentation_samples):
+        raise HarnessError(
+            "requested hardware display profile does not match prepared "
+            "runtime")
     log_path = (
         runtime / "evidence" / f"client-{cache_expectation}.log")
     result_path = (
@@ -2425,8 +2562,13 @@ def run_harness(
         runtime / "evidence" /
         f"performance-result-{cache_expectation}.json"
     )
+    hardware_display_result_path = (
+        runtime / "evidence" /
+        f"hardware-display-result-{cache_expectation}.json"
+    )
     for stale in (driver_result_path, lifecycle_result_path,
-                  performance_result_path, result_path):
+                  performance_result_path, hardware_display_result_path,
+                  result_path):
         stale.unlink(missing_ok=True)
     for stale in (runtime / "game" / "screenshots").glob(
             f"*metalrender-exact-jar-{cache_expectation}-*.png"):
@@ -2449,6 +2591,25 @@ def run_harness(
     command = replace_system_property(
         command, "metalrender.exactJar.performanceSamples",
         str(manifest["performanceSamples"]))
+    command = replace_system_property(
+        command, "metalrender.exactJar.hardwareDisplay",
+        "true" if hardware_display else "false")
+    command = replace_system_property(
+        command, "metalrender.exactJar.hardwareDisplayEvidencePath",
+        str(hardware_display_result_path))
+    command = replace_system_property(
+        command, "metalrender.exactJar.requireRetina",
+        "true" if manifest.get("requireRetina", False) else "false")
+    command = replace_system_property(
+        command, "metalrender.exactJar.requireDisplayMigration",
+        "true" if manifest.get("requireDisplayMigration", False)
+        else "false")
+    command = replace_system_property(
+        command, "metalrender.exactJar.minimumRefreshHz",
+        str(manifest.get("minimumRefreshHz", 0)))
+    command = replace_system_property(
+        command, "metalrender.exactJar.presentationSamples",
+        str(manifest.get("presentationSamples", 0)))
     command = replace_system_property(
         command, "metalrender.exactJar.backend", backend)
     command = replace_system_property(
@@ -2591,6 +2752,10 @@ def run_harness(
         read_json(performance_result_path)
         if performance_result_path.is_file() else None
     )
+    hardware_display_result = (
+        read_json(hardware_display_result_path)
+        if hardware_display_result_path.is_file() else None
+    )
     screenshots = sorted(
         (runtime / "game" / "screenshots").glob(
             f"*metalrender-exact-jar-{cache_expectation}-*.png")
@@ -2731,6 +2896,14 @@ def run_harness(
             or stage9_performance_is_valid(
                 performance_result, performance_side,
                 manifest["performanceSamples"]),
+        "hardwareDisplayValidated":
+            (not hardware_display and hardware_display_result is None)
+            or hardware_display_is_valid(
+                hardware_display_result,
+                manifest.get("requireRetina", False),
+                manifest.get("requireDisplayMigration", False),
+                manifest.get("minimumRefreshHz", 0),
+                manifest.get("presentationSamples", 0)),
         "stage9LifecycleLogged":
             not graph_ownership_required
             or "METALRENDER_STAGE9_LIFECYCLE PASS" in log_text,
@@ -2738,6 +2911,9 @@ def run_harness(
             performance_side == ""
             or ("METALRENDER_STAGE9_PERFORMANCE PASS side="
                 + performance_side) in log_text,
+        "hardwareDisplayLogged":
+            not hardware_display
+            or "METALRENDER_HARDWARE_DISPLAY PASS" in log_text,
         "metalPipelineCacheCompleted":
             metal_pipeline_cache_is_complete(
                 metal_pipeline_cache, backend, cache_expectation),
@@ -2751,7 +2927,7 @@ def run_harness(
             release_source_matches(manifest),
     }
     run_result = {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "cacheExpectation": cache_expectation,
         "qaBackend": backend,
         "status": "PASS" if all(checks.values()) else "FAIL",
@@ -2763,6 +2939,7 @@ def run_harness(
         "driverResult": driver_result,
         "stage9Lifecycle": lifecycle_result,
         "stage9Performance": performance_result,
+        "hardwareDisplay": hardware_display_result,
         "prepareManifest": {
             "path": str(manifest_path),
             "sha256": sha256(manifest_path),
@@ -2846,6 +3023,41 @@ def parser() -> argparse.ArgumentParser:
             "raw CPU/GPU samples for a matched performance side "
             f"({MINIMUM_PERFORMANCE_SAMPLES}-"
             f"{MAXIMUM_PERFORMANCE_SAMPLES})"
+        ),
+    )
+    result.add_argument(
+        "--hardware-display", action="store_true",
+        help=(
+            "run exact-JAR Retina, monitor migration, display lifecycle and "
+            "real window-presentation cadence QA; requires Metal 4 full "
+            "graph ownership"
+        ),
+    )
+    result.add_argument(
+        "--require-retina", action="store_true",
+        help=(
+            "require migration to a connected display with a 2x-class "
+            "content and framebuffer scale"
+        ),
+    )
+    result.add_argument(
+        "--require-display-migration", action="store_true",
+        help="require the QA window to visit two distinct connected displays",
+    )
+    result.add_argument(
+        "--minimum-refresh-hz", type=positive_int, default=0,
+        help=(
+            "minimum active display refresh for hardware cadence QA "
+            "(for example 200)"
+        ),
+    )
+    result.add_argument(
+        "--presentation-samples", type=presentation_sample_count,
+        default=600,
+        help=(
+            "completed GLFW window presentations retained for hardware QA "
+            f"({MINIMUM_PRESENTATION_SAMPLES}-"
+            f"{MAXIMUM_PRESENTATION_SAMPLES})"
         ),
     )
     result.add_argument(
@@ -2958,6 +3170,16 @@ def performance_sample_count(value: str) -> int:
     return parsed
 
 
+def presentation_sample_count(value: str) -> int:
+    parsed = positive_int(value)
+    if not MINIMUM_PRESENTATION_SAMPLES <= parsed <= MAXIMUM_PRESENTATION_SAMPLES:
+        raise argparse.ArgumentTypeError(
+            "must be between "
+            f"{MINIMUM_PRESENTATION_SAMPLES} and "
+            f"{MAXIMUM_PRESENTATION_SAMPLES}")
+    return parsed
+
+
 def nonnegative_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -3001,6 +3223,22 @@ def main() -> int:
                      or args.require_graph_ownership)):
             raise HarnessError(
                 "--performance-side opengl requires --backend metal3")
+        if args.hardware_display and (
+                args.backend != "metal4"
+                or not args.require_graph_ownership):
+            raise HarnessError(
+                "--hardware-display requires --backend metal4 "
+                "--require-graph-ownership")
+        if args.hardware_display and args.performance_side:
+            raise HarnessError(
+                "--hardware-display cannot share --performance-side")
+        if not args.hardware_display and (
+                args.require_retina
+                or args.require_display_migration
+                or args.minimum_refresh_hz != 0):
+            raise HarnessError(
+                "Retina, display migration and refresh requirements need "
+                "--hardware-display")
         with runtime_lock(Path(args.runtime_dir)):
             runtime = safe_runtime_path(Path(args.runtime_dir))
             manifest_path = runtime / "prepare-manifest.json"
@@ -3029,6 +3267,21 @@ def main() -> int:
                             != requested_performance_samples):
                     raise HarnessError(
                         "warm performance profile does not match the "
+                        "prepared runtime")
+                if (manifest.get("hardwareDisplay") is not
+                        args.hardware_display
+                        or manifest.get("requireRetina") is not
+                        args.require_retina
+                        or manifest.get("requireDisplayMigration") is not
+                        args.require_display_migration
+                        or manifest.get("minimumRefreshHz") != (
+                            args.minimum_refresh_hz
+                            if args.hardware_display else 0)
+                        or manifest.get("presentationSamples") != (
+                            args.presentation_samples
+                            if args.hardware_display else 0)):
+                    raise HarnessError(
+                        "warm hardware display profile does not match the "
                         "prepared runtime")
                 runtime_jar = require_file(
                     Path(manifest["release"]["runtimePath"]),

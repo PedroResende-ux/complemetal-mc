@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Display lifecycle and high-refresh QA
+
+- Observe GLFW monitor topology, window migration/recreation, framebuffer and
+  content-scale changes, refresh rate, visibility/iconification and likely
+  wake gaps; invalidate only the display-facing cutover bridge while retaining
+  translated shaders, Metal pipelines, persistent graph resources and
+  in-flight graph tokens.
+- Measure completed Minecraft `GlSurface.present()` calls in a bounded tracker
+  and add strict exact-JAR gates for Retina backing, two-display migration and
+  minimum-refresh cadence.
+- Pass cold and warm 600-sample high-refresh runs in a 200 Hz VX24G10 mode at
+  199.53 Hz and 198.71 Hz, with p50 intervals of 5.000/5.016 ms, zero >=100 ms
+  stalls and zero ownership failures. Sustained/native VSync-synchronised
+  200 Hz scanout is not claimed.
+- Fix display-only reset destroying active graph presentation tokens during a
+  resize/lifecycle transition, and fix cadence accounting after a GLFW window
+  replacement.
+- Add unit-tested exact-JAR lifecycle/hardware validators to the normal Gradle
+  `check` task. The exact-JAR manifest/result schema is now version 4.
+
 ## 0.3.0+mc26.2
 
 ### Stable Stage 9 Iris-to-Metal 4 renderer

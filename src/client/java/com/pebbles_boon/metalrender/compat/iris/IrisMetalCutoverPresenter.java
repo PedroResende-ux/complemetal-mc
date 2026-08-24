@@ -203,17 +203,37 @@ final class IrisMetalCutoverPresenter {
       if (NativeBridge.isLibLoaded()) {
         NativeBridge.nResetIrisMetal4FinalCutoverSurface();
       }
-      if (readFramebuffer != 0) {
-        GL30C.glDeleteFramebuffers(readFramebuffer);
-      }
-      for (int texture : rectangleTextures) {
-        if (texture != 0) {
-          GL11C.glDeleteTextures(texture);
-        }
-      }
+      releaseGlResources();
     } catch (RuntimeException | LinkageError ignored) {
       // A lost context or unloaded native payload already owns cleanup.
     }
+    clearState();
+  }
+
+  synchronized void resetPresentationBindings() {
+    try {
+      if (NativeBridge.isLibLoaded()) {
+        NativeBridge.nResetIrisMetal4PresentationBindings();
+      }
+      releaseGlResources();
+    } catch (RuntimeException | LinkageError ignored) {
+      // A display transition can race a lost context; fail open and rebuild.
+    }
+    clearState();
+  }
+
+  private void releaseGlResources() {
+    if (readFramebuffer != 0) {
+      GL30C.glDeleteFramebuffers(readFramebuffer);
+    }
+    for (int texture : rectangleTextures) {
+      if (texture != 0) {
+        GL11C.glDeleteTextures(texture);
+      }
+    }
+  }
+
+  private void clearState() {
     readFramebuffer = 0;
     java.util.Arrays.fill(rectangleTextures, 0);
     nextSurfaceSlot = 0;

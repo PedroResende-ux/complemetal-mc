@@ -234,6 +234,17 @@ def checkJniParity = tasks.register("checkJniParity", Exec) {
     commandLine "bash", file("scripts/check_jni_parity.sh").absolutePath
 }
 
+def testExactJarQaValidators = tasks.register("testExactJarQaValidators", Exec) {
+    group = "verification"
+    description = "Runs unit tests for exact-JAR evidence validators."
+
+    inputs.file("scripts/exact_jar_qa.py")
+    inputs.file("scripts/test_exact_jar_qa.py")
+
+    commandLine "python3", "-m", "unittest",
+        "discover", "-s", "scripts", "-p", "test_exact_jar_qa.py"
+}
+
 def releaseJar = tasks.named("jar")
 
 def verifyReleaseJar = tasks.register("verifyReleaseJar", Exec) {
@@ -255,6 +266,7 @@ def verifyReleaseJar = tasks.register("verifyReleaseJar", Exec) {
 
 tasks.named("check") {
     dependsOn checkJniParity
+    dependsOn testExactJarQaValidators
 }
 
 tasks.register("releaseCheck") {

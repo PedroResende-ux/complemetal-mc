@@ -781,6 +781,12 @@ public final class NativeBridge {
   /** Drops a promoted surface that was not consumed by a GL binding. */
   public static native boolean nDiscardIrisMetal4FinalCutoverSurface();
 
+  /**
+   * Clears display-facing GL/IOSurface bindings without destroying graph
+   * resources, resident inputs or in-flight presentation tokens.
+   */
+  public static native void nResetIrisMetal4PresentationBindings();
+
   /** Releases calling-thread cutover surfaces after the GL texture is gone. */
   public static native void nResetIrisMetal4FinalCutoverSurface();
 

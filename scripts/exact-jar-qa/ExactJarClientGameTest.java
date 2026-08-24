@@ -9,6 +9,8 @@ import com.pebbles_boon.metalrender.compat.iris.IrisShaderCapture;
 import com.pebbles_boon.metalrender.compat.iris.IrisMetalFeatureFlags;
 import com.pebbles_boon.metalrender.compat.iris.IrisStage9PerformanceSampler;
 import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
+import com.pebbles_boon.metalrender.display.DisplayLifecycleTracker;
+import com.pebbles_boon.metalrender.display.DisplayPresentationTracker;
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import com.pebbles_boon.metalrender.render.MetalRenderHookState;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
@@ -21,15 +23,18 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.Locale;
+import java.util.List;
 import java.util.Set;
 import javax.imageio.ImageIO;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.InactivityFpsLimit;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.api.v0.IrisApi;
 import org.lwjgl.glfw.GLFW;
@@ -49,6 +54,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
   private static final long PERFORMANCE_STUTTER_NANOS = 100_000_000L;
   private static final int LIFECYCLE_PRESENTATIONS_PER_TRANSITION = 20;
   private static final int MAXIMUM_LIFECYCLE_INVALIDATIONS = 16;
+  private static final int MINIMUM_PRESENTATION_SAMPLES = 120;
+  private static final int MAXIMUM_PRESENTATION_SAMPLES = 5_000;
   private static volatile long lastReadinessDiagnosticNanos;
 
   @Override
@@ -133,6 +140,26 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     require(!performanceSide.equals("opengl")
             || !expectMetal4 && !requireGraphOwnership,
         "OpenGL performance capture requires the Metal 3 fallback profile");
+    boolean hardwareDisplay = Boolean.getBoolean(
+        "metalrender.exactJar.hardwareDisplay");
+    boolean requireRetina = Boolean.getBoolean(
+        "metalrender.exactJar.requireRetina");
+    boolean requireDisplayMigration = Boolean.getBoolean(
+        "metalrender.exactJar.requireDisplayMigration");
+    int minimumRefreshHz = integerProperty(
+        "metalrender.exactJar.minimumRefreshHz", 0);
+    int presentationSamples = integerProperty(
+        "metalrender.exactJar.presentationSamples", 0);
+    require(!hardwareDisplay || expectMetal4 && requireGraphOwnership,
+        "hardware display QA requires full Metal 4 graph ownership");
+    require(!hardwareDisplay || performanceSide.isEmpty(),
+        "hardware display QA cannot share the uncapped performance profile");
+    require(hardwareDisplay
+            ? presentationSamples >= MINIMUM_PRESENTATION_SAMPLES
+                && presentationSamples <= MAXIMUM_PRESENTATION_SAMPLES
+            : presentationSamples == 0 && minimumRefreshHz == 0
+                && !requireRetina && !requireDisplayMigration,
+        "invalid hardware display QA profile");
     require(expectedSha.equals(sha256(exactJar)),
         "loaded release JAR SHA-256 differs from the prepared artifact");
     require(System.getProperty("java.version", "").startsWith("25."),
@@ -421,6 +448,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           acceptanceStatus.visualParity();
       requireVisualParity(visualParityStatus, expectMetal4);
       LifecycleEvidence lifecycleEvidence = LifecycleEvidence.notRequired();
+      HardwareDisplayEvidence hardwareDisplayEvidence =
+          HardwareDisplayEvidence.notRequired();
       if (expectMetal4) {
         if (requireGraphOwnership) {
           context.waitFor(client -> {
@@ -431,6 +460,12 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           }, SHADER_TIMEOUT_TICKS);
           lifecycleEvidence = verifyStage9WindowLifecycle(context);
           writeLifecycleEvidence(lifecycleEvidence);
+          if (hardwareDisplay) {
+            hardwareDisplayEvidence = verifyHardwareDisplays(context,
+                requireRetina, requireDisplayMigration, minimumRefreshHz,
+                presentationSamples);
+            writeHardwareDisplayEvidence(hardwareDisplayEvidence);
+          }
         } else {
           context.waitFor(client -> {
             IrisTranslationCoordinator.CutoverStatus cutover =
@@ -474,6 +509,9 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         requireFinalCutover(cutoverStatus, true, true);
         require(lifecycleEvidence.status().equals("PASS"),
             "Stage 9 lifecycle evidence was not completed");
+        require(!hardwareDisplay
+                || hardwareDisplayEvidence.status().equals("PASS"),
+            "hardware display evidence was not completed");
       }
       System.out.println("[MetalRender exact-JAR] programs="
           + translationStatus.attempted() + ", stages="
@@ -1495,6 +1533,253 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         invalidationDelta, completed.ownershipFailures() - failures);
   }
 
+  private static HardwareDisplayEvidence verifyHardwareDisplays(
+      ClientGameTestContext context, boolean requireRetina,
+      boolean requireDisplayMigration, int minimumRefreshHz,
+      int requestedSamples) {
+    List<DisplayLifecycleTracker.DisplayTarget> displays =
+        context.computeOnClient(client -> DisplayLifecycleTracker.displays());
+    require(!displays.isEmpty(),
+        "hardware display QA found no GLFW monitors");
+    WindowPlacement original = context.computeOnClient(client -> {
+      Window window = client.getWindow();
+      DisplayLifecycleTracker.DisplayState state =
+          DisplayLifecycleTracker.status().state();
+      require(state != null && state.monitorHandle() != 0,
+          "display lifecycle tracker has no active monitor");
+      return new WindowPlacement(window.getX(), window.getY(),
+          window.getScreenWidth(), window.getScreenHeight(),
+          client.options.framerateLimit().get(),
+          client.options.enableVsync().get(),
+          client.options.inactivityFpsLimit().get(), state.monitorHandle());
+    });
+    IrisTranslationCoordinator.FullGraphStatus ownershipStart =
+        currentFullGraphStatus(context);
+    long failureBaseline = ownershipStart.ownershipFailures();
+    DisplayLifecycleTracker.Status lifecycleStart =
+        context.computeOnClient(client -> DisplayLifecycleTracker.status());
+    Set<Long> visitedMonitors = new HashSet<>();
+    visitedMonitors.add(original.monitorHandle());
+
+    DisplayLifecycleTracker.DisplayTarget retinaTarget = displays.stream()
+        .max(Comparator.comparingDouble(target -> Math.min(
+            target.contentScaleX(), target.contentScaleY())))
+        .orElseThrow();
+    double retinaScaleX = 0.0;
+    double retinaScaleY = 0.0;
+    String retinaMonitor = "not-required";
+    boolean retinaPassed = false;
+    if (requireRetina) {
+      require(retinaTarget.contentScaleX() >= 1.5F
+              && retinaTarget.contentScaleY() >= 1.5F,
+          "no 2x-class Retina display is currently connected");
+      DisplayLifecycleTracker.DisplayState retinaState = moveToDisplay(
+          context, retinaTarget, failureBaseline, "Retina migration");
+      visitedMonitors.add(retinaState.monitorHandle());
+      retinaScaleX = retinaState.framebufferScaleX();
+      retinaScaleY = retinaState.framebufferScaleY();
+      retinaMonitor = retinaState.monitorName();
+      retinaPassed = retinaState.contentScaleX() >= 1.5F
+          && retinaState.contentScaleY() >= 1.5F
+          && retinaScaleX >= 1.5 && retinaScaleY >= 1.5;
+      require(retinaPassed,
+          "Retina monitor did not produce a 2x-class framebuffer: content="
+              + retinaState.contentScaleX() + "x"
+              + retinaState.contentScaleY() + " framebuffer="
+              + retinaScaleX + "x" + retinaScaleY);
+    }
+
+    DisplayLifecycleTracker.DisplayTarget refreshTarget = displays.stream()
+        .max(Comparator.comparingInt(
+            DisplayLifecycleTracker.DisplayTarget::refreshRate))
+        .orElseThrow();
+    if (minimumRefreshHz > 0) {
+      require(refreshTarget.refreshRate() >= minimumRefreshHz,
+          "no display meets the requested refresh rate: required "
+              + minimumRefreshHz + " Hz, maximum connected "
+              + refreshTarget.refreshRate() + " Hz");
+    }
+    if (requireDisplayMigration && visitedMonitors.size() < 2) {
+      DisplayLifecycleTracker.DisplayTarget alternate = displays.stream()
+          .filter(target -> target.handle() != original.monitorHandle())
+          .findFirst().orElseThrow(() -> new AssertionError(
+              "display migration QA requires two connected monitors"));
+      DisplayLifecycleTracker.DisplayState alternateState = moveToDisplay(
+          context, alternate, failureBaseline, "monitor migration");
+      visitedMonitors.add(alternateState.monitorHandle());
+    }
+    DisplayLifecycleTracker.DisplayState refreshState = moveToDisplay(
+        context, refreshTarget, failureBaseline, "high-refresh migration");
+    visitedMonitors.add(refreshState.monitorHandle());
+    require(!requireDisplayMigration || visitedMonitors.size() >= 2,
+        "window did not migrate between two distinct displays");
+
+    int requestedFpsCap = Math.min(260,
+        Math.max(30, Math.max(minimumRefreshHz,
+            refreshTarget.refreshRate())));
+    context.runOnClient(client -> {
+      client.options.enableVsync().set(false);
+      client.options.framerateLimit().set(requestedFpsCap);
+      client.getFramerateLimitTracker().setFramerateLimit(requestedFpsCap);
+      client.options.inactivityFpsLimit().set(InactivityFpsLimit.MINIMIZED);
+      GLFW.glfwFocusWindow(client.getWindow().handle());
+    });
+    context.waitFor(client -> !client.options.enableVsync().get()
+        && client.options.framerateLimit().get() == requestedFpsCap
+        && MetalRenderClient.effectiveTargetFrameRate()
+            >= Math.max(30, minimumRefreshHz), WORLD_TIMEOUT_TICKS);
+    context.waitTicks(80);
+    IrisTranslationCoordinator.FullGraphStatus cadenceOwnershipStart =
+        currentFullGraphStatus(context);
+    context.runOnClient(client -> DisplayPresentationTracker.reset());
+    context.waitFor(client ->
+        DisplayPresentationTracker.snapshot().completionIntervalsNanos().length
+            >= requestedSamples, SHADER_TIMEOUT_TICKS);
+    DisplayPresentationTracker.Snapshot presentation =
+        context.computeOnClient(
+            client -> DisplayPresentationTracker.snapshot());
+    long[] intervals = tail(presentation.completionIntervalsNanos(),
+        requestedSamples);
+    long[] durations = tail(presentation.presentDurationsNanos(),
+        requestedSamples);
+    long intervalP50 = percentile(intervals, 0.50);
+    long intervalP95 = percentile(intervals, 0.95);
+    long intervalP99 = percentile(intervals, 0.99);
+    long durationP50 = percentile(durations, 0.50);
+    long cadenceStutters = countAtLeast(intervals,
+        PERFORMANCE_STUTTER_NANOS);
+    double measuredHz = presentation.measuredPresentsPerSecond();
+    int reportedRefreshHz = refreshState.refreshRate();
+    double expectedPeriodNanos = 1_000_000_000.0 / reportedRefreshHz;
+    int requiredCadenceHz = minimumRefreshHz > 0
+        ? minimumRefreshHz : reportedRefreshHz;
+    require(presentation.invalidSamples() == 0,
+        "window presentation tracker rejected samples");
+    require(cadenceStutters == 0,
+        "window presentation cadence contains >=100 ms stalls");
+    require(intervalP50 <= Math.round(expectedPeriodNanos * 1.35),
+        "window median presentation interval does not match the active "
+            + reportedRefreshHz + " Hz display: " + intervalP50 + " ns");
+    require(intervalP95 <= Math.round(expectedPeriodNanos * 3.0),
+        "window p95 presentation interval is unstable for the active "
+            + reportedRefreshHz + " Hz display: " + intervalP95 + " ns");
+    require(measuredHz >= requiredCadenceHz * 0.80,
+        "measured window presentation rate is below 80% of requested "
+            + requiredCadenceHz + " Hz: " + measuredHz);
+    IrisTranslationCoordinator.FullGraphStatus cadenceOwnershipEnd =
+        currentFullGraphStatus(context);
+    long ownershipPresentationDelta =
+        cadenceOwnershipEnd.ownershipFramesPresented()
+            - cadenceOwnershipStart.ownershipFramesPresented();
+    require(ownershipPresentationDelta >= requestedSamples,
+        "Metal graph did not own every measured window presentation");
+    require(cadenceOwnershipEnd.ownershipFailures() == failureBaseline,
+        "Metal ownership failed during display cadence capture");
+
+    context.runOnClient(client -> {
+      Window window = client.getWindow();
+      client.options.framerateLimit().set(original.maxFps());
+      client.getFramerateLimitTracker().setFramerateLimit(original.maxFps());
+      client.options.enableVsync().set(original.vsync());
+      client.options.inactivityFpsLimit().set(original.inactivityFpsLimit());
+      window.setWindowed(original.width(), original.height());
+      GLFW.glfwSetWindowPos(window.handle(), original.x(), original.y());
+    });
+    context.waitFor(client -> {
+      DisplayLifecycleTracker.DisplayState state =
+          DisplayLifecycleTracker.status().state();
+      Window window = client.getWindow();
+      return state != null && state.monitorHandle() == original.monitorHandle()
+          && !window.isFullscreen()
+          && window.getScreenWidth() == original.width()
+          && window.getScreenHeight() == original.height();
+    }, WORLD_TIMEOUT_TICKS);
+    IrisTranslationCoordinator.FullGraphStatus restored =
+        waitForOwnershipAdvance(context,
+            cadenceOwnershipEnd.ownershipFramesPresented(), failureBaseline,
+            "hardware display restore");
+    DisplayLifecycleTracker.Status lifecycleEnd =
+        context.computeOnClient(client -> DisplayLifecycleTracker.status());
+    long displayTransitionDelta =
+        lifecycleEnd.transitions() - lifecycleStart.transitions();
+    long displayResetDelta =
+        lifecycleEnd.presentationResets()
+            - lifecycleStart.presentationResets();
+    require(displayTransitionDelta > 0 && displayResetDelta > 0,
+        "display lifecycle tracker did not observe hardware transitions");
+    require(restored.ownershipFailures() == failureBaseline,
+        "Metal ownership failed while restoring the original display");
+    boolean migrationPassed = requireDisplayMigration
+        && visitedMonitors.size() >= 2;
+    HardwareDisplayEvidence evidence = new HardwareDisplayEvidence("PASS",
+        displays.size(), requireDisplayMigration, migrationPassed,
+        requireRetina, retinaPassed, retinaMonitor, retinaScaleX,
+        retinaScaleY, minimumRefreshHz, reportedRefreshHz,
+        refreshState.monitorName(),
+        "software-paced-vsync-off", requestedSamples,
+        intervalP50, intervalP95, intervalP99, durationP50, measuredHz,
+        cadenceStutters, ownershipPresentationDelta,
+        displayTransitionDelta, displayResetDelta,
+        restored.ownershipFailures() - failureBaseline);
+    System.out.printf(Locale.ROOT,
+        "METALRENDER_HARDWARE_DISPLAY PASS displays=%d migration=%s "
+            + "retina=%s refresh=%dHz measured=%.2fHz samples=%d "
+            + "pacing=%s p50=%.3fms p95=%.3fms transitions=%d resets=%d%n",
+        evidence.connectedDisplays(),
+        evidence.displayMigrationRequired()
+            ? Boolean.toString(evidence.displayMigrationPassed())
+            : "not-required",
+        evidence.retinaRequired()
+            ? Boolean.toString(evidence.retinaPassed()) : "not-required",
+        evidence.reportedRefreshHz(),
+        evidence.measuredPresentationHz(), evidence.presentationSamples(),
+        evidence.presentationMode(),
+        nanosToMillis(evidence.presentationIntervalP50Nanos()),
+        nanosToMillis(evidence.presentationIntervalP95Nanos()),
+        evidence.displayTransitionDelta(), evidence.displayResetDelta());
+    return evidence;
+  }
+
+  private static DisplayLifecycleTracker.DisplayState moveToDisplay(
+      ClientGameTestContext context,
+      DisplayLifecycleTracker.DisplayTarget target, long failureBaseline,
+      String stage) {
+    long presentationBaseline =
+        currentFullGraphStatus(context).ownershipFramesPresented();
+    int width = Math.max(640, Math.min(960, target.workWidth() - 80));
+    int height = Math.max(360, Math.min(540, target.workHeight() - 80));
+    int x = target.workX() + Math.max(0, (target.workWidth() - width) / 2);
+    int y = target.workY() + Math.max(0, (target.workHeight() - height) / 2);
+    context.runOnClient(client -> {
+      Window window = client.getWindow();
+      if (window.isFullscreen()) {
+        window.toggleFullScreen();
+        window.updateFullscreenIfChanged();
+      }
+      window.setWindowed(width, height);
+      GLFW.glfwSetWindowPos(window.handle(), x, y);
+    });
+    context.waitFor(client -> {
+      DisplayLifecycleTracker.DisplayState state =
+          DisplayLifecycleTracker.status().state();
+      Window window = client.getWindow();
+      return state != null && state.monitorHandle() == target.handle()
+          && !window.isFullscreen() && window.getScreenWidth() == width
+          && window.getScreenHeight() == height
+          && window.getWidth() > 0 && window.getHeight() > 0;
+    }, WORLD_TIMEOUT_TICKS);
+    waitForOwnershipAdvance(context, presentationBaseline, failureBaseline,
+        stage);
+    return context.computeOnClient(
+        client -> DisplayLifecycleTracker.status().state());
+  }
+
+  private static long[] tail(long[] values, int count) {
+    require(values.length >= count,
+        "not enough presentation samples");
+    return Arrays.copyOfRange(values, values.length - count, values.length);
+  }
+
   private static IrisTranslationCoordinator.FullGraphStatus
       waitForOwnershipAdvance(ClientGameTestContext context,
           long presentationBaseline, long failureBaseline, String stage) {
@@ -1631,6 +1916,54 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     writeAtomicJson("metalrender.exactJar.lifecycleEvidencePath", json);
   }
 
+  private static void writeHardwareDisplayEvidence(
+      HardwareDisplayEvidence evidence) {
+    String json = String.format(Locale.ROOT, """
+        {
+          "schemaVersion": 1,
+          "status": %s,
+          "connectedDisplays": %d,
+          "displayMigrationRequired": %s,
+          "displayMigrationPassed": %s,
+          "retinaRequired": %s,
+          "retinaPassed": %s,
+          "retinaMonitor": %s,
+          "retinaFramebufferScaleX": %.6f,
+          "retinaFramebufferScaleY": %.6f,
+          "minimumRefreshHz": %d,
+          "reportedRefreshHz": %d,
+          "refreshMonitor": %s,
+          "presentationMode": %s,
+          "presentationSamples": %d,
+          "presentationIntervalP50Nanos": %d,
+          "presentationIntervalP95Nanos": %d,
+          "presentationIntervalP99Nanos": %d,
+          "presentCallP50Nanos": %d,
+          "measuredPresentationHz": %.6f,
+          "presentationStutters": %d,
+          "ownershipPresentationDelta": %d,
+          "displayTransitionDelta": %d,
+          "displayResetDelta": %d,
+          "ownershipFailureDelta": %d
+        }
+        """, quote(evidence.status()), evidence.connectedDisplays(),
+        evidence.displayMigrationRequired(),
+        evidence.displayMigrationPassed(), evidence.retinaRequired(),
+        evidence.retinaPassed(), quote(evidence.retinaMonitor()),
+        evidence.retinaFramebufferScaleX(),
+        evidence.retinaFramebufferScaleY(), evidence.minimumRefreshHz(),
+        evidence.reportedRefreshHz(), quote(evidence.refreshMonitor()),
+        quote(evidence.presentationMode()), evidence.presentationSamples(),
+        evidence.presentationIntervalP50Nanos(),
+        evidence.presentationIntervalP95Nanos(),
+        evidence.presentationIntervalP99Nanos(),
+        evidence.presentCallP50Nanos(), evidence.measuredPresentationHz(),
+        evidence.presentationStutters(), evidence.ownershipPresentationDelta(),
+        evidence.displayTransitionDelta(), evidence.displayResetDelta(),
+        evidence.ownershipFailureDelta());
+    writeAtomicJson("metalrender.exactJar.hardwareDisplayEvidencePath", json);
+  }
+
   private static void writePerformanceEvidence(
       PerformanceEvidence evidence) {
     FrameMetrics metrics = evidence.metrics();
@@ -1716,6 +2049,32 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     private static LifecycleEvidence notRequired() {
       return new LifecycleEvidence("NOT_REQUIRED", false, false, false,
           false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+  }
+
+  private record WindowPlacement(int x, int y, int width, int height,
+                                 int maxFps, boolean vsync,
+                                 InactivityFpsLimit inactivityFpsLimit,
+                                 long monitorHandle) {
+  }
+
+  private record HardwareDisplayEvidence(
+      String status, int connectedDisplays, boolean displayMigrationRequired,
+      boolean displayMigrationPassed, boolean retinaRequired,
+      boolean retinaPassed, String retinaMonitor,
+      double retinaFramebufferScaleX, double retinaFramebufferScaleY,
+      int minimumRefreshHz, int reportedRefreshHz, String refreshMonitor,
+      String presentationMode, int presentationSamples,
+      long presentationIntervalP50Nanos,
+      long presentationIntervalP95Nanos, long presentationIntervalP99Nanos,
+      long presentCallP50Nanos, double measuredPresentationHz,
+      long presentationStutters, long ownershipPresentationDelta,
+      long displayTransitionDelta, long displayResetDelta,
+      long ownershipFailureDelta) {
+    private static HardwareDisplayEvidence notRequired() {
+      return new HardwareDisplayEvidence("NOT_REQUIRED", 0, false, false,
+          false, false, "not-required", 0.0, 0.0, 0, 0, "not-required",
+          "not-required", 0, 0, 0, 0, 0, 0.0, 0, 0, 0, 0, 0);
     }
   }
 

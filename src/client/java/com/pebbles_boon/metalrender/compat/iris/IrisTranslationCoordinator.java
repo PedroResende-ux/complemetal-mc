@@ -700,6 +700,19 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     }
   }
 
+  /**
+   * Drops only the display-facing bridge after a monitor, backing-scale or
+   * wake transition. Translation, pipeline archives and validated graph state
+   * remain reusable; the next completed IOSurface must be promoted before
+   * OpenGL suppression can resume.
+   */
+  public static void invalidateDisplayPresentation(String reason) {
+    IrisTranslationCoordinator coordinator = ACTIVE.get();
+    if (coordinator != null) {
+      coordinator.invalidateDisplayPresentationInternal(reason);
+    }
+  }
+
   /** True means this captured draw belongs exclusively to the Metal graph. */
   public static boolean tryFullGraphCutover(
       IrisPipelineStateCapture.PendingState pending) {
@@ -2588,6 +2601,22 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     frame.commandsSuppressed++;
     fullGraphOwnershipCommandsSuppressed.incrementAndGet();
     return true;
+  }
+
+  private void invalidateDisplayPresentationInternal(String reason) {
+    ownershipFrame = null;
+    lastOwnershipPresentationState = null;
+    lastOwnershipPresentationWidth = 0;
+    lastOwnershipPresentationHeight = 0;
+    IrisMetalCutoverPresenter.global().resetPresentationBindings();
+    if (productionOwnershipReady()) {
+      // This transition invalidates only the presentation bridge. It is not a
+      // planned graph frame and therefore must not enter the frame-accounting
+      // invalidation counter.
+      MetalLogger.info(
+          "Iris full Metal display presentation reset: %s; awaiting fresh IOSurface",
+          BoundedReasonSet.normalizeReason(reason));
+    }
   }
 
   private boolean suppressFullGraphOperationInternal() {
