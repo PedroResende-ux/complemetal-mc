@@ -578,6 +578,16 @@ public class MetalRenderClient implements ClientModInitializer {
     }
     DisplayLifecycleTracker.DisplayTransition transition;
     try {
+      int cachedWidth = minecraft.getWindow().getWidth();
+      int cachedHeight = minecraft.getWindow().getHeight();
+      if (DisplayLifecycleTracker.synchronizeFramebufferSize(
+          minecraft.getWindow())) {
+        minecraft.framebufferSizeChanged();
+        MetalLogger.info(
+            "synchronized missed GLFW framebuffer callback: %dx%d -> %dx%d",
+            cachedWidth, cachedHeight, minecraft.getWindow().getWidth(),
+            minecraft.getWindow().getHeight());
+      }
       transition = DisplayLifecycleTracker.poll(minecraft.getWindow());
     } catch (RuntimeException | LinkageError error) {
       MetalLogger.warn("display lifecycle detection failed: %s",

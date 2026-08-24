@@ -1575,10 +1575,37 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "no 2x-class Retina display is currently connected");
       DisplayLifecycleTracker.DisplayState retinaState = moveToDisplay(
           context, retinaTarget, failureBaseline, "Retina migration");
+      context.waitTicks(20);
+      int[] retinaDimensions = context.computeOnClient(client -> {
+        Window window = client.getWindow();
+        int[] directWidth = new int[1];
+        int[] directHeight = new int[1];
+        GLFW.glfwGetFramebufferSize(window.handle(), directWidth,
+            directHeight);
+        return new int[] {window.getScreenWidth(), window.getScreenHeight(),
+            window.getWidth(), window.getHeight(), directWidth[0],
+            directHeight[0]};
+      });
+      retinaState = context.computeOnClient(
+          client -> DisplayLifecycleTracker.status().state());
       visitedMonitors.add(retinaState.monitorHandle());
       retinaScaleX = retinaState.framebufferScaleX();
       retinaScaleY = retinaState.framebufferScaleY();
       retinaMonitor = retinaState.monitorName();
+      double directScaleX = retinaDimensions[0] == 0 ? 0.0
+          : retinaDimensions[4] / (double) retinaDimensions[0];
+      double directScaleY = retinaDimensions[1] == 0 ? 0.0
+          : retinaDimensions[5] / (double) retinaDimensions[1];
+      System.out.printf(Locale.ROOT,
+          "METALRENDER_RETINA_PROBE monitor=%s content=%.2fx%.2f "
+              + "window=%dx%d cachedFramebuffer=%dx%d "
+              + "directFramebuffer=%dx%d cachedScale=%.2fx%.2f "
+              + "directScale=%.2fx%.2f%n",
+          retinaMonitor, retinaState.contentScaleX(),
+          retinaState.contentScaleY(), retinaDimensions[0],
+          retinaDimensions[1], retinaDimensions[2], retinaDimensions[3],
+          retinaDimensions[4], retinaDimensions[5], retinaScaleX,
+          retinaScaleY, directScaleX, directScaleY);
       retinaPassed = retinaState.contentScaleX() >= 1.5F
           && retinaState.contentScaleY() >= 1.5F
           && retinaScaleX >= 1.5 && retinaScaleY >= 1.5;
@@ -1586,7 +1613,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "Retina monitor did not produce a 2x-class framebuffer: content="
               + retinaState.contentScaleX() + "x"
               + retinaState.contentScaleY() + " framebuffer="
-              + retinaScaleX + "x" + retinaScaleY);
+              + retinaScaleX + "x" + retinaScaleY + " direct="
+              + directScaleX + "x" + directScaleY);
     }
 
     DisplayLifecycleTracker.DisplayTarget refreshTarget = displays.stream()

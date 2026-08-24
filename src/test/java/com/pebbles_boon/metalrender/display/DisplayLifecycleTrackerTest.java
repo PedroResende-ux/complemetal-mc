@@ -90,6 +90,18 @@ final class DisplayLifecycleTrackerTest {
   }
 
   @Test
+  void missedCocoaBackingCallbackRequiresMinecraftFramebufferSync() {
+    assertTrue(DisplayLifecycleTracker.requiresFramebufferSync(
+        960, 540, 1920, 1080));
+    assertTrue(DisplayLifecycleTracker.requiresFramebufferSync(
+        1920, 1080, 960, 540));
+    assertFalse(DisplayLifecycleTracker.requiresFramebufferSync(
+        1920, 1080, 1920, 1080));
+    assertFalse(DisplayLifecycleTracker.requiresFramebufferSync(
+        1920, 1080, 0, 0));
+  }
+
+  @Test
   void visibilityAndIconifyTransitionsResetPresentation() {
     var previous = state(100, 1, 2, 960, 540, 960, 540, 1.0F, 200,
         true, false);

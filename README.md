@@ -49,14 +49,15 @@ The following are outside this release's validated scope:
 Post-`0.3.0` development now observes display topology, backing scale,
 framebuffer size, refresh-rate and likely wake boundaries, then rebuilds only
 the display-facing IOSurface/GL bridge while preserving Metal graph resources.
-An exact-JAR cold/warm run also passed 600 real `GlSurface.present()` samples
-in a 200 Hz VX24G10 mode at 199.53/198.71 calls per second, with p50 intervals
-of 5.000/5.016 ms, VSync disabled and a 200 FPS software cap. This proves that
-the path is no longer pinned to 60 Hz and can approach 200 calls per second;
-it does not guarantee sustained or VSync-synchronised 200 Hz scanout. The only
-active GLFW display was 1x, so true Retina, two-display migration/reconnect and
-physical sleep/wake still need hardware-controlled validation. See
-[display lifecycle QA](docs/DISPLAY_LIFECYCLE_QA.md).
+Strict exact-JAR cold/warm runs with the built-in Retina panel and a 200 Hz
+VX24G10 both passed 2x backing, two-display migration and 600 real
+`GlSurface.present()` samples. They measured 181.52/198.64 calls per second,
+with p50 intervals of 5.081/5.003 ms, VSync disabled, zero >=100 ms stalls and
+zero Metal ownership failures. This proves the tested path is not pinned to
+60 Hz and that Metal ownership survives a 1x-to-2x-to-200 Hz migration; it
+does not guarantee sustained or VSync-synchronised 200 Hz scanout. Physical
+display disconnect/reconnect and macOS sleep/wake still need controlled
+hardware validation. See [display lifecycle QA](docs/DISPLAY_LIFECYCLE_QA.md).
 
 ## What Stage 9 delivers
 

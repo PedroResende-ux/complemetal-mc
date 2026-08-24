@@ -196,6 +196,35 @@ public final class DisplayLifecycleTracker {
         window.isFocused());
   }
 
+  /** Repairs a missed GLFW backing-size callback before lifecycle analysis. */
+  public static boolean synchronizeFramebufferSize(Window window) {
+    Objects.requireNonNull(window, "window");
+    long handle = window.handle();
+    if (handle == 0) {
+      return false;
+    }
+    try (MemoryStack stack = MemoryStack.stackPush()) {
+      IntBuffer width = stack.mallocInt(1);
+      IntBuffer height = stack.mallocInt(1);
+      GLFW.glfwGetFramebufferSize(handle, width, height);
+      int directWidth = width.get(0);
+      int directHeight = height.get(0);
+      if (!requiresFramebufferSync(window.getWidth(), window.getHeight(),
+          directWidth, directHeight)) {
+        return false;
+      }
+      window.setWidth(directWidth);
+      window.setHeight(directHeight);
+      return true;
+    }
+  }
+
+  static boolean requiresFramebufferSync(int cachedWidth, int cachedHeight,
+      int directWidth, int directHeight) {
+    return directWidth > 0 && directHeight > 0
+        && (cachedWidth != directWidth || cachedHeight != directHeight);
+  }
+
   private static long topologyFingerprint() {
     long hash = 0xcbf29ce484222325L;
     List<DisplayTarget> displays = displays();

@@ -10,11 +10,12 @@ contract.
 
 - JAR: `build/libs/metalrender-0.3.0+mc26.2.jar`
 - JAR SHA-256:
-  `5a8e54d703648dd3e73cd3d24418f5b1c0e5fd52fcf8feff7debfd0ce226540a`
+  `5c62d7a62c931accafafd62a0438b57d6ee9b10ab7208183645fe20ff05e5b6e`
 - Branch: `develop/0.3.1-display-lifecycle`
 - Platform: MacBook Pro `Mac16,8`, Apple M4 Pro, 24 GB RAM, arm64
 - OS: macOS 26.6, build `25G5065a`
-- Active GLFW display: one `VX24G10`, 1x backing, 200 Hz
+- Active GLFW displays: built-in `Liquid Retina XDR` at 2x backing and
+  external `VX24G10` at 200 Hz
 - Shader workload: Complementary Reimagined r5.8.1 through Iris 1.11.2
 - Full build: `clean test check build releaseCheck` — PASS
 - Java/JNI parity: 152 declarations/exports — PASS
@@ -39,6 +40,16 @@ OpenGL suppression remains off until a new completed IOSurface has been
 promoted and bound. This fixes the earlier lifecycle bug where a resize could
 destroy an in-flight token and produce `graph-presentation-native-failed-1`.
 
+The strict Retina run exposed a second lifecycle gap. After a display move,
+GLFW directly reported a 1920x1080 backing for the 960x540 game window, but
+Minecraft's cached framebuffer remained 960x540 because its backing-size
+callback had been missed. Before evaluating the display transition, the client
+now compares the direct GLFW framebuffer dimensions to the cached Minecraft
+dimensions. A mismatch is copied into the window and passed through
+Minecraft's normal framebuffer-resize handler, which also reconfigures the
+Metal presentation surface. The exact-JAR probe independently records both
+direct and cached dimensions after the migration.
+
 The wake detector uses wall time and treats a client-tick gap of at least five
 seconds as a resume boundary, so time spent in macOS sleep is visible even if
 a platform monotonic clock pauses. Forward clock corrections conservatively
@@ -53,41 +64,45 @@ does not infer presentation from renderer FPS or an offscreen Metal loop.
 | Gate | Cold | Warm |
 | --- | ---: | ---: |
 | Overall exact-JAR result | PASS | PASS |
+| Connected GLFW displays | 2 | 2 |
+| Two-display migration | PASS | PASS |
+| Retina framebuffer backing | 2.0x / 2.0x | 2.0x / 2.0x |
 | Reported display refresh | 200 Hz | 200 Hz |
 | Completed intervals | 600 | 600 |
-| Measured present-call cadence | 199.534406 Hz | 198.713753 Hz |
-| Interval p50 | 5.000208 ms | 5.015625 ms |
-| Interval p95 | 6.041667 ms | 6.384000 ms |
-| Interval p99 | 6.485584 ms | 7.473584 ms |
-| Present-call duration p50 | 0.480833 ms | 0.508791 ms |
+| Measured present-call cadence | 181.524564 Hz | 198.644953 Hz |
+| Interval p50 | 5.080541 ms | 5.003375 ms |
+| Interval p95 | 8.492667 ms | 6.137917 ms |
+| Interval p99 | 11.732083 ms | 6.807667 ms |
+| Present-call duration p50 | 0.864666 ms | 0.498084 ms |
 | >=100 ms stalls | 0 | 0 |
-| Metal-owned presentations during capture | 608 | 605 |
-| Display transitions / resets | 2 / 2 | 2 / 2 |
+| Metal-owned presentations during capture | 609 | 605 |
+| Display transitions / resets | 3 / 3 | 3 / 3 |
 | Ownership failures | 0 | 0 |
 
 The normal Stage 9 lifecycle subtest also passed resize, fullscreen, windowed
-restore and surface hide/show. It recorded 106/90 additional Metal
-presentations, 5,320/4,520 suppressed OpenGL commands, two expected graph-frame
-invalidations per run and zero failures.
+restore and surface hide/show. It recorded 98/89 additional Metal
+presentations, 4,930/4,480 suppressed OpenGL commands, three expected
+graph-frame invalidations per run and zero failures.
 
 Evidence SHA-256:
 
 | Evidence | SHA-256 |
 | --- | --- |
-| Cold run result | `bc041ef117efbb65a009b32ba7e635217942655a91d8d0dc61b63baa2dcafd72` |
-| Warm run result | `6ba306eec574fe05cbfb8ad234f3c67a115ad2f90a2b232eeb21f42ebfd795a6` |
-| Cold hardware sidecar | `21f1387ec0d7b3a6f46d9f04692a7d906c7a0607ba41002eaa91c41595d80d0f` |
-| Warm hardware sidecar | `bc99aeba83901a990d8899442b8ab4928952065ef0df027cdf7fd55913c03e72` |
-| Cold lifecycle sidecar | `6c2873cd0eedaa11d2d6d7e206fd2bdc470ef54bc41a225a426ee7f36f757ae6` |
-| Warm lifecycle sidecar | `7257eac22615ff2b5d7ced2a496f3c32e025be0ceb45e6fea8dd4dd2769be850` |
+| Cold run result | `b884a6fde916a0c60f68adf982c0d4dd483eeae99b1d4eec323ec04a71933587` |
+| Warm run result | `5a873b9fc208412e000d707a256c89061ae3a9643a6d58cd94ea488a4c1f31c5` |
+| Cold hardware sidecar | `2551a45d960180bd0cda518595b0f811d445adcac19f1c542806715f4c863ec9` |
+| Warm hardware sidecar | `6acc65cf5dc22089577a29bd6f0315245cb744481e94e87155d8aa58f4be1090` |
+| Cold lifecycle sidecar | `e343dc6c2e6fc2656d581ba7f96084315efc4f3770316e90e5108cdf6c71cbc7` |
+| Warm lifecycle sidecar | `4e40d6eedd6e29bd8fc784b927c416c5540af63006c265bb00f8343e3ebfa0c2` |
 
 ## What the 200 Hz result means
 
 The passing profile disables VSync and applies an exact 200 FPS software cap.
-It proves that Minecraft executes the real window-present call at the intended
-cadence while the Metal graph owns the measured frames. Both final runs stayed
-within about 1.3 calls per second of 200, but this remains a finite controlled
-sample rather than a guaranteed 200 FPS floor. It also does **not**
+It proves that Minecraft executes the real window-present call above the
+strict 160 Hz acceptance floor while the Metal graph owns the measured frames.
+The cold run reached 181.52 Hz after the first complete two-display/Retina
+migration, while the warm repeat reached 198.64 Hz. This remains a finite
+controlled sample rather than a guaranteed 200 FPS floor. It also does **not**
 prove that Core Animation or the monitor scanned out 600 distinct frames in a
 VSync-synchronised native Metal presentation path. The final image still
 crosses the fenced IOSurface-to-OpenGL bridge, so native synchronized 200 Hz
@@ -97,35 +112,35 @@ remains a separate future cutover boundary.
 
 | Gate | Current state | How it closes |
 | --- | --- | --- |
-| True 2x Retina framebuffer | Harness and reset logic ready; not run | Make the built-in Retina panel active and run with `--require-retina` |
-| Two-display migration/reconnect | Topology/migration logic ready; not run | Expose two GLFW displays and run with `--require-display-migration`; physically reconnect separately |
+| True 2x Retina framebuffer | **PASS** cold and warm | Strict exact-JAR probe recorded matching cached/direct 2.0x framebuffer scales |
+| Two-display migration | **PASS** cold and warm | Strict run visited both displays and recorded three matched transitions/resets per run |
+| Physical display disconnect/reconnect | Not run | Disconnect and reconnect the external display during a controlled exact-JAR session, then require ownership recovery with zero faults |
 | Physical sleep/wake | Resume-gap recovery implemented and unit tested | Sleep and wake the Mac during a controlled exact-JAR session, then require ownership recovery with zero faults |
 | Native VSync-synchronised 200 Hz | Not claimed | Replace/augment the final CGL/GLFW swap boundary with a native display-linked Metal presentation path and measure compositor/display feedback |
 
-Only one display was visible to GLFW in the passing run. Consequently, the
-Retina and two-monitor gates cannot be honestly marked PASS from this machine
-state.
+The lid-open configuration closed the Retina-backing and live migration gates.
+It did not exercise a physical cable hot-plug or a real system sleep/wake, so
+those remain separate hardware actions rather than inferred passes.
 
-## Reproduce the available 200 Hz gate
+## Reproduce the strict Retina/migration/200 Hz gate
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   ./gradlew --no-daemon clean test check build releaseCheck
 
 python3 scripts/exact_jar_qa.py run \
-  --runtime-dir build/exact-jar-qa-hardware-200hz \
+  --runtime-dir build/exact-jar-qa-retina-migration \
   --jar build/libs/metalrender-0.3.0+mc26.2.jar \
   --backend metal4 --require-graph-ownership \
-  --hardware-display --minimum-refresh-hz 200 \
+  --hardware-display --require-retina --require-display-migration \
+  --minimum-refresh-hz 200 \
   --presentation-samples 600 --timeout 1200
 
 python3 scripts/exact_jar_qa.py warm \
-  --runtime-dir build/exact-jar-qa-hardware-200hz \
+  --runtime-dir build/exact-jar-qa-retina-migration \
   --jar build/libs/metalrender-0.3.0+mc26.2.jar \
   --backend metal4 --require-graph-ownership \
-  --hardware-display --minimum-refresh-hz 200 \
+  --hardware-display --require-retina --require-display-migration \
+  --minimum-refresh-hz 200 \
   --presentation-samples 600 --timeout 1200
 ```
-
-When the built-in Retina panel and a second display are both available, add
-`--require-retina --require-display-migration` to both commands.

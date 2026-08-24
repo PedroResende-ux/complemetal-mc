@@ -12,10 +12,14 @@
 - Measure completed Minecraft `GlSurface.present()` calls in a bounded tracker
   and add strict exact-JAR gates for Retina backing, two-display migration and
   minimum-refresh cadence.
-- Pass cold and warm 600-sample high-refresh runs in a 200 Hz VX24G10 mode at
-  199.53 Hz and 198.71 Hz, with p50 intervals of 5.000/5.016 ms, zero >=100 ms
+- Pass strict cold and warm two-display runs with a real 2x Retina backing,
+  migration back to a 200 Hz VX24G10, and 600 present-call samples at
+  181.52/198.64 Hz. The p50 intervals were 5.081/5.003 ms, with zero >=100 ms
   stalls and zero ownership failures. Sustained/native VSync-synchronised
   200 Hz scanout is not claimed.
+- Repair a missed Cocoa/GLFW Retina backing-size callback by synchronizing the
+  direct framebuffer dimensions into Minecraft and invoking its normal resize
+  handler before display-lifecycle analysis.
 - Fix display-only reset destroying active graph presentation tokens during a
   resize/lifecycle transition, and fix cadence accounting after a GLFW window
   replacement.

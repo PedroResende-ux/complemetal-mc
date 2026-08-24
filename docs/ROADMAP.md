@@ -97,12 +97,14 @@ successes.
 The post-release display-lifecycle branch has since delivered the reusable
 foundation for those runs: topology/backing/wake observation, fail-open
 display-only IOSurface reset, real window-present timing, and opt-in exact-JAR
-requirements for Retina, two-display migration and minimum refresh. On the
-currently available single 1x VX24G10 it passed a high-refresh cold/warm gate
-in 200 Hz mode at 199.53/198.71 calls per second with p50 intervals near 5 ms
-in the explicit VSync-off software-paced mode. Sustained native
-VSync-synchronised 200 Hz scanout, true 2x backing, physical reconnect and
-physical sleep/wake remain open hardware gates. See
+requirements for Retina, two-display migration and minimum refresh. With the
+built-in Retina panel and the 200 Hz VX24G10 active, strict cold/warm runs now
+pass real 2x backing and migration across both displays. The final 600-sample
+200 Hz phases measured 181.52/198.64 calls per second with p50 intervals of
+5.081/5.003 ms in the explicit VSync-off software-paced mode, zero >=100 ms
+stalls and zero ownership failures. Sustained native VSync-synchronised 200 Hz
+scanout, physical display disconnect/reconnect and physical sleep/wake remain
+open hardware gates. See
 [`DISPLAY_LIFECYCLE_QA.md`](DISPLAY_LIFECYCLE_QA.md).
 
 ## Performance interpretation
