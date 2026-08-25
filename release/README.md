@@ -4,15 +4,24 @@ This directory contains reviewable GitHub and Modrinth metadata. It does not
 contain credentials or generated JARs. Release binaries are created under the
 ignored `build/release/` directory by `scripts/package_release.sh`.
 
-## Publication target
+## Publication record
 
 - GitHub repository: <https://github.com/daniiarkg/complemetal-mc>
 - Git tag: `v0.4.1+mc26.2`
+- GitHub release:
+  <https://github.com/daniiarkg/complemetal-mc/releases/tag/v0.4.1%2Bmc26.2>
 - GitHub release notes: `GITHUB_RELEASE_NOTES_0.4.1.md`
 - Modrinth project: <https://modrinth.com/mod/complemetal>, id `eQOVChw5`
-- Modrinth version number: `0.4.1+mc26.2`
+- Modrinth version: `0.4.1+mc26.2`, id `IfTP5hQu`, status `listed`, featured
+- Modrinth project state after upload: `processing`, requested `approved`
 - Exact JAR SHA-256:
   `e291b3b80c702ee90fc5f42b1ef5062b3c17e2e0cf383e55e34c55929e62f554`
+
+GitHub independently reports the same SHA-256 for its JAR asset. The Modrinth
+CDN file was downloaded after upload and also matched the exact SHA above.
+Until Modrinth moderation changes the project from `processing` to `approved`,
+its public project/version API can return 404 to unauthenticated visitors even
+though the version is already stored as `listed`.
 
 The prior `0.4.0+mc26.2` Modrinth version id is `aQBN08lk`. It is historical
 and must not be overwritten; `0.4.1` is uploaded as a new version.
