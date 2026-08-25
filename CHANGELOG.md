@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.4.1+mc26.2 - 2026-08-26
+
+### Critical Iris stability fixes
+
+- Disable automatic production opt-in for Iris draw interception and full
+  graph ownership. The experimental Stage 9 pipeline remains available only
+  through explicit development properties; the stable profile keeps
+  Iris/OpenGL as the visible shader renderer.
+- Prevent the legacy FINAL-only cutover from activating when full-graph
+  ownership was requested. A failed or incomplete graph capture can no longer
+  fall through to a stale same-frame FINAL bridge and suppress the valid Iris
+  image—the direct cause of the black world reported in `0.4.0`.
+- Remove the render-thread capture storm seen in the affected profile: twelve
+  consecutive 489–1,271 ms graph-capture attempts retained logical snapshots
+  as large as 17–22.7 GB and pushed the Java heap near its limit.
+- Defer all duplicate Metal world resources while an Iris shader pack owns the
+  frame. Complemetal no longer initializes terrain meshes, texture mirrors,
+  entity/particle GPU buffers, mesh orchestration, or presentation surfaces
+  just to release them a frame later. Disabling Iris can initialize the native
+  terrain path lazily without restarting the client.
+
+### Crash and reload fixes
+
+- Replace the live `/complemetal reload` call to Minecraft's teardown-only
+  `resetLevelRenderData()` with the paired
+  `invalidateCompiledGeometry(...)` rebuild. The level renderer's `ViewArea`
+  is now non-null immediately after reload and throughout a post-reload render
+  window.
+- Make config-apply and command reload paths use the same safe rebuild helper;
+  a command outside a world clears only the Complemetal cache and reports that
+  no active level was rebuilt.
+- Add a client GameTest regression that performs a live rebuild, waits twenty
+  world ticks, and verifies the active world and `ViewArea` remain intact.
+
+### Real-client compatibility and performance QA
+
+- Add `scripts/field_qa.py`, a production Fabric/Minecraft 26.2 harness that
+  loads the exact release JAR, Complementary Reimagined r5.8.1 Ultra, and the
+  complete reported mod set: Fabric API, Fabric Language Kotlin, Sodium, Iris,
+  ImmediatelyFast, Entity Culling, Lithium, FerriteCore, Mod Menu, YACL,
+  Zoomify, and Placeholder API.
+- Exercise entities, fluids, biome changes, a 12-second black-frame regression
+  window, 1920x1080 fullscreen at 200 Hz, a 30-second FPS sample, Zoomify,
+  flight/chunk streaming, survival mining, live Complemetal reload, resource
+  reload, Nether/End/Overworld transitions, and a second rainy night world.
+- Compare enabled and disabled sides using the same JAR, modpack, shader pack,
+  display mode, and scenario. The final pair measured 58.01 versus 51.21
+  average FPS (+13.29%) and 36.74 versus 36.14 1% low (+1.68%). This is a
+  single controlled non-regression result, not a universal FPS promise and
+  not an Iris-to-Metal acceleration claim—the stable Iris frame stayed on
+  OpenGL.
+- Pass 14 enabled-side screenshot luminance/variance checks with no black
+  frame, zero crash reports, zero forbidden diagnostics, zero GPU
+  command-buffer errors, zero in-flight timeouts, and zero unsafe IOSurface
+  slot skips. After two full GCs, retained heap was 445.5 MB enabled versus
+  456.7 MB disabled.
+
 ## 0.4.0+mc26.2 - 2026-08-26
 
 ### Complemetal release identity

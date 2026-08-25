@@ -46,8 +46,10 @@ The most useful fields are:
   reason for a fail-open decision.
 
 `nIsMetal4Active` or an available MTL4 object is not by itself proof that the
-visible shader graph runs through Metal. Visible ownership requires the full
-translation, pipeline, resource, graph, parity and presentation gates.
+visible shader graph runs through Metal. In stable `0.4.1`, an active Iris
+shader pack intentionally retains visible OpenGL ownership. Experimental
+Metal ownership additionally requires the full translation, pipeline,
+resource, graph, parity, and presentation gates.
 
 ## Recovery order
 
@@ -59,9 +61,10 @@ For a transient visual problem, use the least disruptive operation first:
 /complemetal config reset
 ```
 
-If the problem remains, save `latest.log` before restarting the game. To force
-the safe Iris/OpenGL baseline for comparison, add this JVM property and restart
-the client:
+If the problem remains, save `latest.log` before restarting the game. Stable
+`0.4.1` already uses the safe Iris/OpenGL profile by default. The following
+legacy property remains useful only to override an explicitly enabled
+development profile:
 
 ```text
 -Dmetalrender.irisMetal.enabled=false

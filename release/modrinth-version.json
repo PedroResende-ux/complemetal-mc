@@ -1,7 +1,7 @@
 {
-  "name": "Complemetal 0.4.0 for Minecraft 26.2",
-  "version_number": "0.4.0+mc26.2",
-  "changelog": "First release under the Complemetal name. Public mod id, artifact, UI, resources and commands were renamed while the MetalRender Java/JNI ABI and legacy settings remain compatible. Existing metalrender.json is migrated automatically. Includes the complete Stage 9 Iris GLSL -> SPIR-V -> MSL -> Metal 4 graph path, strict visual parity, fenced IOSurface presentation and fail-open Iris/OpenGL fallback. Complemetal is a continuation and fork of MetalRender by pebbles_boon / webblepebbles under Apache-2.0.",
+  "name": "Complemetal 0.4.1 for Minecraft 26.2",
+  "version_number": "0.4.1+mc26.2",
+  "changelog": "Critical Iris stability release. Fixes the extreme FPS loss, black world, and live-reload crash reported in 0.4.0. Stable Iris rendering now remains fail-open on Iris/OpenGL, full-graph and legacy FINAL cutover cannot overlap, and duplicate Metal world resources stay deferred while shaders are active. The exact JAR passed a real production-client full-modpack test with Complementary Ultra, ImmediatelyFast, Entity Culling, Lithium, FerriteCore, YACL, Zoomify and related dependencies across fullscreen 1920x1080 at 200 Hz, flight, mining, reloads, dimensions, biomes and two worlds. Controlled A/B: 58.01 vs 51.21 average FPS and zero native faults. Complemetal remains a continuation and fork of MetalRender by pebbles_boon / webblepebbles under Apache-2.0.",
   "dependencies": [
     {
       "project_id": "P7dR8mSH",

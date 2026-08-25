@@ -825,16 +825,19 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     }
     IrisSelectiveCutoverGate.Status status = coordinator.cutoverGate.status();
     return legacyCutoverCaptureEligible(
+        NativeIrisMetalGraphExecutor.isOwnershipOptedIn(),
         coordinator.productionOwnershipReady(),
         coordinator.fullGraphCapturesOutstanding.get(), phase, status)
         && coordinator.cutoverPipelineIdentities.containsKey(
             IrisPipelineStateCapture.lookupKey(registration, snapshot));
   }
 
-  static boolean legacyCutoverCaptureEligible(boolean fullGraphOwnershipReady,
+  static boolean legacyCutoverCaptureEligible(
+      boolean fullGraphOwnershipOptedIn, boolean fullGraphOwnershipReady,
       int fullGraphCapturesOutstanding, IrisRenderGraph.Phase phase,
       IrisSelectiveCutoverGate.Status status) {
-    return !fullGraphOwnershipReady && fullGraphCapturesOutstanding == 0
+    return !fullGraphOwnershipOptedIn && !fullGraphOwnershipReady
+        && fullGraphCapturesOutstanding == 0
         && phase == IrisRenderGraph.Phase.FINAL && status != null
         && status.currentFrame() >= 0 && !status.frameFallback()
         && (status.mode() == IrisSelectiveCutoverGate.Mode.ARMED
@@ -2941,9 +2944,19 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     IrisSelectiveCutoverGate.Status gateStatus = cutoverGate.status();
     IrisRenderGraph.Phase capturePhase = IrisRenderGraphCapture.global()
         .currentPhase();
+    boolean graphOwnershipOptedIn =
+        NativeIrisMetalGraphExecutor.isOwnershipOptedIn();
     boolean unsubmittedLegacyCapture = pending.replayTextures()
-        .captureEnabled() && legacyCutoverCaptureEligible(false,
+        .captureEnabled() && legacyCutoverCaptureEligible(
+            graphOwnershipOptedIn, false,
             fullGraphCapturesOutstanding.get(), capturePhase, gateStatus);
+    if (graphOwnershipOptedIn) {
+      // Full-graph mode may suppress OpenGL only from an already completed,
+      // promoted graph surface. Falling back to the legacy FINAL-only bridge
+      // after a graph capture failure combines stale inputs with a current
+      // frame and was the direct cause of black output in 0.4.0.
+      return false;
+    }
     if (productionOwnershipReady()) {
       // Full-graph ownership supersedes the legacy same-frame FINAL bridge.
       // Keeping both capture paths active leases one IOSurface per visible

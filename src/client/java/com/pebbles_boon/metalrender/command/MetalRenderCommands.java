@@ -455,14 +455,14 @@ public final class MetalRenderCommands {
     private static void reloadWorld(FabricClientCommandSource src) {
         try {
             Minecraft mc = Minecraft.getInstance();
-            if (mc != null && mc.levelRenderer != null) {
-                mc.levelRenderer.resetLevelRenderData();
-            }
+            boolean vanillaRebuilt = MetalRenderClient.rebuildLevelRenderer(mc);
             MetalWorldRenderer wr = MetalRenderClient.getWorldRenderer();
             if (wr != null) {
                 wr.getChunkMesher().clearAllMeshes();
             }
-            msg(src, "§aLevel render data reloaded");
+            msg(src, vanillaRebuilt
+                ? "§aLevel render data reloaded"
+                : "§eMetal cache cleared; no active level to rebuild");
         } catch (Exception e) {
             msg(src, "§creload failed: " + e.getMessage());
         }

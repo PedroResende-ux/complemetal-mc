@@ -148,6 +148,8 @@ public final class MetalRenderClientGameTest implements FabricClientGameTest {
             "initial client level is not the Overworld");
       });
 
+      verifyLiveLevelRendererReload(context);
+
       int entityRecoveryBefore = bulkRecoveryCount(context);
       long entityBuildEpochBefore = currentBuildEpoch(context);
       buildEntityScene(singleplayer);
@@ -328,6 +330,28 @@ public final class MetalRenderClientGameTest implements FabricClientGameTest {
       require(nativeSurfaceMatches(window),
           "Metal IOSurface did not recover after iconify/restore");
     });
+  }
+
+  private static void verifyLiveLevelRendererReload(
+      ClientGameTestContext context) {
+    ClientLevel levelBefore =
+        context.computeOnClient(client -> client.level);
+    context.runOnClient(client -> {
+      require(client.levelRenderer.viewArea() != null,
+          "ViewArea was unavailable before live reload");
+      require(MetalRenderClient.rebuildLevelRenderer(client),
+          "live level renderer rebuild failed");
+      require(client.levelRenderer.viewArea() != null,
+          "live reload left ViewArea null");
+    });
+    context.waitFor(client -> client.level == levelBefore
+        && client.levelRenderer != null
+        && client.levelRenderer.viewArea() != null,
+        WORLD_TIMEOUT_TICKS);
+    waitForWorldTicks(context, 20);
+    context.runOnClient(client -> require(
+        client.levelRenderer.viewArea() != null,
+        "ViewArea became null after the post-reload render window"));
   }
 
   private static boolean placeWindowOnPrimaryMonitor(

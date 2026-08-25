@@ -42,6 +42,8 @@ public class MinecraftClientMixin {
     }
     ClientLevel level = ((Minecraft) (Object) this).level;
     if (MetalRenderClient.isEnabled()) {
+      boolean irisCompatibilityMode = level != null
+          && IrisCompatibility.requiresShaderCompatibilityMode();
       PerformanceController.startFrame();
       metalrender$debugCounter++;
       if (metalrender$debugCounter % 600 == 1) {
@@ -70,21 +72,17 @@ public class MinecraftClientMixin {
         if (level != null) {
           MetalLogger.info("[mcmix] new level found");
           try {
-            wr.onWorldLoad();
+            wr.onWorldLoad(irisCompatibilityMode);
             MetalLogger.info("[mcmix] onworldload ok");
           } catch (Throwable error) {
             MetalLogger.error("[mcmix] onworldload fail", error);
           }
         }
       }
-      if (level != null) {
-        if (wr != null && wr.metalActive()) {
-          boolean irisCompatibilityMode =
-              IrisCompatibility.requiresShaderCompatibilityMode();
-          wr.setIrisCompatibilityPaused(irisCompatibilityMode);
-          if (!irisCompatibilityMode) {
-            wr.prepareMeshes();
-          }
+      if (level != null && wr != null) {
+        wr.setIrisCompatibilityPaused(irisCompatibilityMode);
+        if (wr.metalActive()) {
+          wr.prepareMeshes();
         }
       }
     } else {

@@ -2,8 +2,8 @@
 
 **English** | [Русский](TECHNICAL_ARCHITECTURE_RU.md)
 
-- Document version: 1.0
-- Target mod version: `0.4.0+mc26.2`
+- Document version: 1.1
+- Target mod version: `0.4.1+mc26.2`
 - Minecraft: Java Edition 26.2
 - Platform: Fabric, Java 25, Apple Silicon, macOS 26+, Metal 4
 
@@ -14,6 +14,14 @@ Its main path does not translate arbitrary OpenGL calls into Metal one by one.
 Instead, it observes the program already prepared by Iris, captures the final
 shaders, complete pipeline state, resources, and pass graph, then replays a
 **validated Iris frame as a whole** through Metal 4.
+
+The paragraph above describes the implemented experimental Stage 9
+architecture. In the stable `0.4.1` profile, an active Iris shader pack keeps
+the visible frame on Iris/OpenGL. Translation, draw interception, and graph
+ownership require explicit development opt-in; duplicate Metal world
+resources are deferred for the entire Iris session. This safety boundary was
+introduced after real `0.4.0` field testing exposed render-thread capture
+stalls, black output after an incomplete graph, and a live-reload crash.
 
 The main path is:
 
@@ -69,7 +77,7 @@ Version `0.4.0` changes the public product identity to Complemetal:
 | Boundary | New value | Compatibility behavior |
 | --- | --- | --- |
 | Fabric mod id | `complemetal` | metadata `provides: ["metalrender"]` |
-| JAR name | `complemetal-0.4.0+mc26.2.jar` | existing JARs are not modified |
+| JAR name | `complemetal-0.4.1+mc26.2.jar` | existing JARs are not modified |
 | Resources | `assets/complemetal/` | the old namespace is not needed inside the new JAR |
 | Commands | `/complemetal`, `/cm` | `/metalrender`, `/mr` remain aliases |
 | Config | `config/complemetal.json` | legacy `metalrender.json` is imported on first run |
@@ -443,17 +451,17 @@ checked before loading.
 
 ## 10. Configuration and activation
 
-The full Iris-to-Metal path becomes a production default only when:
+Stable `0.4.1` never enables Iris draw interception from a version, OS,
+architecture, or hardware probe. The production default is always fail-open
+Iris/OpenGL. Explicit development properties may opt into translation and
+graph ownership, after which compiler, pipeline, resource, graph, parity, and
+presentation gates still have to pass at runtime.
 
-1. code is loaded from a packaged stable version matching `x.y.z+mc26.2`;
-2. Fabric is not in a development environment;
-3. the OS is macOS 26 or newer;
-4. the architecture is `arm64` or `aarch64`;
-5. the native Metal 4 probe creates, encodes, commits, and completes a real
-   MTL4 command buffer.
-
-Translation, compiler, pipeline, resource, graph, parity, and presentation
-gates still have to pass at runtime.
+The native Metal 4 runtime can remain initialized in the stable Iris profile,
+but `MetalWorldRenderer` attaches the world in a deferred state. Terrain
+meshes, texture mirrors, entity/particle GPU buffers, mesh orchestration, and
+presentation surfaces are initialized lazily only if Iris releases visible
+ownership.
 
 Primary `complemetal.json` settings include:
 
@@ -538,6 +546,7 @@ the complete Minecraft frame from UI to window scanout.
 | 2026-08-25 | `52ac697` | Synchronised the real Retina framebuffer |
 | 2026-08-25 | `be3a8d8` | Published the stable `0.3.1` exact-JAR baseline |
 | 2026-08-26 | `v0.4.0+mc26.2` | Rebranded publicly as Complemetal and added migration, attribution, and release packaging |
+| 2026-08-26 | `v0.4.1+mc26.2` | Disabled unsafe automatic Iris cutover, fixed live reload, and added real full-modpack fullscreen QA |
 
 The standalone import did not preserve an exact upstream base hash. The
 documentation therefore records the provable local boundary `5f9997b`
@@ -582,9 +591,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 proves that the code was loaded from the requested JAR and SHA-256 rather than
 from a Gradle source set.
 
-The Metal 4 cold/warm matrix checks:
+The historical Stage 9 exact-JAR matrix checks:
 
-- packaged-stable automatic activation;
+- explicit experimental activation;
 - shader pack on, off, and on again;
 - Overworld to Nether to End to Overworld;
 - translation, compiler, pipeline archive, and graph resources;
@@ -601,6 +610,13 @@ The forced Metal 3 cold/warm matrix requires the inverse:
 - zero OpenGL suppression;
 - Iris/OpenGL remains the visible owner;
 - the same dimension, shader-toggle, and lifecycle scenarios finish normally.
+
+Stable `0.4.1` adds `scripts/field_qa.py` as the release-authority integration
+gate. It launches the official production Fabric runtime twice with the exact
+JAR, Complementary Ultra, and the full compatibility mod set. Both sides run
+the same real-world scenarios and physical 1920x1080@200 Hz fullscreen mode;
+the enabled side additionally proves Iris owns the visible frame and no
+duplicate Metal world resources exist.
 
 ### 14.4. Performance gate
 
@@ -622,9 +638,15 @@ frame-time improvements were:
 - GPU p99: 11.5–32.5%;
 - zero frames at or above 100 ms on every side.
 
-Those values apply to that scene. The `0.4.0` rebrand does not alter the
-renderer algorithm and makes no new universal FPS claim without a new matched
-run.
+Those values apply to the historical explicitly enabled Stage 9 scene. They
+are not the `0.4.1` stable operating mode.
+
+The final `0.4.1` fullscreen field pair measured 58.01 FPS enabled versus
+51.21 disabled and 36.74 versus 36.14 FPS 1% low. Since Iris/OpenGL remained
+the visible renderer, that single +13.29% average result is treated as a
+non-regression observation, not as proof of Iris Metal acceleration or a
+universal claim. Full evidence is in
+[`RELEASE_CHECKLIST_0.4.1.md`](RELEASE_CHECKLIST_0.4.1.md).
 
 ## 15. Source map
 
@@ -668,7 +690,9 @@ to immutable evidence rather than an informal observation.
 
 ## 17. Known limitations
 
-The following are not fully qualified for `0.4.0`:
+The following are not fully qualified for `0.4.1`:
+
+- production Iris-to-Metal visible graph ownership;
 
 - geometry-shader packs;
 - Intel Macs, Windows, and Linux;
@@ -689,8 +713,8 @@ does not imply that a crash is acceptable.
 
 The technically justified next steps are:
 
-1. repeat physical Retina, two-display, sleep/wake, and 200 Hz qualification
-   against the exact `0.4.0` SHA;
+1. requalify the experimental Iris Metal graph without render-thread capture
+   stalls, stale FINAL fallback, or incomplete-frame suppression;
 2. expand the shader-pack conformance corpus and reason-code statistics;
 3. add reproducible CI for Java, cache, and packet validators plus a separate
    macOS 26 release runner for native and exact-JAR work;

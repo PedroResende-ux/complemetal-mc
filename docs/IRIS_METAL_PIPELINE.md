@@ -1,9 +1,14 @@
 # Iris to Metal pipeline
 
-`0.3.1+mc26.2` implements the complete validated Iris-to-Metal 4 path. The
+The repository implements a complete experimental Iris-to-Metal 4 path. The
 input is the final GLSL after Iris has applied shader-pack directives,
 compatibility transforms, generated uniforms and Sodium vertex conventions;
 capturing the original pack source would not reproduce the program Iris runs.
+
+Stable `0.4.1+mc26.2` does **not** enable this draw-interception path
+automatically. Iris/OpenGL remains the visible owner and duplicate Metal world
+resources stay deferred. This document describes the experimental pipeline
+and the gates it must pass before a future production requalification.
 
 ```text
 Iris final linked GLSL
@@ -104,13 +109,16 @@ parity result.
 
 ## Activation and fallback
 
-The packaged stable release automatically enables this path on Apple Silicon
-macOS 26+. Dev and prerelease classpaths remain opt-in. The global emergency
-override is:
+Stable `0.4.1` always defaults this path off, including packaged Apple Silicon
+macOS 26 builds. A developer can opt in explicitly with:
 
 ```text
--Dmetalrender.irisMetal.enabled=false
+-Dmetalrender.irisMetal.enabled=true
 ```
+
+That property selects an unsupported experimental profile; it is not an
+installation requirement or a stable-performance recommendation. Setting it
+to `false` remains a hard safe-disable override.
 
 Forced Metal 3 exact-JAR runs keep MTL4 pipeline readiness unsupported, encode
 zero native Iris draws, suppress zero OpenGL draws, preserve shader-toggle and
@@ -120,8 +128,9 @@ errors and unsupported shader state follow the same safe boundary.
 ## Expected FPS effect
 
 Full graph ownership can reduce OpenGL driver/state overhead and make
-submission more predictable. In two matched M4 Pro 1280x720 Complementary
-r5.8.1 stable-JAR runs, Metal improved CPU p50 by 42.6-44.8%, CPU p95 by
+submission more predictable. In two historical matched M4 Pro 1280x720
+Complementary r5.8.1 experimental Stage 9 runs, Metal improved CPU p50 by
+42.6-44.8%, CPU p95 by
 27.1-37.4%, GPU p95 by 10.5-19.5% and GPU p99 by 11.5-32.5%. Every side
 recorded zero >=100 ms stutters.
 
@@ -133,3 +142,8 @@ math, high-resolution shadows, volumetrics or memory bandwidth, so a GPU-bound
 configuration can improve less. Visual parity and the matched performance
 gate are both required; neither a translated shader nor a compiled pipeline is
 accepted as an FPS claim by itself.
+
+The stable `0.4.1` field pair instead measured 58.01 FPS enabled versus 51.21
+disabled in 1920x1080@200 Hz fullscreen. Because Iris/OpenGL owned both visible
+shader paths, the +13.29% average is a non-regression observation rather than
+an Iris-to-Metal acceleration claim.

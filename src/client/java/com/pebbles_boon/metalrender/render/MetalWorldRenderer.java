@@ -193,7 +193,21 @@ public class MetalWorldRenderer {
   }
 
   public void onWorldLoad() {
-    if (worldLoaded && renderingActive) {
+    onWorldLoad(false);
+  }
+
+  /**
+   * Attaches a client world and optionally defers duplicate terrain resources
+   * while Iris owns the visible render graph.
+   *
+   * <p>The native Metal runtime remains attached in compatibility mode so the
+   * opt-in Iris translation pipeline can still operate. Chunk meshes, texture
+   * mirrors, entity/particle buffers and terrain orchestration are created
+   * only after Iris releases visible-frame ownership.</p>
+   */
+  public void onWorldLoad(boolean deferTerrainResourcesForIris) {
+    if (worldLoaded) {
+      setIrisCompatibilityPaused(deferTerrainResourcesForIris);
       return;
     }
     worldLifecycleEpoch++;
@@ -211,6 +225,28 @@ public class MetalWorldRenderer {
     }
     AsyncCullTask.reset();
     worldLoaded = true;
+    irisCompatibilityPaused = deferTerrainResourcesForIris;
+    if (deferTerrainResourcesForIris) {
+      renderingActive = false;
+      texturesReady = false;
+      resetChunkBuildQueueState();
+      resetBulkUpdateRecoveryState();
+      MetalRenderHookState.resetSession();
+      MetalLogger.info(
+          "Iris shader pack active: duplicate Metal world resources deferred");
+      return;
+    }
+    initializeWorldRenderingResources();
+  }
+
+  private boolean initializeWorldRenderingResources() {
+    if (!worldLoaded || irisCompatibilityPaused) {
+      return false;
+    }
+    if (renderingActive) {
+      return true;
+    }
+    MetalRenderer renderer = MetalRenderClient.getRenderer();
     MetalRenderConfig gpuConfig = MetalRenderClient.getConfig();
     boolean clusterEnabled = gpuConfig != null && gpuConfig.enableClusterFrustumCulling;
     boolean hiZEnabled = gpuConfig != null && gpuConfig.enableHiZCull;
@@ -276,11 +312,13 @@ public class MetalWorldRenderer {
           meshShadersActive ? "on" : (meshShadersSupported ? "avail" : "no"),
           gpuDrivenEnabled ? "yes" : "no");
       MetalLogger.info("world rendering active (" + w + "x" + h + ")");
+      return true;
     } else if (!loggedWorldLoadWithoutRenderer) {
       loggedWorldLoadWithoutRenderer = true;
       MetalLogger.warn(
           "world load before renderer is ready; capture deferred");
     }
+    return false;
   }
 
   public void onWorldUnload() {
@@ -456,6 +494,7 @@ public class MetalWorldRenderer {
 
   public boolean metalActive() {
     return worldLoaded && renderingActive &&
+        !irisCompatibilityPaused &&
         MetalRenderClient.isMetalAvailable() &&
         MetalRenderClient.getConfig().enableMetalRendering;
   }
@@ -568,6 +607,11 @@ public class MetalWorldRenderer {
    */
   public void setIrisCompatibilityPaused(boolean paused) {
     if (irisCompatibilityPaused == paused) {
+      if (paused && renderingActive) {
+        releaseDuplicateWorldResources();
+      } else if (!paused && worldLoaded && !renderingActive) {
+        initializeWorldRenderingResources();
+      }
       return;
     }
     irisCompatibilityPaused = paused;
@@ -598,10 +642,7 @@ public class MetalWorldRenderer {
               "Failed to drain Metal frames before entering Iris mode", error);
         }
       }
-      chunkMesher.clearAllMeshes();
-      resetChunkBuildQueueState();
-      resetBulkUpdateRecoveryState();
-      textureManager.destroy();
+      releaseDuplicateWorldResources();
       if (NativeBridge.isLibLoaded()) {
         try {
           NativeBridge.nFlushDeferredDeletions();
@@ -623,9 +664,40 @@ public class MetalWorldRenderer {
     lastScanPlayerCX = Integer.MIN_VALUE;
     lastScanPlayerCZ = Integer.MIN_VALUE;
     lastScanRenderDist = -1;
-    onConfigScreenClosed();
+    if (initializeWorldRenderingResources()) {
+      onConfigScreenClosed();
+    }
     MetalLogger.info(
         "Iris shader pack disabled: Metal terrain rebuild requested");
+  }
+
+  private void releaseDuplicateWorldResources() {
+    renderingActive = false;
+    entityRenderer.shutdown();
+    particleRenderer.shutdown();
+    textureManager.destroy();
+    chunkMesher.clearAllMeshes();
+    resetChunkBuildQueueState();
+    resetBulkUpdateRecoveryState();
+    if (meshShaderBackend != null) {
+      meshShaderBackend.shutdown();
+      meshShaderBackend = null;
+    }
+    gpuDrivenEnabled = false;
+    subChunkUploadBuffer = null;
+    chunkUniformsBuffer = null;
+    if (argumentBufferHandle != 0) {
+      NativeBridge.nDestroyBuffer(argumentBufferHandle);
+      argumentBufferHandle = 0;
+    }
+    com.pebbles_boon.metalrender.nativebridge.ResidencySetManager.shutdown();
+    cullingOrcreator.shutdown();
+    hiZController.shutdown();
+    translucencySorter.shutdown();
+    terrainIndirectDraw.shutdown();
+    texturesReady = false;
+    AsyncCullTask.reset();
+    updateLoadingModeState();
   }
 
   public void beginFrame(Camera camera, float tickDelta, Matrix4f projection,

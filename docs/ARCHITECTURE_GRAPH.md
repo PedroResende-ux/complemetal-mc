@@ -2,11 +2,32 @@
 
 **English** | [Русский](ARCHITECTURE_GRAPH_RU.md)
 
-This document is the compact visual map of Complemetal `0.4.0+mc26.2`.
+This document is the compact visual map of Complemetal `0.4.1+mc26.2`.
 The full explanation of every boundary is available in
 [`TECHNICAL_ARCHITECTURE.md`](TECHNICAL_ARCHITECTURE.md).
 
-## Complete Iris shader-frame path
+## Stable 0.4.1 runtime path
+
+```mermaid
+flowchart LR
+  MC["Minecraft 26.2"] --> Iris{"Iris shader pack active?"}
+  Iris -- "yes" --> GL["Iris/OpenGL owns the visible frame"]
+  Metal["Metal 4 runtime"] --> Deferred["World resources deferred"]
+  Iris -- "yes" --> Deferred
+  Deferred --> NoDup["No duplicate meshes, atlas mirrors,<br/>entity or particle GPU buffers"]
+  GL --> Window["Minecraft window"]
+  Iris -- "no" --> Hybrid["Complemetal hybrid terrain path"]
+  Metal --> Hybrid
+  Hybrid --> Surface["Fenced IOSurface presentation"]
+  Surface --> Window
+  Dev["Explicit development opt-in"] -.-> Experimental["Stage 9 Iris Metal graph below"]
+```
+
+The complete graph below documents the implemented experimental Stage 9
+pipeline. Stable `0.4.1` does not enter it automatically and never suppresses
+Iris/OpenGL draws merely because the machine or JAR version is eligible.
+
+## Experimental complete Iris shader-frame path
 
 ```mermaid
 flowchart TB

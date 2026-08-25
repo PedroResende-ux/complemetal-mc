@@ -1,7 +1,7 @@
 # Iris-to-Metal roadmap
 
-This roadmap records the completed Stage 9 path and the `0.3.1+mc26.2`
-hardening release. Every stage remains a separate fail-closed acceptance
+This roadmap records the implemented Stage 9 path and the `0.4.1+mc26.2`
+stable safety release. Every stage remains a separate fail-closed acceptance
 boundary; a later success never hides an earlier translation, state, resource,
 parity, lifecycle, or performance failure.
 
@@ -16,7 +16,30 @@ parity, lifecycle, or performance failure.
 | 6 | MTL4 pipeline/archive cache | Complete for the validated workload | Device/OS/compiler-qualified cold compile, warm archive hits and stale-archive recovery |
 | 7 | Offscreen execution and parity | Complete | Four-phase MTL4 replay plus exact 3/3 FINAL parity, zero differing pixels in final acceptance |
 | 8 | Selective cutover | Complete | Fenced IOSurface presentation, paired FINAL OpenGL cancellation and fail-open recovery |
-| 9 | Full graph ownership and stable performance | Complete for the supported release matrix | Persistent Metal resources, frame-batched MTL4 execution, async presentation, lifecycle PASS, forced Metal 3 PASS and two matched A/B PASS results |
+| 9 | Full graph ownership and stable performance | Architecture complete; production requalification pending | Historical persistent-resource, MTL4, parity, lifecycle and matched A/B evidence; `0.4.1` automatic ownership disabled after field failures |
+
+## `0.4.1` stable safety release
+
+Real `0.4.0` play exposed three release-blocking failures that the earlier
+synthetic graph matrix did not catch: 489–1,271 ms render-thread capture
+attempts, a black world after an incomplete graph fell through to the legacy
+FINAL bridge, and a live-reload crash caused by leaving Minecraft's `ViewArea`
+null. `0.4.1` therefore changes the production gate:
+
+- packaged stable versions no longer imply Iris Metal activation;
+- Iris/OpenGL owns the visible shader frame by default;
+- full-graph opt-in and the legacy FINAL bridge are mutually exclusive;
+- duplicate Metal world resources are deferred for the full Iris session;
+- live reload uses Minecraft's paired geometry invalidation/rebuild path;
+- release authority now includes a real production-client, full-modpack,
+  fullscreen enabled/disabled field run.
+
+The exact `0.4.1` JAR passed Complementary Ultra with ImmediatelyFast, Entity
+Culling, Lithium, FerriteCore, YACL, Zoomify, and the rest of the declared set
+across flight, mining, reloads, dimensions, biomes, weather, and two worlds at
+1920x1080@200 Hz. Automatic Iris Metal ownership remains pending until an
+equally realistic profile proves it can be restored without weakening these
+gates.
 
 ## `0.3.1` hardening release
 
@@ -50,7 +73,8 @@ does not perform a CPU output readback.
 
 Production ownership has these prerequisites:
 
-1. packaged stable MetalRender version rather than a dev/alpha classpath;
+1. an explicit experimental development opt-in; stable versions alone are not
+   sufficient;
 2. Apple Silicon macOS 26 or newer;
 3. a successful native Metal 4 command-buffer/feedback probe;
 4. final Iris shader translation and Apple compilation complete;
@@ -87,10 +111,10 @@ Complementary workload, not a fixed renderer limit.
 
 ## Release acceptance
 
-The initial Stage 9 publication required all of the following. A maintenance
-release repeats the correctness/runtime matrix and either repeats the matched
-performance gate or explicitly inherits it without publishing a new FPS
-claim:
+The historical Stage 9 publication required all of the following. A future
+attempt to restore production ownership must repeat them and also pass the
+`0.4.1` real-client full-modpack field scenarios without capture stalls,
+black output, crashes, or retained-memory regression:
 
 - Metal 4 cold and warm runs with full graph ownership required;
 - Metal 3 cold and warm runs with Iris/OpenGL ownership retained;
@@ -114,11 +138,11 @@ independent final-artifact evidence is recorded in
 
 ## Explicitly deferred hardware validation
 
-Stage 9 is complete for the declared software/support matrix. It does not
-claim validation of true 2x Retina backing, physical sleep/wake, external
-display reconnect, or real presented 200 Hz cadence. These require separate
-hardware-controlled runs and remain release exclusions, not hidden Stage 9
-successes.
+The source-level Stage 9 pipeline is complete, but stable automatic ownership
+is not currently qualified. `0.4.1` does validate physical 1920x1080
+fullscreen selection on a 200 Hz display; it does not claim VSync-synchronised
+native 200 Hz scanout, true 2x Retina backing, physical sleep/wake, or external
+display reconnect. Those remain separate hardware gates.
 
 The `0.3.1` display-lifecycle work delivered the reusable foundation for those
 runs: topology/backing/wake observation, fail-open
@@ -138,7 +162,7 @@ remain open hardware gates. See
 
 ## Performance interpretation
 
-The two qualifying stable A/B runs showed a 42.6-44.8% CPU p50 improvement,
+The two historical experimental A/B runs showed a 42.6-44.8% CPU p50 improvement,
 27.1-37.4% CPU p95 improvement, a first-run 38.3% CPU p99 improvement and a
 reverse-run 1.5% CPU p99 regression within the 5% limit, plus 10.5-19.5% GPU
 p95 and 11.5-32.5% GPU p99 improvements in the exact M4 Pro 1280x720
@@ -148,3 +172,8 @@ This is evidence that the Stage 9 path can raise FPS and reduce frame time in
 that CPU/driver-sensitive scene. It is not a universal percentage promise:
 fragment math, high shadow resolution, volumetrics, bandwidth, resolution,
 pack settings and world complexity can move the bottleneck elsewhere.
+
+The stable `0.4.1` field pair measured 58.01 versus 51.21 average FPS and
+36.74 versus 36.14 FPS 1% low. Since Iris/OpenGL rendered both visible shader
+paths, the +13.29% average is retained as a non-regression measurement, not as
+a Metal shader-acceleration claim.

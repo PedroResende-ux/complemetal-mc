@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender;
 
 import com.pebbles_boon.metalrender.backend.MetalRenderer;
 import com.pebbles_boon.metalrender.command.MetalRenderCommands;
+import com.pebbles_boon.metalrender.compat.IrisCompatibility;
 import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.culling.AsyncCullTask;
@@ -139,8 +140,9 @@ public class MetalRenderClient implements ClientModInitializer {
       wr.applyFeatureConfig(config);
     }
 
-    if (levelRendererRefreshPending && mc != null && mc.levelRenderer != null) {
-      mc.levelRenderer.resetLevelRenderData();
+    if (levelRendererRefreshPending && !rebuildLevelRenderer(mc)) {
+      MetalLogger.warn(
+          "level renderer rebuild skipped; active world is unavailable");
     }
     levelRendererRefreshPending = false;
 
@@ -175,7 +177,8 @@ public class MetalRenderClient implements ClientModInitializer {
     }
 
     if (worldRenderer != null && mc.level != null) {
-      worldRenderer.onWorldLoad();
+      worldRenderer.onWorldLoad(
+          IrisCompatibility.requiresShaderCompatibilityMode());
       worldRenderer.onConfigScreenClosed();
     }
   }
@@ -464,10 +467,36 @@ public class MetalRenderClient implements ClientModInitializer {
     initMetal(mc);
     if (initState == InitState.READY && worldRenderer != null &&
         mc.level != null) {
-      worldRenderer.onWorldLoad();
+      worldRenderer.onWorldLoad(
+          IrisCompatibility.requiresShaderCompatibilityMode());
       worldRenderer.onConfigScreenClosed();
     }
     return initState == InitState.READY;
+  }
+
+  /**
+   * Rebuilds Minecraft's chunk renderer without leaving its ViewArea null.
+   *
+   * <p>In 26.2 {@code resetLevelRenderData()} is a teardown-only method. It
+   * releases the current ViewArea and SectionRenderDispatcher but does not
+   * recreate either one, so calling it from a live client crashes the next
+   * render frame. {@code invalidateCompiledGeometry(...)} performs the paired
+   * teardown and reconstruction used by Minecraft itself.</p>
+   */
+  public static boolean rebuildLevelRenderer(Minecraft mc) {
+    if (mc == null || mc.level == null || mc.levelRenderer == null
+        || mc.options == null || mc.gameRenderer == null) {
+      return false;
+    }
+    try {
+      mc.levelRenderer.invalidateCompiledGeometry(mc.level, mc.options,
+          mc.gameRenderer.mainCamera(), mc.getBlockColors());
+      return mc.levelRenderer.viewArea() != null;
+    } catch (Throwable error) {
+      MetalLogger.warn("level renderer rebuild failed: %s",
+          error.getMessage());
+      return false;
+    }
   }
 
   public static void requestNativeRetry() {

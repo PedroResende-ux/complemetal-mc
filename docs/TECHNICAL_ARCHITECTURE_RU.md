@@ -2,8 +2,8 @@
 
 [English](TECHNICAL_ARCHITECTURE.md) | **Русский**
 
-- Версия документа: 1.0
-- Целевая версия мода: `0.4.0+mc26.2`
+- Версия документа: 1.1
+- Целевая версия мода: `0.4.1+mc26.2`
 - Minecraft: Java Edition 26.2
 - Платформа: Fabric, Java 25, Apple Silicon, macOS 26+, Metal 4
 
@@ -15,6 +15,14 @@ Silicon. Его главная ветка не переводит произво
 захватывает конечные шейдеры, полное состояние пайплайна, ресурсы и граф
 проходов, а затем воспроизводит **проверенный кадр Iris целиком** через Metal
 4.
+
+Этот абзац описывает реализованную экспериментальную архитектуру Stage 9. В
+стабильном профиле `0.4.1` видимый кадр при активном Iris остаётся на
+Iris/OpenGL. Translation, draw interception и graph ownership включаются
+только явными development-параметрами, а дублирующие Metal-ресурсы мира не
+создаются всю Iris-сессию. Эта граница введена после реального теста `0.4.0`,
+который выявил render-thread stalls, чёрный кадр после неполного graph capture
+и crash при live reload.
 
 Основной путь:
 
@@ -70,7 +78,7 @@ pebbles_boon / webblepebbles. Подробная атрибуция и исто�
 | Граница | Новое значение | Совместимость |
 | --- | --- | --- |
 | Fabric mod id | `complemetal` | metadata `provides: ["metalrender"]` |
-| Имя JAR | `complemetal-0.4.0+mc26.2.jar` | старые JAR не модифицируются |
+| Имя JAR | `complemetal-0.4.1+mc26.2.jar` | старые JAR не модифицируются |
 | Ресурсы | `assets/complemetal/` | старый namespace больше не нужен внутри нового JAR |
 | Команды | `/complemetal`, `/cm` | `/metalrender`, `/mr` сохранены |
 | Конфиг | `config/complemetal.json` | старый `metalrender.json` импортируется при первом запуске |
@@ -437,17 +445,16 @@ versioned cache под `~/Library/Caches/Complemetal/native/` с SHA-256 в пу
 
 ## 10. Конфигурация и активация
 
-Production default полного Iris-to-Metal пути включается только если:
-
-1. код загружен из packaged stable version вида `x.y.z+mc26.2`;
-2. Fabric не находится в development environment;
-3. ОС — macOS 26 или новее;
-4. архитектура — `arm64`/`aarch64`;
-5. native Metal 4 probe реально создал, encoded, committed и завершил MTL4
-   command buffer.
-
-После этого всё равно должны пройти runtime gates translation, compiler,
+Стабильный `0.4.1` никогда не включает Iris draw interception только по
+версии, ОС, архитектуре или hardware probe. Production default всегда
+fail-open Iris/OpenGL. Явные development properties могут включить translation
+и graph ownership; после этого всё равно должны пройти runtime gates compiler,
 pipeline, resources, graph, parity и presentation.
+
+Native Metal 4 runtime может оставаться инициализированным, но
+`MetalWorldRenderer` подключает мир в deferred-состоянии. Terrain meshes,
+texture mirrors, entity/particle GPU buffers, mesh orchestration и presentation
+surfaces создаются лениво только после отключения Iris.
 
 Главные пользовательские настройки `complemetal.json`:
 
@@ -533,6 +540,7 @@ Minecraft от UI до оконного scanout.
 | 2026-08-25 | `52ac697` | Синхронизация реального Retina framebuffer |
 | 2026-08-25 | `be3a8d8` | Стабильный `0.3.1` exact-JAR release |
 | 2026-08-26 | `v0.4.0+mc26.2` | Публичный ребрендинг в Complemetal, migration/attribution/release packaging |
+| 2026-08-26 | `v0.4.1+mc26.2` | Отключение небезопасного automatic Iris cutover, исправление live reload и реальный full-modpack fullscreen QA |
 
 Standalone import не сохранил точный upstream base hash. Поэтому документ
 фиксирует доказуемую локальную границу `5f9997b`, а не приписывает проекту
@@ -577,9 +585,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 убеждается, что код загружен именно из указанного JAR с ожидаемым SHA-256, а не
 из Gradle source set.
 
-Metal 4 cold/warm matrix проверяет:
+Историческая экспериментальная Metal 4 cold/warm matrix проверяет:
 
-- packaged-stable automatic activation;
+- явную experimental activation;
 - shader pack on -> off -> on;
 - Overworld -> Nether -> End -> Overworld;
 - translation, compiler, pipeline archive и graph resources;
@@ -596,6 +604,13 @@ Forced Metal 3 cold/warm matrix требует обратного:
 - zero OpenGL suppressions;
 - Iris/OpenGL остаётся visible owner;
 - те же dimension/shader-toggle/lifecycle сценарии завершаются штатно.
+
+В стабильном `0.4.1` release-authority integration gate —
+`scripts/field_qa.py`. Он дважды запускает официальный production Fabric
+runtime с точным JAR, Complementary Ultra и полным compatibility mod set. Обе
+стороны проходят одинаковые сценарии и физический fullscreen
+1920x1080@200 Hz; enabled-сторона дополнительно доказывает, что Iris владеет
+видимым кадром, а дублирующие Metal world resources отсутствуют.
 
 ### 14.4. Performance gate
 
@@ -616,8 +631,15 @@ samples. Gate требует:
 - GPU p99: +11.5–32.5%;
 - ноль >=100 ms stutters на всех сторонах.
 
-Процент относится к этой сцене. Rebrand `0.4.0` не меняет renderer algorithm и
-не публикует новый FPS процент без нового matched run.
+Эти проценты относятся к исторической Stage 9 сцене с явным experimental
+включением, а не к стабильному режиму `0.4.1`.
+
+Финальный fullscreen field pair `0.4.1` показал 58.01 FPS enabled против
+51.21 disabled и 36.74 против 36.14 FPS 1% low. Поскольку видимый кадр остался
+на Iris/OpenGL, единичный результат +13.29% считается non-regression
+наблюдением, а не доказательством Iris Metal acceleration или универсальным
+обещанием. Полные данные находятся в
+[`RELEASE_CHECKLIST_0.4.1.md`](RELEASE_CHECKLIST_0.4.1.md).
 
 ## 15. Карта исходников
 
@@ -660,7 +682,9 @@ versioned schema и SHA-256, чтобы release checklist ссылался на 
 
 ## 17. Известные ограничения
 
-На момент `0.4.0` явно не заявлены как полностью квалифицированные:
+На момент `0.4.1` явно не заявлены как полностью квалифицированные:
+
+- production Iris-to-Metal visible graph ownership;
 
 - geometry-shader packs;
 - Intel Macs, Windows и Linux;
@@ -681,8 +705,8 @@ Unsupported здесь означает «остаётся безопасная 
 
 Технически логичный post-Stage-9 roadmap:
 
-1. повторить physical Retina/two-display/sleep-wake/200 Hz qualification на
-   точном `0.4.0` SHA;
+1. заново квалифицировать experimental Iris Metal graph без render-thread
+   capture stalls, stale FINAL fallback и incomplete-frame suppression;
 2. расширить shader-pack conformance corpus и reason-code статистику;
 3. добавить воспроизводимый CI для Java/cache/packet validators и отдельный
    macOS 26 release runner для native/exact-JAR;

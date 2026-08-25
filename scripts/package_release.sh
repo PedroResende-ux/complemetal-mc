@@ -15,14 +15,14 @@ sources="$project_dir/build/libs/$base_name-$mod_version-sources.jar"
 icon="$project_dir/src/main/resources/assets/complemetal/icon.png"
 release_root="$project_dir/build/release"
 destination="$release_root/$base_name-$mod_version"
-metal4_cold="$project_dir/build/exact-jar-qa-0.4.0-metal4/evidence/run-result-cold.json"
-metal4_warm="$project_dir/build/exact-jar-qa-0.4.0-metal4/evidence/run-result-warm.json"
-metal3_cold="$project_dir/build/exact-jar-qa-0.4.0-metal3/evidence/run-result-cold.json"
-metal3_warm="$project_dir/build/exact-jar-qa-0.4.0-metal3/evidence/run-result-warm.json"
+field_root="$project_dir/build/field-qa/release-stability-final"
+field_enabled="$field_root/enabled/run-result.json"
+field_baseline="$field_root/baseline/run-result.json"
+field_comparison="$field_root/comparison.json"
 
 for required in "$jar" "$sources" "$icon" \
-  "$metal4_cold" "$metal4_warm" "$metal3_cold" "$metal3_warm" \
-  "$project_dir/docs/RELEASE_CHECKLIST_0.4.0.md"; do
+  "$field_enabled" "$field_baseline" "$field_comparison" \
+  "$project_dir/docs/RELEASE_CHECKLIST_0.4.1.md"; do
   if [[ ! -f "$required" ]]; then
     echo "Required release artifact is missing: $required" >&2
     exit 1
@@ -45,15 +45,14 @@ cp "$sources" "$staging/"
 cp "$icon" "$staging/complemetal-icon-256.png"
 cp "$project_dir/LICENSE" "$staging/"
 cp "$project_dir/NOTICE" "$staging/"
-cp "$project_dir/release/GITHUB_RELEASE_NOTES_0.4.0.md" \
+cp "$project_dir/release/GITHUB_RELEASE_NOTES_0.4.1.md" \
   "$staging/RELEASE_NOTES.md"
 cp "$project_dir/release/MODRINTH_DESCRIPTION.md" "$staging/"
-cp "$project_dir/docs/RELEASE_CHECKLIST_0.4.0.md" "$staging/"
+cp "$project_dir/docs/RELEASE_CHECKLIST_0.4.1.md" "$staging/"
 mkdir -p "$staging/qa-evidence"
-cp "$metal4_cold" "$staging/qa-evidence/metal4-cold.json"
-cp "$metal4_warm" "$staging/qa-evidence/metal4-warm.json"
-cp "$metal3_cold" "$staging/qa-evidence/metal3-cold.json"
-cp "$metal3_warm" "$staging/qa-evidence/metal3-warm.json"
+cp "$field_enabled" "$staging/qa-evidence/field-enabled.json"
+cp "$field_baseline" "$staging/qa-evidence/field-baseline.json"
+cp "$field_comparison" "$staging/qa-evidence/field-comparison.json"
 
 evidence_archive="$base_name-$mod_version-qa-evidence.zip"
 (

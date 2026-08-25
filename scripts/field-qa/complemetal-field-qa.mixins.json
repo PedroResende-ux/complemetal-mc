@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "com.pebbles_boon.metalrender.fieldqa.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "FieldFrameSamplerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

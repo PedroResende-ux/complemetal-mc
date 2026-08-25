@@ -1,20 +1,20 @@
 # Metal 4 implementation status
 
-This document is part of the `0.3.1+mc26.2` release contract. Runtime status
-must distinguish Metal 4 availability, active Iris graph ownership and the
-Metal 3/OpenGL fallback; creating an MTL4 object alone is not an active draw
-claim.
+This document records the Metal 4 implementation and the current
+`0.4.1+mc26.2` release boundary. Runtime status must distinguish Metal 4
+availability, experimental Iris graph ownership, and the stable Iris/OpenGL
+fallback; creating an MTL4 object alone is not an active draw claim.
 
-| Area | Stable `0.3.1` status |
+| Area | `0.4.1` status |
 | --- | --- |
 | Metal 4 API/runtime detection | Implemented with a real command-buffer and completion-feedback probe |
-| MTL4 command queue and allocator | Active for the Iris graph on supported macOS 26 systems |
+| MTL4 command queue and allocator | Implemented; Iris graph use is explicit experimental opt-in |
 | Iris GLSL -> SPIR-V -> MSL | Implemented after final Iris transformations; bounded cache |
 | Apple Metal library validation | Implemented for every accepted stage |
 | Device-qualified pipeline archive | Implemented with warm reuse and stale-archive recovery |
 | Full Iris pipeline/resource ABI | Captured, reflected and fail-closed |
 | Persistent Metal graph resources | Implemented with history preservation and bounded native allocation |
-| MTL4 frame execution | Active for validated SHADOW, GEOMETRY, DEFERRED, COMPOSITE and FINAL passes |
+| MTL4 frame execution | Implemented for validated phases; not the stable Iris visible path |
 | Hazards | Explicit RAW/WAR/WAW tracking and MTL4 barriers |
 | Texture input | IOSurface handoff or bounded resident Metal texture |
 | Vertex/index input | Bounded resident Metal buffer cache |
@@ -24,7 +24,8 @@ claim.
 | Resize/fullscreen/surface restore | Exact-JAR validated |
 | Overworld/Nether/End transition | Exact-JAR validated |
 | Iris shader toggle/reload | Exact-JAR validated |
-| Matched frame-time gate | Passed twice in opposite launch orders |
+| Historical Stage 9 frame-time gate | Passed twice in opposite launch orders |
+| Stable full-modpack fullscreen gate | Passed enabled/disabled at 1920x1080@200 Hz |
 | True 2x Retina backing | Passed on an earlier development candidate; outside final-artifact qualification |
 | Physical sleep/wake | Not validated; outside stable scope |
 | External display reconnect | Not validated; outside stable scope |
@@ -74,19 +75,12 @@ reproduction commands are in
 
 ## Production activation
 
-The complete Iris-to-Metal path defaults on only when all static conditions
-are true:
-
-- the classes come from a packaged stable version such as
-  `0.3.1+mc26.2`, not a dev or prerelease classpath;
-- the OS is macOS 26 or newer;
-- the process architecture is Apple Silicon.
-
-Native availability, translation, pipeline, graph and parity checks still run
-before any OpenGL draw is suppressed. `-Dmetalrender.irisMetal.enabled=false`
-disables the whole path. The older fine-grained
-`metalrender.experimental.irisMetal*` properties remain as diagnostic
-overrides, not normal installation requirements.
+Stable `0.4.1` never turns Iris draw interception on from static eligibility.
+The global default is off for every JAR version, OS, and architecture. An
+explicit development `-Dmetalrender.irisMetal.enabled=true` can select the
+experimental path; native availability, translation, pipeline, graph, parity,
+and presentation gates must still pass before suppression. `false` remains a
+hard safe-disable override.
 
 ## Backend names
 
@@ -124,7 +118,7 @@ blocking so startup cannot suppress a frame without an image.
 
 ## Performance status
 
-The Stage 9 renderer passed two 600-frame matched warm-cache A/B gates in
+The experimental Stage 9 renderer passed two 600-frame matched warm-cache A/B gates in
 opposite launch orders. Metal improved every required CPU and GPU percentile,
 with no >=100 ms stutters and no MTL4 commit-feedback errors. Detailed numbers
 and the exact scenario are in [README.md](../README.md). Those measurements
@@ -133,14 +127,19 @@ and does not claim a newly measured FPS percentage. Its final exact-artifact
 evidence is in
 [`RELEASE_CHECKLIST_0.3.1.md`](RELEASE_CHECKLIST_0.3.1.md).
 
-The measured uplift applies to the tested M4 Pro, 1280x720 Complementary
+The measured uplift applies to the historical M4 Pro, 1280x720 Complementary
 Reimagined r5.8.1 scenario. A GPU-bound pack or resolution can show a smaller
 gain because shader math and memory traffic are not removed by translation.
 
+The stable `0.4.1` production field pair passed at 58.01 versus 51.21 average
+FPS and 36.74 versus 36.14 FPS 1% low in physical 1920x1080@200 Hz fullscreen.
+Iris/OpenGL remained visible on both sides, so this proves non-regression for
+the qualified modpack rather than active MTL4 shader ownership.
+
 ## Stable support boundary
 
-Stable means full graph ownership only for states that pass every strict gate.
-Unsupported content retains Iris/OpenGL or Minecraft rendering. Native
+Stable `0.4.1` means Iris/OpenGL ownership while the full graph is
+requalified. Unsupported content retains Iris/OpenGL or Minecraft rendering. Native
 entity/particle replacement, experimental mesh shaders, Hi-Z culling,
 MetalFX conformance, physical power/display lifecycle and native synchronized
 200 Hz presentation are not implied by the Stage 9 Iris graph release.

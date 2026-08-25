@@ -55,13 +55,15 @@ final class IrisTranslationCoordinatorTest {
             IrisSelectiveCutoverGate.Mode.ARMED, 4, 2,
             false, 0, 0, 0, 0);
     assertTrue(IrisTranslationCoordinator.legacyCutoverCaptureEligible(
-        false, 0, IrisRenderGraph.Phase.FINAL, armed));
+        false, false, 0, IrisRenderGraph.Phase.FINAL, armed));
     assertFalse(IrisTranslationCoordinator.legacyCutoverCaptureEligible(
-        true, 0, IrisRenderGraph.Phase.FINAL, armed));
+        true, false, 0, IrisRenderGraph.Phase.FINAL, armed));
     assertFalse(IrisTranslationCoordinator.legacyCutoverCaptureEligible(
-        false, 1, IrisRenderGraph.Phase.FINAL, armed));
+        false, true, 0, IrisRenderGraph.Phase.FINAL, armed));
     assertFalse(IrisTranslationCoordinator.legacyCutoverCaptureEligible(
-        false, 0, IrisRenderGraph.Phase.COMPOSITE, armed));
+        false, false, 1, IrisRenderGraph.Phase.FINAL, armed));
+    assertFalse(IrisTranslationCoordinator.legacyCutoverCaptureEligible(
+        false, false, 0, IrisRenderGraph.Phase.COMPOSITE, armed));
   }
 
   @Test
