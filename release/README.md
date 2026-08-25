@@ -4,6 +4,18 @@ This directory contains reviewable metadata for GitHub and Modrinth. It does
 not contain credentials or generated JARs. Release binaries are created under
 the ignored `build/release/` directory by `scripts/package_release.sh`.
 
+## Publication record
+
+- GitHub repository: <https://github.com/daniiarkg/complemetal-mc>
+- GitHub release: <https://github.com/daniiarkg/complemetal-mc/releases/tag/v0.4.0%2Bmc26.2>
+- Modrinth project: <https://modrinth.com/mod/complemetal>, id `eQOVChw5`
+- Modrinth version: `0.4.0+mc26.2`, id `aQBN08lk`
+- Modrinth submission state on 2026-08-26: project `processing`, requested
+  `approved`; version `listed`
+
+The release tag remains attached to the exact source used to build the JAR.
+This post-release record does not change the tagged artifact.
+
 ## GitHub
 
 Repository: <https://github.com/daniiarkg/complemetal-mc>
@@ -20,9 +32,9 @@ Repository: <https://github.com/daniiarkg/complemetal-mc>
 
 ## Modrinth
 
-Proposed slug: `complemetal`. It returned HTTP 404 from the public Modrinth API
-on 2026-08-26, so no project occupied that exact slug at preparation time.
-Availability must be checked again immediately before creation.
+Project slug: `complemetal`. The project and first version were created as
+drafts, their metadata and remote file hashes were verified, the version was
+set to `listed`, and the project was submitted for moderation.
 
 The API project template is `modrinth-project.json`; inject the long body from
 `MODRINTH_DESCRIPTION.md` into its `body` field before sending it. Create the

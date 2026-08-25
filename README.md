@@ -4,6 +4,10 @@
 
 # Complemetal
 
+[GitHub release](https://github.com/daniiarkg/complemetal-mc/releases/tag/v0.4.0%2Bmc26.2)
+· [Modrinth](https://modrinth.com/mod/complemetal)
+· [Architecture graphs](docs/ARCHITECTURE_GRAPH.md)
+
 Complemetal is a Fabric client renderer for Apple Silicon Macs. It captures
 the final shader programs and render graph produced by Iris, translates the
 validated workload through SPIR-V and MSL, executes it with Metal 4, then
@@ -106,6 +110,11 @@ claim a new performance percentage beyond the Stage 9 measurements.
 2. Run the instance with Java 25.
 3. Place `complemetal-0.4.0+mc26.2.jar` in the instance's `mods` folder.
 4. Select the shader pack and run `/complemetal status` in a world.
+
+Download the exact release JAR from
+[GitHub Releases](https://github.com/daniiarkg/complemetal-mc/releases/tag/v0.4.0%2Bmc26.2)
+or [Modrinth](https://modrinth.com/mod/complemetal). New Modrinth projects can
+remain unavailable publicly while their first release is under moderation.
 
 No JVM enable flags are required for the packaged stable release. The emergency
 fallback override intentionally keeps its legacy name:
