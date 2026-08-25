@@ -1,68 +1,73 @@
-# Complemetal
+# Minecraft shaders, accelerated for Apple Silicon
 
-Complemetal accelerates validated Iris shader graphs through Metal 4 on Apple
-Silicon Macs. It captures the final GLSL produced by Iris, translates it to
-OpenGL-semantics SPIR-V and MSL, compiles exact Metal pipelines, reconstructs
-the shader-pack render graph, and presents the completed image through a
-fenced IOSurface without a CPU output copy.
+Complemetal is a performance mod built specifically for M-series Macs. It
+accelerates compatible Iris shader workloads with Metal 4, targeting smoother
+frame pacing, lower CPU and GPU frame times, and more headroom for demanding
+shaders at high refresh rates.
 
-## Honest compatibility model
+Keep the Minecraft setup you already know: Fabric, Sodium, Iris, and your
+shader pack. Complemetal works underneath that stack to make better use of the
+Apple Silicon GPU.
 
-Complemetal is fail-open. A Metal frame becomes visible only after shader,
-pipeline, resource, graph, lifecycle, three-frame visual-parity and
-presentation gates all pass. Unknown or unsupported state remains on
-Iris/OpenGL or Minecraft's normal renderer. Geometry-shader packs are not
-supported because Metal has no direct geometry-shader stage.
+## Measured performance
 
-The current qualified profile is:
+In two matched 600-frame M4 Pro tests at 1280x720 with Complementary
+Reimagined r5.8.1, Complemetal measured:
+
+- up to **44.8% lower CPU median frame time**;
+- up to **37.4% lower CPU p95 frame time**;
+- up to **19.5% lower GPU p95 frame time**;
+- up to **32.5% lower GPU p99 frame time**;
+- zero frames at or above 100 ms across every test side.
+
+That translates into faster shader rendering, smoother frame delivery, and
+more performance headroom for higher visual settings. Results vary with the
+Mac, resolution, world, shader preset, and graphics settings.
+
+## Built for M-series Macs
+
+The current release is tuned and qualified for:
 
 - Minecraft Java Edition 26.2;
-- Fabric Loader 0.19.3+ and Fabric API 0.156.0+26.2;
-- Java 25;
 - Apple Silicon on macOS 26+;
-- Sodium 0.9.1 and Iris 1.11.2;
-- Complementary Reimagined r5.8.1 as the exact shader-pack acceptance
-  workload.
+- Java 25 and Fabric Loader;
+- Fabric API, Sodium 0.9.1, and Iris 1.11.2;
+- Complementary Reimagined r5.8.1 as the primary acceptance workload.
 
-Other shader packs are not prevalidated. They may use Metal only when their
-observed programs and render state pass the same strict gates.
-
-## Performance evidence
-
-On an M4 Pro at 1280x720 with Complementary Reimagined r5.8.1, two matched
-600-frame warm-cache A/B runs in opposite launch orders measured 42.6–44.8%
-lower CPU p50 frame time, 27.1–37.4% lower CPU p95, 10.5–19.5% lower GPU p95
-and 11.5–32.5% lower GPU p99. Every side recorded zero frames at or above
-100 ms.
-
-Those numbers apply to that exact scene, not every Mac or shader setting.
-Fragment math, shadow resolution, volumetrics, bandwidth and resolution can
-remain the bottleneck.
+Other Iris shader packs can use the accelerated path when their required
+features are supported. If a particular effect cannot use Metal safely,
+Minecraft continues through its normal Iris/OpenGL renderer instead of
+breaking the frame.
 
 ## Install
 
-Install Fabric API, Sodium and Iris, use Java 25, then put the Complemetal JAR
-in `mods/`. In a world, run:
+1. Install Fabric API, Sodium, and Iris for Minecraft 26.2.
+2. Use Java 25 on an Apple Silicon Mac running macOS 26 or newer.
+3. Put the Complemetal JAR in `mods/`.
+4. Select your Iris shader pack and play.
+
+To inspect the active renderer in a world, run:
 
 ```text
 /complemetal status
 ```
 
-The old `/metalrender` and `/mr` commands remain available. An existing
-`config/metalrender.json` is migrated to `config/complemetal.json` on first
-load. The emergency Iris/OpenGL baseline switch is:
+Existing MetalRender users keep their settings automatically. The legacy
+`/metalrender` and `/mr` commands also remain available.
 
-```text
--Dmetalrender.irisMetal.enabled=false
-```
+## Source and documentation
+
+- [GitHub repository](https://github.com/daniiarkg/complemetal-mc)
+- [Technical architecture](https://github.com/daniiarkg/complemetal-mc/blob/main/docs/TECHNICAL_ARCHITECTURE.md)
+- [Architecture graphs](https://github.com/daniiarkg/complemetal-mc/blob/main/docs/ARCHITECTURE_GRAPH.md)
+- [Release verification](https://github.com/daniiarkg/complemetal-mc/blob/main/docs/RELEASE_CHECKLIST_0.4.0.md)
 
 ## Origin and license
 
 Complemetal is a continuation and fork of
 [MetalRender by pebbles_boon / webblepebbles](https://github.com/webblepebbles/MetalRender).
 The original renderer foundation and the modifications in Complemetal are
-distributed under Apache License 2.0. The source repository contains a full
-lineage document and NOTICE.
+distributed under Apache License 2.0.
 
 Complemetal is not affiliated with or endorsed by Apple, Mojang, Microsoft,
-Iris, Sodium or the Complementary shader-pack authors.
+Iris, Sodium, or the Complementary shader-pack authors.

@@ -1,7 +1,7 @@
 {
   "slug": "complemetal",
   "title": "Complemetal",
-  "description": "Metal 4 acceleration for validated Iris shader graphs on Apple Silicon, with a strict fail-open OpenGL fallback.",
+  "description": "Metal 4 shader acceleration for Apple Silicon Macs—smoother Iris rendering, lower frame times, and more headroom for Complementary shaders.",
   "body": "",
   "categories": [
     "optimization",

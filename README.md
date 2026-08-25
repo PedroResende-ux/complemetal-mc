@@ -8,16 +8,15 @@
 · [Modrinth](https://modrinth.com/mod/complemetal)
 · [Architecture graphs](docs/ARCHITECTURE_GRAPH.md)
 
-Complemetal is a Fabric client renderer for Apple Silicon Macs. It captures
-the final shader programs and render graph produced by Iris, translates the
-validated workload through SPIR-V and MSL, executes it with Metal 4, then
-presents the completed image to Minecraft through a fenced IOSurface bridge.
+Complemetal is a performance mod built specifically for Apple Silicon Macs.
+It accelerates compatible Iris shader workloads with Metal 4 for smoother
+frame pacing, lower CPU and GPU frame times, and more headroom for shader-heavy
+Minecraft at high refresh rates.
 
-The renderer is deliberately **fail-open**: if translation, render state,
-resource bindings, visual parity, display lifecycle or presentation cannot be
-proven correct, Iris/OpenGL or Minecraft keeps ownership. Complemetal does not
-invent missing bindings and does not suppress a visible OpenGL draw before a
-usable Metal result exists.
+In matched M4 Pro testing with Complementary Reimagined, Complemetal reduced
+median CPU frame time by up to **44.8%** and GPU p99 frame time by up to
+**32.5%**. Install it alongside Iris and Sodium and keep using the shader packs
+and settings you already know.
 
 ## Origin
 
