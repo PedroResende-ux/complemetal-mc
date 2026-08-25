@@ -49,20 +49,33 @@ public final class MetalRenderConfig {
 
   private static java.nio.file.Path configFile() {
     return net.fabricmc.loader.api.FabricLoader.getInstance()
+        .getConfigDir().resolve("complemetal.json");
+  }
+
+  private static java.nio.file.Path legacyConfigFile() {
+    return net.fabricmc.loader.api.FabricLoader.getInstance()
         .getConfigDir().resolve("metalrender.json");
   }
 
   private static java.nio.file.Path deepDebugFlagFile() {
+    return net.fabricmc.loader.api.FabricLoader.getInstance()
+        .getConfigDir().resolve("complemetal-debug-next-run.flag");
+  }
+
+  private static java.nio.file.Path legacyDeepDebugFlagFile() {
     return net.fabricmc.loader.api.FabricLoader.getInstance()
         .getConfigDir().resolve("metalrender-debug-next-run.flag");
   }
 
   private static void activateOneRunDeepDebugIfRequested() {
     java.nio.file.Path flagPath = deepDebugFlagFile();
+    java.nio.file.Path legacyFlagPath = legacyDeepDebugFlagFile();
     try {
-      deepDebugActive = java.nio.file.Files.exists(flagPath);
+      deepDebugActive = java.nio.file.Files.exists(flagPath)
+          || java.nio.file.Files.exists(legacyFlagPath);
       if (deepDebugActive) {
         java.nio.file.Files.deleteIfExists(flagPath);
+        java.nio.file.Files.deleteIfExists(legacyFlagPath);
       }
     } catch (Exception e) {
       deepDebugActive = false;
@@ -74,9 +87,15 @@ public final class MetalRenderConfig {
   public static MetalRenderConfig load() {
     activateOneRunDeepDebugIfRequested();
     MetalRenderConfig cfg = new MetalRenderConfig();
+    boolean migrateLegacyConfig = false;
 
     try {
       java.nio.file.Path path = configFile();
+      if (!java.nio.file.Files.exists(path)
+          && java.nio.file.Files.exists(legacyConfigFile())) {
+        path = legacyConfigFile();
+        migrateLegacyConfig = true;
+      }
       if (java.nio.file.Files.exists(path)) {
         String raw = java.nio.file.Files.readString(path);
         com.google.gson.JsonObject obj = com.google.gson.JsonParser.parseString(raw).getAsJsonObject();
@@ -153,6 +172,11 @@ public final class MetalRenderConfig {
 
     cfg.loadFeatureFlags();
     loadFromSystemProperties();
+    if (migrateLegacyConfig) {
+      cfg.save();
+      com.pebbles_boon.metalrender.util.MetalLogger.info(
+          "migrated metalrender.json to complemetal.json");
+    }
     return cfg;
   }
 
@@ -223,7 +247,7 @@ public final class MetalRenderConfig {
       java.nio.file.Files.createDirectories(path.getParent());
       String json = new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(obj);
       java.nio.file.Path temporary = java.nio.file.Files.createTempFile(
-          path.getParent(), "metalrender-", ".json.tmp");
+          path.getParent(), "complemetal-", ".json.tmp");
       try {
         java.nio.file.Files.writeString(temporary, json);
         try {
@@ -273,7 +297,8 @@ public final class MetalRenderConfig {
 
   public static boolean isOneRunDeepDebugRequested() {
     try {
-      return java.nio.file.Files.exists(deepDebugFlagFile());
+      return java.nio.file.Files.exists(deepDebugFlagFile())
+          || java.nio.file.Files.exists(legacyDeepDebugFlagFile());
     } catch (Exception e) {
       return false;
     }
@@ -287,6 +312,7 @@ public final class MetalRenderConfig {
         java.nio.file.Files.writeString(flagPath, "enabled\n");
       } else {
         java.nio.file.Files.deleteIfExists(flagPath);
+        java.nio.file.Files.deleteIfExists(legacyDeepDebugFlagFile());
       }
     } catch (Exception e) {
       com.pebbles_boon.metalrender.util.MetalLogger.warn(

@@ -1,68 +1,72 @@
-# MetalRender commands
+# Complemetal commands
 
-All commands are client-side. Use `/metalrender` or the shorter `/mr` alias.
+All commands are client-side. Use `/complemetal` or the short `/cm` alias.
+The former MetalRender roots `/metalrender` and `/mr` remain compatibility
+aliases and execute the same command tree.
 
 | Command | Result |
 | --- | --- |
-| `/metalrender` | Shows help |
-| `/metalrender help` | Shows the command list |
-| `/metalrender status` | Reports initialization, hardware, backend mode, Metal 4 runtime and draw-path state |
-| `/metalrender config open` | Opens MetalRender settings |
-| `/metalrender config save` | Saves the active configuration |
-| `/metalrender config reload` | Reloads the configuration from disk and reapplies it |
-| `/metalrender config reset` | Restores validated defaults and invalidates generated meshes |
-| `/metalrender cache clear` | Clears MetalRender terrain meshes |
-| `/metalrender reload` | Rebuilds Minecraft level render data and MetalRender meshes |
-| `/metalrender restart` | Restarts the renderer session; process-global Metal device and pipeline objects are released when the client exits |
-| `/metalrender performance reset` | Restores resolution scaling to `1.0x` |
-| `/metalrender profile` | Toggles the MetalRender profiler overlay |
+| `/complemetal` | Shows help |
+| `/complemetal help` | Shows the command list |
+| `/complemetal status` | Reports initialization, hardware, translation, pipeline, graph, ownership and presentation status |
+| `/complemetal config open` | Opens Complemetal settings |
+| `/complemetal config save` | Saves the active configuration |
+| `/complemetal config reload` | Reloads the configuration from disk and reapplies it |
+| `/complemetal config reset` | Restores validated defaults and invalidates generated meshes |
+| `/complemetal cache clear` | Clears generated terrain meshes |
+| `/complemetal reload` | Rebuilds Minecraft level render data and Complemetal meshes |
+| `/complemetal restart` | Restarts the renderer session; process-global Metal objects are released at client exit |
+| `/complemetal performance reset` | Restores resolution scaling to `1.0x` |
+| `/complemetal profile` | Toggles the frame-time profiler overlay |
 
 Commands that reset, reload or restart state require an attended client
 session. This prevents automation or a remote command source from silently
-destroying transient renderer state.
+discarding transient renderer state.
 
 ## First diagnostic
 
 Run:
 
 ```text
-/metalrender status
+/complemetal status
 ```
 
-The important fields are:
+The most useful fields are:
 
-- `Init state`: whether MetalRender reached the running state;
-- `Fallback reason`: why the normal Minecraft renderer was retained;
-- `Native backend`: `METAL4_RUNTIME_VERIFIED_METAL3_RENDER` means an MTL4
-  command buffer completed successfully while renderer draw encoding still
-  uses the Metal 3 compatibility path;
-- `Metal 4 runtime`: result of the real MTL4 command-buffer completion probe;
-- `Metal 4 draw path`: `Compatibility` is expected in the current release.
+- `Init state` and `Fallback reason`: whether native initialization succeeded
+  and why Minecraft retained the normal renderer when it did not;
+- `Native backend`: the exact Metal runtime mode;
+- `Iris GLSL translation`, `MSL library validation` and pipeline-state fields:
+  progress through shader and pipeline preparation;
+- `Iris render graph`, graph attachments and full graph: whether every pass,
+  dependency and resource is complete;
+- `ownership`, successful presentations and OpenGL suppression: whether Metal
+  actually owns the validated Iris graph rather than merely compiling it;
+- native fault counters and blocker summaries: the first release-relevant
+  reason for a fail-open decision.
 
-`Ready` for the Metal 4 runtime is not proof of MTL4 draw encoding. On a
-Metal 4-capable macOS 26 runtime, the expected combination is runtime `Ready`,
-draw path `Compatibility`, and backend
-`METAL4_RUNTIME_VERIFIED_METAL3_RENDER`. On macOS 14 or another runtime that
-does not expose MTL4, `Unavailable`, draw path `Compatibility`, and
-`METAL3_FALLBACK_NO_METAL4` are the normal stable fallback.
-
-The stable label applies to this Metal 3 compatibility draw profile. When an
-Iris shader pack is active, Iris continues to render through OpenGL. The
-opt-in Iris GLSL-to-SPIR-V-to-MSL cache experiment does not execute Metal
-pipelines and does not claim an FPS improvement.
+`nIsMetal4Active` or an available MTL4 object is not by itself proof that the
+visible shader graph runs through Metal. Visible ownership requires the full
+translation, pipeline, resource, graph, parity and presentation gates.
 
 ## Recovery order
 
 For a transient visual problem, use the least disruptive operation first:
 
 ```text
-/metalrender reload
-/metalrender restart
-/metalrender config reset
+/complemetal reload
+/complemetal restart
+/complemetal config reset
 ```
 
-If the renderer still falls back, save `latest.log` before restarting the game.
+If the problem remains, save `latest.log` before restarting the game. To force
+the safe Iris/OpenGL baseline for comparison, add this JVM property and restart
+the client:
 
-For a clean vanilla baseline, disable MetalRender before startup with the JVM
-property `-Dmetalrender.enabled=false`. This is a diagnostic switch, not an
-in-game command, and requires a client restart.
+```text
+-Dmetalrender.irisMetal.enabled=false
+```
+
+The legacy `metalrender.*` property namespace is intentional: it is a stable
+diagnostic and automation compatibility boundary retained after the public
+Complemetal rename.

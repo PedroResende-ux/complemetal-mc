@@ -66,7 +66,7 @@ public class MetalRenderSettingsScreen extends Screen {
   private static final int FPS_LIMIT_UNLIMITED = 241;
 
   private static final String[] TABS = {
-      "Video", "MetalRender", "Quality", "Performance", "Advanced"
+      "Video", "Complemetal", "Quality", "Performance", "Advanced"
   };
 
   private final Screen parent;
@@ -132,7 +132,7 @@ public class MetalRenderSettingsScreen extends Screen {
   }
 
   public MetalRenderSettingsScreen(Screen parent) {
-    super(Component.literal("MetalRender Settings"));
+    super(Component.literal("Complemetal Settings"));
     this.parent = parent;
   }
 
@@ -215,9 +215,9 @@ public class MetalRenderSettingsScreen extends Screen {
   private void drawHeader(GuiGraphicsExtractor ctx, net.minecraft.client.gui.Font font) {
     ctx.fillGradient(px + 1, py + 1, px + pw - 1, py + HDR_H, C_HEADER, C_HEADER_GRADIENT);
     ctx.text(font,
-        Component.literal("MetalRender Settings"),
+        Component.literal("Complemetal Settings"),
         px + 16, py + (HDR_H - 9) / 2 + 1, C_TEXT_PRI, false);
-    int vx = px + 16 + font.width("MetalRender Settings") + 8;
+    int vx = px + 16 + font.width("Complemetal Settings") + 8;
     ctx.text(font, Component.literal("v" + modVersion()),
         vx, py + (HDR_H - 9) / 2 + 1, C_TEXT_SEC, false);
   }
@@ -733,7 +733,7 @@ public class MetalRenderSettingsScreen extends Screen {
   private static String modVersion() {
     try {
       return FabricLoader.getInstance()
-          .getModContainer("metalrender")
+          .getModContainer("complemetal")
           .map(container ->
               container.getMetadata().getVersion().getFriendlyString())
           .orElse("development");

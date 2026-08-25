@@ -208,13 +208,13 @@ public class CustomChunkMesher {
     this.backgroundThreadCount = Math.max(2, Math.min(14, processors - immediateThreadCount - 1));
 
     final java.util.concurrent.ThreadFactory immediateFactory = r -> {
-      Thread t = new Thread(r, "MetalRender-MeshBuilder-Immediate");
+      Thread t = new Thread(r, "Complemetal-MeshBuilder-Immediate");
       t.setDaemon(true);
       t.setPriority(Thread.NORM_PRIORITY);
       return t;
     };
     final java.util.concurrent.ThreadFactory backgroundFactory = r -> {
-      Thread t = new Thread(r, "MetalRender-MeshBuilder-Background");
+      Thread t = new Thread(r, "Complemetal-MeshBuilder-Background");
       t.setDaemon(true);
       t.setPriority(Thread.NORM_PRIORITY - 1);
       return t;

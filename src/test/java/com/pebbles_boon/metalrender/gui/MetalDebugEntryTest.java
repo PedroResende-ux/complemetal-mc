@@ -104,7 +104,7 @@ final class MetalDebugEntryTest {
         MetalDebugEntry.resolve(snapshot), snapshot, VERSION);
 
     assertEquals(first, second);
-    assertTrue(first.contains("MetalRender " + VERSION));
+    assertTrue(first.contains("Complemetal " + VERSION));
     assertTrue(first.contains("Iris/OpenGL compatibility"));
     assertFalse(first.toLowerCase().contains("concoction"));
   }

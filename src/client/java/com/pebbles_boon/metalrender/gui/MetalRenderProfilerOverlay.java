@@ -10,7 +10,7 @@ import net.minecraft.resources.Identifier;
 
 @SuppressWarnings("deprecation")
 public final class MetalRenderProfilerOverlay implements HudElement {
-  private static final Identifier PROFILER_ID = Identifier.fromNamespaceAndPath("metalrender", "profiler_overlay");
+  private static final Identifier PROFILER_ID = Identifier.fromNamespaceAndPath("complemetal", "profiler_overlay");
   private static final int BG_COLOR = 0x80213648;
   private static final int TEXT_COLOR = 0xFF89CFF0;
   private static final int HEADER_COLOR = 0xFFA8DFF0;
@@ -35,7 +35,7 @@ public final class MetalRenderProfilerOverlay implements HudElement {
       return;
     }
     String[] lines = snapshot.toLines();
-    String header = "MetalRender Profiler";
+    String header = "Complemetal Profiler";
     int maxWidth = mc.font.width(header);
     for (String line : lines) {
       int w = mc.font.width(line);

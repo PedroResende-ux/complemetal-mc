@@ -1,0 +1,35 @@
+{
+  "name": "Complemetal 0.4.0 for Minecraft 26.2",
+  "version_number": "0.4.0+mc26.2",
+  "changelog": "First release under the Complemetal name. Public mod id, artifact, UI, resources and commands were renamed while the MetalRender Java/JNI ABI and legacy settings remain compatible. Existing metalrender.json is migrated automatically. Includes the complete Stage 9 Iris GLSL -> SPIR-V -> MSL -> Metal 4 graph path, strict visual parity, fenced IOSurface presentation and fail-open Iris/OpenGL fallback. Complemetal is a continuation and fork of MetalRender by pebbles_boon / webblepebbles under Apache-2.0.",
+  "dependencies": [
+    {
+      "project_id": "P7dR8mSH",
+      "dependency_type": "required"
+    },
+    {
+      "project_id": "AANobbMI",
+      "dependency_type": "required"
+    },
+    {
+      "project_id": "YL57xq9U",
+      "dependency_type": "required"
+    }
+  ],
+  "game_versions": [
+    "26.2"
+  ],
+  "version_type": "release",
+  "loaders": [
+    "fabric"
+  ],
+  "featured": true,
+  "status": "draft",
+  "requested_status": "listed",
+  "project_id": "__MODRINTH_PROJECT_ID__",
+  "file_parts": [
+    "file"
+  ],
+  "primary_file": "file",
+  "environment": "client_only"
+}

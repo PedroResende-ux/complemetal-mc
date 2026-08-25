@@ -1,0 +1,12 @@
+Complemetal
+Copyright 2026 Daniiar
+
+Complemetal is a continuation and fork of MetalRender, originally created by
+pebbles_boon (webblepebbles):
+https://github.com/webblepebbles/MetalRender
+
+MetalRender and the modifications in Complemetal are distributed under the
+Apache License, Version 2.0. The repository's standalone history begins from
+an imported MetalRender source snapshot; the exact upstream base commit was
+not recorded in that import. See docs/LINEAGE.md for the project lineage and
+the major modifications made after the fork.

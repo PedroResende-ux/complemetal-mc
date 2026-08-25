@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "id": "metalrender-exact-jar-qa",
+  "id": "complemetal-exact-jar-qa",
   "version": "1.0.0",
-  "name": "MetalRender exact release JAR QA",
+  "name": "Complemetal exact release JAR QA",
   "environment": "client",
   "entrypoints": {
     "fabric-client-gametest": [
@@ -15,7 +15,7 @@
     "fabric-client-gametest-api-v1": "*",
     "minecraft": "26.2",
     "java": ">=25",
-    "metalrender": "*",
+    "complemetal": "*",
     "sodium": "0.9.x",
     "iris": ">=1.11.2"
   }

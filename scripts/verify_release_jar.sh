@@ -32,7 +32,9 @@ required_entries=(
   "metalrender.iris.mixins.json"
   "libmetalrender.dylib"
   "shaders.metallib"
+  "assets/complemetal/icon.png"
   "LICENSE"
+  "NOTICE"
 )
 
 for required in "${required_entries[@]}"; do
@@ -47,12 +49,12 @@ if grep -Fxq "libmetalrender_debug_v2.dylib" <<<"$entries"; then
   exit 1
 fi
 
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/metalrender-jar.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/complemetal-jar.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 (cd "$tmp_dir" && jar xf "$jar_path" \
   libmetalrender.dylib shaders.metallib \
   fabric.mod.json metalrender.mixins.json metalrender.iris.mixins.json \
-  LICENSE META-INF/MANIFEST.MF)
+  assets/complemetal/icon.png LICENSE NOTICE META-INF/MANIFEST.MF)
 
 if ! file "$tmp_dir/libmetalrender.dylib" | grep -q 'Mach-O 64-bit.*arm64'; then
   echo "Packaged native library is not macOS arm64" >&2
@@ -79,6 +81,34 @@ if ! grep -q '"minecraft"[[:space:]]*:[[:space:]]*"[^"]*26\.2' \
   exit 1
 fi
 
+if ! grep -q '"id"[[:space:]]*:[[:space:]]*"complemetal"' \
+  "$tmp_dir/fabric.mod.json" ||
+   ! grep -q '"name"[[:space:]]*:[[:space:]]*"Complemetal"' \
+  "$tmp_dir/fabric.mod.json" ||
+   ! grep -q '"icon"[[:space:]]*:[[:space:]]*"assets/complemetal/icon.png"' \
+  "$tmp_dir/fabric.mod.json" ||
+   ! grep -q '"metalrender"' "$tmp_dir/fabric.mod.json"; then
+  echo "fabric.mod.json does not contain the Complemetal identity and legacy alias" >&2
+  exit 1
+fi
+
+icon_size="$(wc -c < "$tmp_dir/assets/complemetal/icon.png" | tr -d '[:space:]')"
+icon_width="$(sips -g pixelWidth "$tmp_dir/assets/complemetal/icon.png" 2>/dev/null |
+  sed -n 's/.*pixelWidth: //p')"
+icon_height="$(sips -g pixelHeight "$tmp_dir/assets/complemetal/icon.png" 2>/dev/null |
+  sed -n 's/.*pixelHeight: //p')"
+if [[ "$icon_size" -gt 262144 || "$icon_width" != "256" ||
+      "$icon_height" != "256" ]]; then
+  echo "Complemetal icon must be a 256x256 image no larger than 256 KiB" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'https://github.com/webblepebbles/MetalRender' \
+  "$tmp_dir/NOTICE"; then
+  echo "NOTICE does not retain upstream MetalRender attribution" >&2
+  exit 1
+fi
+
 if grep -Fq '${version}' "$tmp_dir/fabric.mod.json"; then
   echo "fabric.mod.json still contains an unexpanded version placeholder" >&2
   exit 1
@@ -89,7 +119,10 @@ fabric_version="$(sed -n \
   "$tmp_dir/fabric.mod.json" | head -n 1)"
 manifest_version="$(tr -d '\r' < "$tmp_dir/META-INF/MANIFEST.MF" |
   sed -n 's/^Implementation-Version: //p' | head -n 1)"
-if [[ -z "$fabric_version" || "$manifest_version" != "$fabric_version" ]]; then
+manifest_title="$(tr -d '\r' < "$tmp_dir/META-INF/MANIFEST.MF" |
+  sed -n 's/^Implementation-Title: //p' | head -n 1)"
+if [[ -z "$fabric_version" || "$manifest_version" != "$fabric_version" ||
+      "$manifest_title" != "Complemetal" ]]; then
   echo "JAR manifest and fabric.mod.json versions do not match" >&2
   exit 1
 fi
@@ -112,7 +145,7 @@ if ! grep -Fq '"required": false' \
   exit 1
 fi
 
-for tool in javac nm rg; do
+for tool in javac nm rg sips; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "Required release verification tool is unavailable: $tool" >&2
     exit 1

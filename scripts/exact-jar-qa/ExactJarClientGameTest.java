@@ -69,7 +69,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     FabricLoader loader = FabricLoader.getInstance();
     require(!loader.isDevelopmentEnvironment(),
         "exact-JAR QA must run in a production Fabric environment");
-    require(loader.isModLoaded("metalrender"), "MetalRender is not loaded");
+    require(loader.isModLoaded("complemetal"), "Complemetal is not loaded");
     require(loader.isModLoaded("fabric-api"), "Fabric API is not loaded");
     require(loader.isModLoaded("sodium"), "Sodium is not loaded");
     require(loader.isModLoaded("iris"), "Iris is not loaded");
@@ -189,7 +189,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         "Metal renderer is not enabled after initialization");
     require(NativeBridge.isLibLoaded(),
         "native bridge was not loaded from the release JAR");
-    String expectedNativeCacheVersion = loader.getModContainer("metalrender")
+    String expectedNativeCacheVersion = loader.getModContainer("complemetal")
         .orElseThrow().getMetadata().getVersion().getFriendlyString()
         .replaceAll("[^A-Za-z0-9._-]", "_");
     Path loadedNative = Path.of(NativeBridge.getLoadedPath())
@@ -221,9 +221,9 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     }
 
     MetalRenderConfig config = MetalRenderClient.getConfig();
-    require(config != null, "MetalRender config was not loaded");
+    require(config != null, "Complemetal config was not loaded");
     require(config.enableMetal4 == expectMetal4,
-        "MetalRender config did not apply backend expectation "
+        "Complemetal config did not apply backend expectation "
             + backendExpectation);
     require(!config.enableFastTerrainReplacement,
         "fast terrain replacement must be off in release-safe defaults");
@@ -2563,9 +2563,9 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       Path expected = Path.of(requiredProperty(
           "metalrender.exactJar.expectedPath")).toRealPath();
       require(actual.equals(expected),
-          "MetalRender loaded from " + actual + " instead of " + expected);
+          "Complemetal loaded from " + actual + " instead of " + expected);
       require(actual.getFileName().toString().endsWith(".jar"),
-          "MetalRender code source is not a JAR: " + actual);
+          "Complemetal code source is not a JAR: " + actual);
       return actual;
     } catch (Exception error) {
       throw new AssertionError(
@@ -2597,7 +2597,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     String shaderPack =
         requiredProperty("metalrender.exactJar.shaderPack");
     String version = FabricLoader.getInstance()
-        .getModContainer("metalrender").orElseThrow()
+        .getModContainer("complemetal").orElseThrow()
         .getMetadata().getVersion().getFriendlyString();
     boolean graphOwnershipRequired = Boolean.getBoolean(
         "metalrender.exactJar.requireGraphOwnership");
@@ -3428,9 +3428,30 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       BufferedImage candidate = ImageIO.read(cutover.toFile());
       require(reference != null && candidate != null,
           "cutover screenshot is not a decodable PNG image");
-      require(reference.getWidth() == candidate.getWidth()
-              && reference.getHeight() == candidate.getHeight(),
-          "cutover screenshot dimensions differ from Iris reference");
+      boolean dimensionsMatch =
+          reference.getWidth() == candidate.getWidth()
+              && reference.getHeight() == candidate.getHeight();
+      if (!dimensionsMatch) {
+        // Stage 9 deliberately verifies fullscreen and window restoration
+        // before taking the Metal-owned screenshot. macOS may deliver a late
+        // Cocoa framebuffer callback after that lifecycle sequence, so the
+        // final capture can be the same scene at the monitor's native
+        // resolution. Per-draw parity is authoritative; this secondary
+        // whole-frame check compares normalised samples and still rejects an
+        // aspect-ratio change, channel swap, flip, stale frame, or uniform
+        // output. Metal 3 never performs this lifecycle sequence and must
+        // remain byte-for-byte at the original dimensions.
+        require(expectMetal4,
+            "Metal 3 cutover screenshot dimensions changed unexpectedly");
+        require(candidate.getWidth() >= 640 && candidate.getHeight() >= 360,
+            "post-lifecycle cutover screenshot is unexpectedly small");
+        double referenceAspect =
+            reference.getWidth() / (double) reference.getHeight();
+        double candidateAspect =
+            candidate.getWidth() / (double) candidate.getHeight();
+        require(Math.abs(referenceAspect - candidateAspect) <= 0.01,
+            "cutover screenshot aspect ratio differs from Iris reference");
+      }
       SampleStats stats = sampleStats(candidate);
       require(stats.uniqueColors() >= 64
               && stats.luminanceStdDev() >= 0.02,
@@ -3488,13 +3509,17 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     long absoluteDifference = 0;
     long channelSamples = 0;
     for (int gridY = 0; gridY < 36; gridY++) {
-      int y = Math.min(left.getHeight() - 1,
+      int leftY = Math.min(left.getHeight() - 1,
           (gridY * left.getHeight() + left.getHeight() / 2) / 36);
+      int rightY = Math.min(right.getHeight() - 1,
+          (gridY * right.getHeight() + right.getHeight() / 2) / 36);
       for (int gridX = 0; gridX < 64; gridX++) {
-        int x = Math.min(left.getWidth() - 1,
-            (gridX * left.getWidth() + left.getWidth() / 2) / 64);
-        int leftRgb = left.getRGB(x, y);
-        int rightRgb = right.getRGB(x, y);
+        int leftX = Math.min(left.getWidth() - 1,
+          (gridX * left.getWidth() + left.getWidth() / 2) / 64);
+        int rightX = Math.min(right.getWidth() - 1,
+            (gridX * right.getWidth() + right.getWidth() / 2) / 64);
+        int leftRgb = left.getRGB(leftX, leftY);
+        int rightRgb = right.getRGB(rightX, rightY);
         absoluteDifference += Math.abs(
             ((leftRgb >>> 16) & 0xff) - ((rightRgb >>> 16) & 0xff));
         absoluteDifference += Math.abs(

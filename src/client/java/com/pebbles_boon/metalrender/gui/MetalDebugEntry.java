@@ -23,8 +23,8 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import org.jspecify.annotations.Nullable;
 
 public final class MetalDebugEntry implements DebugScreenEntry {
-  private static final Identifier DBG_GRP = Identifier.fromNamespaceAndPath("metalrender", "debug_group");
-  private static final Identifier DBG_ID = Identifier.fromNamespaceAndPath("metalrender", "debug");
+  private static final Identifier DBG_GRP = Identifier.fromNamespaceAndPath("complemetal", "debug_group");
+  private static final Identifier DBG_ID = Identifier.fromNamespaceAndPath("complemetal", "debug");
 
   enum Status {
     DISABLED(ChatFormatting.GRAY),
@@ -125,7 +125,7 @@ public final class MetalDebugEntry implements DebugScreenEntry {
       case IRIS_PAUSED -> "terrain paused - Iris/OpenGL compatibility";
       case ACTIVE -> "rendering";
     };
-    return "%sMetalRender %s%s%s".formatted(
+    return "%sComplemetal %s%s%s".formatted(
         status.color,
         version,
         status == Status.ACTIVE ? " " : ": ",
@@ -171,7 +171,7 @@ public final class MetalDebugEntry implements DebugScreenEntry {
 
   private static String dispVer() {
     var v = FabricLoader.getInstance()
-        .getModContainer("metalrender")
+        .getModContainer("complemetal")
         .map(c -> c.getMetadata().getVersion().getFriendlyString())
         .orElse("unknown");
     return !v.isEmpty() && (v.charAt(0) == 'v' || v.charAt(0) == 'V')

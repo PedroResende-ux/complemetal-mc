@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.0+mc26.2 - 2026-08-26
+
+### Complemetal release identity
+
+- Rename the public project, Fabric mod id, artifact, UI, diagnostics, resource
+  namespace and primary commands from MetalRender to Complemetal.
+- Add the minimalist Complemetal `C` icon in a 256 px transparent release
+  asset and preserve its high-resolution source in `branding/`.
+- Declare `metalrender` as a Fabric-provided legacy alias; retain
+  `/metalrender` and `/mr` beside the new `/complemetal` and `/cm` commands.
+- Migrate `config/metalrender.json` to `config/complemetal.json` on first load
+  without deleting the legacy file. Continue accepting the stable
+  `metalrender.*` JVM-property namespace.
+- Preserve the Java package tree, JNI symbol names, native
+  `libmetalrender.dylib` name and binary cache formats to avoid an unnecessary
+  ABI break during a public-name migration.
+- Add explicit attribution to the original
+  [MetalRender project by pebbles_boon](https://github.com/webblepebbles/MetalRender),
+  including `NOTICE` and a detailed lineage record.
+- Add complete English technical architecture and Mermaid render graphs, with
+  separate Russian translations, release publication metadata, and
+  GitHub/Modrinth checklists.
+- Harden the exact-JAR whole-frame screenshot validator for late macOS
+  framebuffer callbacks after fullscreen lifecycle QA. Authoritative per-draw
+  parity remains unchanged; cross-resolution comparison requires the same
+  aspect ratio and normalised scene samples.
+
+### Rendering boundary
+
+- No shader, pipeline, graph, parity or presentation algorithm is weakened by
+  the rebrand. The Stage 9 Metal 4 path and fail-open Iris/OpenGL fallback
+  retain their `0.3.1` correctness contract.
+- The release does not publish a new FPS percentage. Its performance claim
+  remains the two matched Stage 9 A/B measurements documented below.
+
 ## 0.3.1+mc26.2 - 2026-08-25
 
 ### Display lifecycle and high-refresh QA

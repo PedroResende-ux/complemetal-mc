@@ -17,7 +17,7 @@ public final class MetalHardwareChecker {
     try {
       return NativeBridge.isLibLoaded() && NativeBridge.nIsAvailable();
     } catch (Throwable t) {
-      LOGGER.warn("[MetalRender] Metal support check failed", t);
+      LOGGER.warn("[Complemetal] Metal support check failed", t);
       return false;
     }
   }
@@ -59,7 +59,7 @@ public final class MetalHardwareChecker {
       compatible = true;
     } catch (UnsatisfiedLinkError | IllegalArgumentException e) {
       compatible = true;
-      LOGGER.warn("[MetalRender] Could not schedule GL capability check, "
+      LOGGER.warn("[Complemetal] Could not schedule GL capability check, "
           + "allowing fallback",
           e);
     }

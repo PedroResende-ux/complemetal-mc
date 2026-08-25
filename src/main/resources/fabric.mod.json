@@ -1,14 +1,23 @@
 {
   "schemaVersion": 1,
-  "id": "metalrender",
+  "id": "complemetal",
   "version": "${version}",
   "license": "Apache-2.0",
   "authors": [
-    "pebbles_boon"
+    "daniiarkg",
+    "pebbles_boon (original MetalRender)"
   ],
-  "name": "MetalRender",
-  "description": "Conservative Apple Silicon Metal hybrid renderer with a safe Minecraft fallback",
-  "icon": "assets/metalrender/icon.png",
+  "contact": {
+    "homepage": "https://modrinth.com/mod/complemetal",
+    "sources": "https://github.com/daniiarkg/complemetal-mc",
+    "issues": "https://github.com/daniiarkg/complemetal-mc/issues"
+  },
+  "name": "Complemetal",
+  "description": "Apple Silicon Metal 4 renderer for Iris shaders with a strict fail-open OpenGL fallback",
+  "icon": "assets/complemetal/icon.png",
+  "provides": [
+    "metalrender"
+  ],
   "environment": "client",
   "entrypoints": {
     "client": [

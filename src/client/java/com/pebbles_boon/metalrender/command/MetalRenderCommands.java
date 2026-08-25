@@ -23,10 +23,12 @@ public final class MetalRenderCommands {
 
     public static void register() {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+            dispatcher.register(commandTree("complemetal"));
+            dispatcher.register(commandTree("cm"));
             dispatcher.register(commandTree("metalrender"));
             dispatcher.register(commandTree("mr"));
         });
-        MetalLogger.info("MetalRender client commands registered");
+        MetalLogger.info("Complemetal client commands registered");
     }
 
     private static LiteralArgumentBuilder<FabricClientCommandSource> commandTree(String root) {
@@ -72,7 +74,7 @@ public final class MetalRenderCommands {
                                         MetalRenderConfig cfg = MetalRenderClient.getConfig();
                                         if (cfg != null)
                                             cfg.save();
-                                        msg(ctx.getSource(), "§aMetalRender config saved");
+                                        msg(ctx.getSource(), "§aComplemetal config saved");
                                         return 1;
                                     }))
                                     .then(literal("reload")
@@ -80,8 +82,8 @@ public final class MetalRenderCommands {
                                       .executes(ctx -> {
                                         boolean ok = MetalRenderClient.reloadConfig();
                                         msg(ctx.getSource(), ok
-                                            ? "§aMetalRender config reloaded"
-                                            : "§cMetalRender config reload failed; see log");
+                                            ? "§aComplemetal config reloaded"
+                                            : "§cComplemetal config reload failed; see log");
                                         return 1;
                                     }))
                                     .then(literal("reset")
@@ -106,8 +108,8 @@ public final class MetalRenderCommands {
                                 com.pebbles_boon.metalrender.performance.MetalRenderProfiler.getInstance().toggleVisible();
                                 boolean nowVisible = com.pebbles_boon.metalrender.performance.MetalRenderProfiler.getInstance().isVisible();
                                 msg(ctx.getSource(), nowVisible
-                                    ? "§aMetalRender profiler enabled"
-                                    : "§eMetalRender profiler disabled");
+                                    ? "§aComplemetal profiler enabled"
+                                    : "§eComplemetal profiler disabled");
                                 return 1;
                             }))
 
@@ -125,15 +127,15 @@ public final class MetalRenderCommands {
     }
 
     private static void sendHelp(FabricClientCommandSource src) {
-        msg(src, "§6§l--- MetalRender Commands ---");
-        msg(src, "§e/metalrender status §7- Show renderer and backend status");
-        msg(src, "§e/metalrender cache clear §7- Clear generated terrain meshes");
-        msg(src, "§e/metalrender reload §7- Rebuild level render data");
-        msg(src, "§e/metalrender restart §7- Restart the Metal renderer session");
-        msg(src, "§e/metalrender config open|save|reload|reset §7- Configuration");
-        msg(src, "§e/metalrender performance reset §7- Reset dynamic scaling");
-        msg(src, "§e/metalrender profile §7- Toggle profiler overlay");
-        msg(src, "§7Alias: §e/mr");
+        msg(src, "§6§l--- Complemetal Commands ---");
+        msg(src, "§e/complemetal status §7- Show renderer and backend status");
+        msg(src, "§e/complemetal cache clear §7- Clear generated terrain meshes");
+        msg(src, "§e/complemetal reload §7- Rebuild level render data");
+        msg(src, "§e/complemetal restart §7- Restart the Metal renderer session");
+        msg(src, "§e/complemetal config open|save|reload|reset §7- Configuration");
+        msg(src, "§e/complemetal performance reset §7- Reset dynamic scaling");
+        msg(src, "§e/complemetal profile §7- Toggle profiler overlay");
+        msg(src, "§7Aliases: §e/cm, /metalrender, /mr");
     }
 
     private static void openConfigScreen(FabricClientCommandSource src) {
@@ -144,7 +146,7 @@ public final class MetalRenderCommands {
                 return;
             }
             MetalRenderClient.openSettingsScreen(mc);
-            msg(src, "§aOpened MetalRender settings");
+            msg(src, "§aOpened Complemetal settings");
         } catch (Exception e) {
             msg(src, "§cfailed to open config screen: " + e.getMessage());
         }
@@ -155,7 +157,7 @@ public final class MetalRenderCommands {
         MetalRenderConfig cfg = MetalRenderClient.getConfig();
         boolean enabled = cfg != null && cfg.enableMetalRendering;
 
-        msg(src, "§6§l--- MetalRender Status ---");
+        msg(src, "§6§l--- Complemetal Status ---");
         msg(src, "§7Enabled: " + (enabled ? "§aYes" : "§cNo"));
         msg(src, "§7Hardware: "
                 + (available ? "§a" + MetalHardwareChecker.getDeviceName() : "§cUnavailable"));
@@ -470,8 +472,8 @@ public final class MetalRenderCommands {
         try {
             boolean restarted = MetalRenderClient.restartRenderer(Minecraft.getInstance());
             msg(src, restarted
-                ? "§aMetalRender restarted"
-                : "§cMetalRender restart failed; see /metalrender status");
+                ? "§aComplemetal restarted"
+                : "§cComplemetal restart failed; see /complemetal status");
         } catch (Exception e) {
             msg(src, "§cRestart fail: " + e.getMessage());
         }
@@ -480,7 +482,7 @@ public final class MetalRenderCommands {
     private static void resetConfig(FabricClientCommandSource src) {
         MetalRenderClient.resetConfig();
         invalidateAllMeshes();
-        msg(src, "§eMetalRender settings restored to defaults");
+        msg(src, "§eComplemetal settings restored to defaults");
     }
 
     private static String fmtPx(float value) {

@@ -11,10 +11,10 @@ import net.minecraft.resources.Identifier;
 @SuppressWarnings("deprecation")
 public final class MetalHudOverlay implements HudElement {
   private static final int COLOR = 0xFFFF00FF;
-  private static final String LABEL = "MetalRender ACTIVE";
+  private static final String LABEL = "Complemetal ACTIVE";
   private static final int LOADING_COLOR = 0xFFFFAA00;
   private static final int LOADING_BG_COLOR = 0x80000000;
-  private static final Identifier HUD_ID = Identifier.fromNamespaceAndPath("metalrender", "hud_overlay");
+  private static final Identifier HUD_ID = Identifier.fromNamespaceAndPath("complemetal", "hud_overlay");
 
   private String cachedLoadingText;
   private int cachedLoadingTextWidth;

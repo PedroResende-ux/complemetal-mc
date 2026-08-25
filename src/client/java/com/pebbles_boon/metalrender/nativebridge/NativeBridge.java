@@ -66,7 +66,7 @@ public final class NativeBridge {
     String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
     if (!os.contains("mac") || !(arch.contains("aarch64") || arch.contains("arm64"))) {
       markLoadFailure(LoadState.UNSUPPORTED,
-          "MetalRender native backend requires macOS on Apple Silicon; found "
+          "Complemetal native backend requires macOS on Apple Silicon; found "
               + os + "/" + arch);
       throw new UnsatisfiedLinkError(loadFailure);
     }
@@ -159,7 +159,7 @@ public final class NativeBridge {
 
     String version = implementationVersion();
     Path cacheRoot = Path.of(System.getProperty("user.home"), "Library", "Caches",
-        "MetalRender", "native", version,
+        "Complemetal", "native", version,
         library.sha256().substring(0, 16)
             + "-" + shaders.sha256().substring(0, 16));
     Files.createDirectories(cacheRoot);
@@ -302,17 +302,23 @@ public final class NativeBridge {
       Class<?> loaderType = Class.forName(
           "net.fabricmc.loader.api.FabricLoader", false, classLoader);
       Object loader = loaderType.getMethod("getInstance").invoke(null);
-      Object containerResult = loaderType
-          .getMethod("getModContainer", String.class)
-          .invoke(loader, "metalrender");
-      if (!(containerResult instanceof Optional<?> optional)
-          || optional.isEmpty()) {
+      java.lang.reflect.Method getModContainer = loaderType
+          .getMethod("getModContainer", String.class);
+      Object containerResult = getModContainer.invoke(loader, "complemetal");
+      Optional<?> container = containerResult instanceof Optional<?> optional
+          ? optional : Optional.empty();
+      if (container.isEmpty()) {
+        Object legacyResult = getModContainer.invoke(loader, "metalrender");
+        container = legacyResult instanceof Optional<?> optional
+            ? optional : Optional.empty();
+      }
+      if (container.isEmpty()) {
         return null;
       }
       Class<?> containerType = Class.forName(
           "net.fabricmc.loader.api.ModContainer", false, classLoader);
       Object metadata = containerType.getMethod("getMetadata")
-          .invoke(optional.orElseThrow());
+          .invoke(container.orElseThrow());
       Class<?> metadataType = Class.forName(
           "net.fabricmc.loader.api.metadata.ModMetadata", false, classLoader);
       Object semanticVersion = metadataType.getMethod("getVersion")
@@ -339,7 +345,7 @@ public final class NativeBridge {
     loadedPath = null;
     loadFailure = message;
     loadState = state;
-    System.err.println("[MetalRender] " + message);
+    System.err.println("[Complemetal] " + message);
   }
 
   private static String safeMessage(Throwable throwable) {

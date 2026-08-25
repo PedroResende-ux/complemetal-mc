@@ -52,7 +52,8 @@ public final class IrisMetalFeatureFlags {
       if (loader.isDevelopmentEnvironment()) {
         return null;
       }
-      return loader.getModContainer("metalrender")
+      return loader.getModContainer("complemetal")
+          .or(() -> loader.getModContainer("metalrender"))
           .map(container -> container.getMetadata().getVersion()
               .getFriendlyString())
           .orElse(null);

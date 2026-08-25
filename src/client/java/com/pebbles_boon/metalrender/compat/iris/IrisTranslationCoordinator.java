@@ -477,7 +477,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         .toAbsolutePath().normalize().toString();
     this.quietPeriodNanos = Math.max(0, quietPeriodNanos);
     ThreadFactory daemonFactory = task -> {
-      Thread thread = new Thread(task, "MetalRender-Iris-Translator");
+      Thread thread = new Thread(task, "Complemetal-Iris-Translator");
       thread.setDaemon(true);
       thread.setPriority(Thread.MIN_PRIORITY);
       return thread;

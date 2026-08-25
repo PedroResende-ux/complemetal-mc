@@ -262,7 +262,7 @@ public final class MetalRenderProfiler {
             Thread.currentThread().interrupt();
           }
         }
-      }, "MetalRender-CsvWorker");
+      }, "Complemetal-CsvWorker");
       t.setDaemon(true);
       t.start();
     }

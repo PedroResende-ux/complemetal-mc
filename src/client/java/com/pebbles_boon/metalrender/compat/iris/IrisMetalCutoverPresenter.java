@@ -18,9 +18,9 @@ import org.lwjgl.opengl.GL30C;
  * fullscreen pass performs a byte-preserving BGRA swizzle entirely on the GPU
  * while keeping IOSurface and framebuffer coordinates in the same orientation.
  * A fenced three-slot ring avoids a blocking GL finish during steady-state
- * presentation. FINAL textures use GPU/resident handoff and geometry uses
- * resident Metal buffers, but upstream passes remain OpenGL; the replay waits
- * for completion, so this is not Stage 9 performance eligible.</p>
+ * full-graph presentation. The legacy FINAL-only validation call remains
+ * conservative, while Stage 9 presents an asynchronously completed Metal-owned
+ * graph and may reuse the last fenced surface without a render-thread wait.</p>
  */
 final class IrisMetalCutoverPresenter {
   static final String BRIDGE_NAME = "iosurface-gpu-handoff";

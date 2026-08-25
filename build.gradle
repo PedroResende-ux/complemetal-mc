@@ -44,7 +44,7 @@ loom {
     splitEnvironmentSourceSets()
 
     mods {
-        "metalrender" {
+        "complemetal" {
             sourceSet sourceSets.main
             sourceSet sourceSets.client
         }
@@ -81,11 +81,11 @@ loom {
 fabricApi {
     configureTests {
         createSourceSet = true
-        modId = "metalrender-tests"
+        modId = "complemetal-tests"
         enableGameTests = false
         enableClientGameTests = true
         clearRunDirectory = true
-        username = "MetalRenderQA"
+        username = "ComplemetalQA"
     }
 }
 
@@ -151,11 +151,12 @@ jar {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     manifest {
         attributes(
-            "Implementation-Title": "MetalRender",
+            "Implementation-Title": "Complemetal",
             "Implementation-Version": project.version
         )
     }
     from("LICENSE")
+    from("NOTICE")
     from('src/main/resources/native') {
         include 'metalrender.h', 'metalrender.mm'
         into 'native'

@@ -1,0 +1,33 @@
+{
+  "slug": "complemetal",
+  "title": "Complemetal",
+  "description": "Metal 4 acceleration for validated Iris shader graphs on Apple Silicon, with a strict fail-open OpenGL fallback.",
+  "body": "",
+  "categories": [
+    "optimization",
+    "technology"
+  ],
+  "additional_categories": [
+    "utility"
+  ],
+  "status": "draft",
+  "requested_status": "approved",
+  "issues_url": "https://github.com/daniiarkg/complemetal-mc/issues",
+  "source_url": "https://github.com/daniiarkg/complemetal-mc",
+  "wiki_url": "https://github.com/daniiarkg/complemetal-mc/blob/main/docs/TECHNICAL_ARCHITECTURE.md",
+  "discord_url": null,
+  "donation_urls": [],
+  "license_id": "Apache-2.0",
+  "license_url": "https://github.com/daniiarkg/complemetal-mc/blob/main/LICENSE",
+  "project_type": "mod",
+  "environment": [
+    "client_only"
+  ],
+  "game_versions": [
+    "26.2"
+  ],
+  "loaders": [
+    "fabric"
+  ],
+  "is_draft": true
+}

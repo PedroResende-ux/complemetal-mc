@@ -10,20 +10,20 @@ import net.minecraft.resources.Identifier;
 
 public class StartupBlockerOverlay extends Overlay {
     private static final RuntimeTexture IMAGE = new RuntimeTexture(
-            Identifier.fromNamespaceAndPath("metalrender",
+            Identifier.fromNamespaceAndPath("complemetal",
                     "textures/gui/dont_be_like_bloffo.png"),
             1954, 1556, "image");
     private static final RuntimeTexture TEXT = new RuntimeTexture(
-            Identifier.fromNamespaceAndPath("metalrender",
+            Identifier.fromNamespaceAndPath("complemetal",
                     "textures/gui/startup_blocker_text.png"),
             1620, 124, "text");
     private static final RuntimeTexture BOTTOM_TEXT = new RuntimeTexture(
             Identifier.fromNamespaceAndPath(
-                    "metalrender", "textures/gui/startup_blocker_bottom_text.png"),
+                    "complemetal", "textures/gui/startup_blocker_bottom_text.png"),
             670, 101, "bottom text");
     private static final RuntimeTexture FOOTNOTE = new RuntimeTexture(
             Identifier.fromNamespaceAndPath(
-                    "metalrender", "textures/gui/startup_blocker_footnote.png"),
+                    "complemetal", "textures/gui/startup_blocker_footnote.png"),
             260, 58, "footnote");
     private static final int PADDING = 16;
     private static final int GAP = 12;

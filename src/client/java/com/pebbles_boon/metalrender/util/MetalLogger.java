@@ -14,23 +14,23 @@ public class MetalLogger {
   }
 
   public static void info(String msg, Object... args) {
-    LOGGER.info("[metalrender] {}", format(msg, args));
+    LOGGER.info("[complemetal] {}", format(msg, args));
   }
 
   public static void debug(String msg, Object... args) {
-    LOGGER.debug("[metalrender] {}", format(msg, args));
+    LOGGER.debug("[complemetal] {}", format(msg, args));
   }
 
   public static void warn(String msg, Object... args) {
-    LOGGER.warn("[metalrender] {}", format(msg, args));
+    LOGGER.warn("[complemetal] {}", format(msg, args));
   }
 
   public static void error(String msg, Object... args) {
-    LOGGER.error("[errorwender] {}", format(msg, args));
+    LOGGER.error("[complemetal] {}", format(msg, args));
   }
 
   public static void debugInfo(String msg, Object... args) {
-    LOGGER.debug("[metalrender] {}", format(msg, args));
+    LOGGER.debug("[complemetal] {}", format(msg, args));
   }
 
   public static void deepInfo(String msg, Object... args) {

@@ -13,8 +13,8 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 
 public class StartupBlockerScreen extends Screen {
-  private static final String IMAGE_RESOURCE = "/assets/metalrender/textures/gui/dont_be_like_bloffo.png";
-  private static final Identifier RUNTIME_IMAGE = Identifier.fromNamespaceAndPath("metalrender",
+  private static final String IMAGE_RESOURCE = "/assets/complemetal/textures/gui/dont_be_like_bloffo.png";
+  private static final Identifier RUNTIME_IMAGE = Identifier.fromNamespaceAndPath("complemetal",
       "startup_blocker_runtime");
   private static final Component MESSAGE = Component.literal("You are on Windows. You do not need this.");
   private static final int IMAGE_WIDTH = 1954;
@@ -28,7 +28,7 @@ public class StartupBlockerScreen extends Screen {
   private static boolean loggedRender;
 
   public StartupBlockerScreen() {
-    super(Component.literal("MetalRender Startup Notice"));
+    super(Component.literal("Complemetal Startup Notice"));
   }
 
   @Override
@@ -88,7 +88,7 @@ public class StartupBlockerScreen extends Screen {
       NativeImage image = NativeImage.read(stream);
       runtimeImageWidth = image.getWidth();
       runtimeImageHeight = image.getHeight();
-      DynamicTexture texture = new DynamicTexture(() -> "metalrender_startup_blocker", image);
+      DynamicTexture texture = new DynamicTexture(() -> "complemetal_startup_blocker", image);
       mc.getTextureManager().register(RUNTIME_IMAGE, texture);
       texture.upload();
       runtimeImageLoaded = true;

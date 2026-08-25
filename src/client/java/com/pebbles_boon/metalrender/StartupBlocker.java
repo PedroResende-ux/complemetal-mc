@@ -34,10 +34,10 @@ public final class StartupBlocker {
 
   public static String unsupportedReason() {
     if (!MACOS) {
-      return "MetalRender requires macOS";
+      return "Complemetal requires macOS";
     }
     if (!APPLE_SILICON) {
-      return "MetalRender requires Apple Silicon";
+      return "Complemetal requires Apple Silicon";
     }
     return null;
   }
