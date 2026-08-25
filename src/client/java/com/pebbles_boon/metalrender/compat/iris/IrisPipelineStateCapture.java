@@ -197,7 +197,8 @@ public final class IrisPipelineStateCapture {
     boolean sampledReplay = IrisGlBufferMirror.isEnabled() && draw
         && IrisRenderGraphCapture.global().reserveShadowReplaySample();
     boolean cutoverReplay = IrisGlBufferMirror.isEnabled() && draw
-        && IrisTranslationCoordinator.cutoverCaptureRequested(phase);
+        && IrisTranslationCoordinator.cutoverCaptureRequested(phase,
+            registration, snapshot);
     boolean graphReplay = IrisGlBufferMirror.isEnabled() && draw
         && IrisRenderGraphCapture.global().captureFullGraphReplay();
     boolean captureReplay = sampledReplay || cutoverReplay || graphReplay;
@@ -529,9 +530,14 @@ public final class IrisPipelineStateCapture {
    */
   public static PipelineLookupKey lookupKey(PendingState pending) {
     Objects.requireNonNull(pending, "pending");
-    IrisProgramIdentityRegistry.Registration registration =
-        pending.registration();
-    IrisGlStateSnapshot snapshot = pending.snapshot();
+    return lookupKey(pending.registration(), pending.snapshot());
+  }
+
+  static PipelineLookupKey lookupKey(
+      IrisProgramIdentityRegistry.Registration registration,
+      IrisGlStateSnapshot snapshot) {
+    Objects.requireNonNull(registration, "registration");
+    Objects.requireNonNull(snapshot, "snapshot");
     return new PipelineLookupKey(registration.generation(),
         snapshot.operation(), snapshot.program(), snapshot.drawFramebuffer(),
         snapshot.drawBuffers(), snapshot.colorTargets(),

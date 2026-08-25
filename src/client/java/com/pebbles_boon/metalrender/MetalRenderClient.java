@@ -578,14 +578,19 @@ public class MetalRenderClient implements ClientModInitializer {
     }
     DisplayLifecycleTracker.DisplayTransition transition;
     try {
-      int cachedWidth = minecraft.getWindow().getWidth();
-      int cachedHeight = minecraft.getWindow().getHeight();
-      if (DisplayLifecycleTracker.synchronizeFramebufferSize(
+      int cachedWindowWidth = minecraft.getWindow().getScreenWidth();
+      int cachedWindowHeight = minecraft.getWindow().getScreenHeight();
+      int cachedFramebufferWidth = minecraft.getWindow().getWidth();
+      int cachedFramebufferHeight = minecraft.getWindow().getHeight();
+      if (DisplayLifecycleTracker.synchronizeWindowGeometry(
           minecraft.getWindow())) {
         minecraft.framebufferSizeChanged();
         MetalLogger.info(
-            "synchronized missed GLFW framebuffer callback: %dx%d -> %dx%d",
-            cachedWidth, cachedHeight, minecraft.getWindow().getWidth(),
+            "synchronized missed GLFW geometry callbacks: window=%dx%d->%dx%d framebuffer=%dx%d->%dx%d",
+            cachedWindowWidth, cachedWindowHeight,
+            minecraft.getWindow().getScreenWidth(),
+            minecraft.getWindow().getScreenHeight(), cachedFramebufferWidth,
+            cachedFramebufferHeight, minecraft.getWindow().getWidth(),
             minecraft.getWindow().getHeight());
       }
       transition = DisplayLifecycleTracker.poll(minecraft.getWindow());

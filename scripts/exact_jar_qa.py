@@ -22,6 +22,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -658,12 +659,14 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             hardware_display=hardware_display,
             require_retina=args.require_retina,
             require_display_migration=args.require_display_migration,
+            require_display_reconnect=args.require_display_reconnect,
+            require_sleep_wake=args.require_sleep_wake,
             minimum_refresh_hz=minimum_refresh_hz,
             presentation_samples=presentation_samples,
         )
 
         manifest = {
-            "schemaVersion": 4,
+            "schemaVersion": 5,
             "status": "PREPARED",
             "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
             "networkDownloadsRequired": False,
@@ -681,6 +684,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "hardwareDisplay": hardware_display,
             "requireRetina": args.require_retina,
             "requireDisplayMigration": args.require_display_migration,
+            "requireDisplayReconnect": args.require_display_reconnect,
+            "requireSleepWake": args.require_sleep_wake,
             "minimumRefreshHz": minimum_refresh_hz,
             "presentationSamples": presentation_samples,
             "irisMetalActivation": (
@@ -790,7 +795,7 @@ def artifact_record(path: Path, metadata: dict[str, Any]) -> dict[str, str]:
 
 
 def verify_prepared_runtime(manifest: dict[str, Any]) -> None:
-    if (manifest.get("schemaVersion") != 4
+    if (manifest.get("schemaVersion") != 5
             or manifest.get("status") != "PREPARED"):
         raise HarnessError("prepared manifest has an unsupported schema/status")
     backend = manifest.get("qaBackend")
@@ -834,11 +839,15 @@ def verify_prepared_runtime(manifest: dict[str, Any]) -> None:
     hardware_display = manifest.get("hardwareDisplay")
     require_retina = manifest.get("requireRetina")
     require_display_migration = manifest.get("requireDisplayMigration")
+    require_display_reconnect = manifest.get("requireDisplayReconnect")
+    require_sleep_wake = manifest.get("requireSleepWake")
     minimum_refresh_hz = manifest.get("minimumRefreshHz")
     presentation_samples = manifest.get("presentationSamples")
     if (type(hardware_display) is not bool
             or type(require_retina) is not bool
             or type(require_display_migration) is not bool
+            or type(require_display_reconnect) is not bool
+            or type(require_sleep_wake) is not bool
             or type(minimum_refresh_hz) is not int
             or type(presentation_samples) is not int):
         raise HarnessError(
@@ -853,6 +862,7 @@ def verify_prepared_runtime(manifest: dict[str, Any]) -> None:
             raise HarnessError(
                 "prepared hardware display profile is inconsistent")
     elif (require_retina or require_display_migration
+          or require_display_reconnect or require_sleep_wake
           or minimum_refresh_hz != 0 or presentation_samples != 0):
         raise HarnessError(
             "prepared non-hardware profile contains display requirements")
@@ -1892,7 +1902,7 @@ def stage9_lifecycle_is_valid(value: Any) -> bool:
         "resizedWindowWidth", "resizedWindowHeight",
     )
     return (
-        value.get("schemaVersion") == 1
+        value.get("schemaVersion") == 2
         and value.get("status") == "PASS"
         and all(value.get(name) is True for name in (
             "resizePassed", "fullscreenPassed", "windowedRestorePassed",
@@ -1919,6 +1929,8 @@ def hardware_display_is_valid(
     value: Any,
     require_retina: bool,
     require_display_migration: bool,
+    require_display_reconnect: bool,
+    require_sleep_wake: bool,
     minimum_refresh_hz: int,
     expected_samples: int,
 ) -> bool:
@@ -1946,8 +1958,45 @@ def hardware_display_is_valid(
             and value.get("retinaFramebufferScaleY", 0) >= 1.5
         ))
     )
+    reconnect_valid = (
+        value.get("displayReconnectRequired") is require_display_reconnect
+        and (not require_display_reconnect or (
+            value.get("displayReconnectPassed") is True
+            and type(value.get(
+                "minimumConnectedDisplaysDuringReconnect")) is int
+            and value["minimumConnectedDisplaysDuringReconnect"]
+                < value.get("connectedDisplays", 0)
+            and type(value.get("reconnectedDisplays")) is int
+            and value["reconnectedDisplays"]
+                >= value.get("connectedDisplays", 0)
+            and type(value.get(
+                "reconnectOwnershipPresentationDelta")) is int
+            and value["reconnectOwnershipPresentationDelta"] >= 60
+            and type(value.get("reconnectTransitionDelta")) is int
+            and value["reconnectTransitionDelta"] >= 2
+            and type(value.get("reconnectResetDelta")) is int
+            and value["reconnectResetDelta"] >= 2
+        ))
+    )
+    sleep_wake_valid = (
+        value.get("sleepWakeRequired") is require_sleep_wake
+        and (not require_sleep_wake or (
+            value.get("sleepWakePassed") is True
+            and type(value.get("systemSleepDelta")) is int
+            and value["systemSleepDelta"] > 0
+            and type(value.get("systemWakeDelta")) is int
+            and value["systemWakeDelta"] > 0
+            and type(value.get("resumeGapDelta")) is int
+            and value["resumeGapDelta"] > 0
+            and type(value.get("sleepWakeResetDelta")) is int
+            and value["sleepWakeResetDelta"] > 0
+            and type(value.get(
+                "sleepWakeOwnershipPresentationDelta")) is int
+            and value["sleepWakeOwnershipPresentationDelta"] >= 20
+        ))
+    )
     return (
-        value.get("schemaVersion") == 1
+        value.get("schemaVersion") == 2
         and value.get("status") == "PASS"
         and type(value.get("connectedDisplays")) is int
         and value["connectedDisplays"] >= (2 if require_display_migration else 1)
@@ -1955,6 +2004,8 @@ def hardware_display_is_valid(
         and (not require_display_migration
              or value.get("displayMigrationPassed") is True)
         and retina_valid
+        and reconnect_valid
+        and sleep_wake_valid
         and value.get("minimumRefreshHz") == minimum_refresh_hz
         and reported_refresh >= max(1, minimum_refresh_hz)
         and isinstance(value.get("refreshMonitor"), str)
@@ -2051,6 +2102,8 @@ def build_launch_command(
     hardware_display: bool,
     require_retina: bool,
     require_display_migration: bool,
+    require_display_reconnect: bool,
+    require_sleep_wake: bool,
     minimum_refresh_hz: int,
     presentation_samples: int,
 ) -> list[str]:
@@ -2093,6 +2146,10 @@ def build_launch_command(
         f"{'true' if require_retina else 'false'}",
         "-Dmetalrender.exactJar.requireDisplayMigration="
         f"{'true' if require_display_migration else 'false'}",
+        "-Dmetalrender.exactJar.requireDisplayReconnect="
+        f"{'true' if require_display_reconnect else 'false'}",
+        "-Dmetalrender.exactJar.requireSleepWake="
+        f"{'true' if require_sleep_wake else 'false'}",
         f"-Dmetalrender.exactJar.minimumRefreshHz={minimum_refresh_hz}",
         f"-Dmetalrender.exactJar.presentationSamples={presentation_samples}",
         f"-Dmetalrender.exactJar.shaderPack={shader_pack}",
@@ -2478,6 +2535,22 @@ def replace_system_property(
     return result
 
 
+def keep_hardware_display_awake(
+    command: list[str], hardware_display: bool, require_sleep_wake: bool,
+) -> list[str]:
+    """Wake and hold the display for non-sleep hardware qualification.
+
+    A cold Iris translation can outlast the macOS display-idle timer.  If the
+    display sleeps before Minecraft constructs its monitor manager, GLFW can
+    keep rendering while fullscreen qualification has no active monitor.
+    Physical sleep/wake QA deliberately remains unwrapped so the requested
+    system transition is never inhibited by the harness.
+    """
+    if not hardware_display or require_sleep_wake:
+        return list(command)
+    return ["/usr/bin/caffeinate", "-d", "-u", "--", *command]
+
+
 def set_system_property(
     command: list[str],
     name: str,
@@ -2537,6 +2610,10 @@ def run_harness(
                 args.require_retina
             or manifest.get("requireDisplayMigration", False) is not
                 args.require_display_migration
+            or manifest.get("requireDisplayReconnect", False) is not
+                args.require_display_reconnect
+            or manifest.get("requireSleepWake", False) is not
+                args.require_sleep_wake
             or manifest.get("minimumRefreshHz", 0)
                 != requested_minimum_refresh_hz
             or manifest.get("presentationSamples", 0)
@@ -2604,6 +2681,13 @@ def run_harness(
         command, "metalrender.exactJar.requireDisplayMigration",
         "true" if manifest.get("requireDisplayMigration", False)
         else "false")
+    command = replace_system_property(
+        command, "metalrender.exactJar.requireDisplayReconnect",
+        "true" if manifest.get("requireDisplayReconnect", False)
+        else "false")
+    command = replace_system_property(
+        command, "metalrender.exactJar.requireSleepWake",
+        "true" if manifest.get("requireSleepWake", False) else "false")
     command = replace_system_property(
         command, "metalrender.exactJar.minimumRefreshHz",
         str(manifest.get("minimumRefreshHz", 0)))
@@ -2702,6 +2786,8 @@ def run_harness(
             "abort_on_error=1:detect_leaks=0:check_initialization_order=1:"
             "strict_string_checks=1:allocator_may_return_null=1"
         )
+    command = keep_hardware_display_awake(
+        command, hardware_display, args.require_sleep_wake)
     started = dt.datetime.now(dt.timezone.utc)
     with log_path.open("wb") as log:
         process = subprocess.Popen(
@@ -2715,6 +2801,30 @@ def run_harness(
         timed_out = False
         return_code: Optional[int] = None
         previous_handlers: dict[int, Any] = {}
+        physical_action_offset = 0
+        physical_action_remainder = ""
+
+        def emit_physical_actions() -> None:
+            nonlocal physical_action_offset, physical_action_remainder
+            if not (args.require_display_reconnect
+                    or args.require_sleep_wake):
+                return
+            try:
+                with log_path.open("rb") as reader:
+                    reader.seek(physical_action_offset)
+                    chunk = reader.read()
+                    physical_action_offset = reader.tell()
+            except FileNotFoundError:
+                return
+            if not chunk:
+                return
+            text = physical_action_remainder + chunk.decode(
+                "utf-8", errors="replace")
+            lines = text.split("\n")
+            physical_action_remainder = lines.pop()
+            for line in lines:
+                if line.startswith("METALRENDER_PHYSICAL_ACTION_"):
+                    print(line, flush=True)
 
         def interrupted(signum: int, _frame: Any) -> None:
             raise HarnessError(
@@ -2725,11 +2835,18 @@ def run_harness(
                 previous_handlers[interrupt_signal] = signal.getsignal(
                     interrupt_signal)
                 signal.signal(interrupt_signal, interrupted)
-            try:
-                return_code = process.wait(timeout=args.timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                return_code = terminate_process_group(process)
+            deadline = time.monotonic() + args.timeout
+            while process.poll() is None:
+                emit_physical_actions()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    return_code = terminate_process_group(process)
+                    break
+                time.sleep(min(0.25, remaining))
+            emit_physical_actions()
+            if return_code is None:
+                return_code = int(process.returncode)
         finally:
             if process.poll() is None:
                 terminated_code = terminate_process_group(process)
@@ -2902,6 +3019,8 @@ def run_harness(
                 hardware_display_result,
                 manifest.get("requireRetina", False),
                 manifest.get("requireDisplayMigration", False),
+                manifest.get("requireDisplayReconnect", False),
+                manifest.get("requireSleepWake", False),
                 manifest.get("minimumRefreshHz", 0),
                 manifest.get("presentationSamples", 0)),
         "stage9LifecycleLogged":
@@ -2927,7 +3046,7 @@ def run_harness(
             release_source_matches(manifest),
     }
     run_result = {
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "cacheExpectation": cache_expectation,
         "qaBackend": backend,
         "status": "PASS" if all(checks.values()) else "FAIL",
@@ -3043,6 +3162,20 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--require-display-migration", action="store_true",
         help="require the QA window to visit two distinct connected displays",
+    )
+    result.add_argument(
+        "--require-display-reconnect", action="store_true",
+        help=(
+            "pause for a physical disconnect and reconnect of the selected "
+            "external display, then require Metal ownership recovery"
+        ),
+    )
+    result.add_argument(
+        "--require-sleep-wake", action="store_true",
+        help=(
+            "pause for a real macOS sleep/wake cycle, require native power "
+            "notifications and Metal ownership recovery"
+        ),
     )
     result.add_argument(
         "--minimum-refresh-hz", type=positive_int, default=0,
@@ -3235,9 +3368,11 @@ def main() -> int:
         if not args.hardware_display and (
                 args.require_retina
                 or args.require_display_migration
+                or args.require_display_reconnect
+                or args.require_sleep_wake
                 or args.minimum_refresh_hz != 0):
             raise HarnessError(
-                "Retina, display migration and refresh requirements need "
+                "Retina, display lifecycle and refresh requirements need "
                 "--hardware-display")
         with runtime_lock(Path(args.runtime_dir)):
             runtime = safe_runtime_path(Path(args.runtime_dir))
@@ -3274,6 +3409,10 @@ def main() -> int:
                         args.require_retina
                         or manifest.get("requireDisplayMigration") is not
                         args.require_display_migration
+                        or manifest.get("requireDisplayReconnect") is not
+                        args.require_display_reconnect
+                        or manifest.get("requireSleepWake") is not
+                        args.require_sleep_wake
                         or manifest.get("minimumRefreshHz") != (
                             args.minimum_refresh_hz
                             if args.hardware_display else 0)

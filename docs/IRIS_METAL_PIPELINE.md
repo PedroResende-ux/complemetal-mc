@@ -1,6 +1,6 @@
 # Iris to Metal pipeline
 
-`0.3.0+mc26.2` implements the complete validated Iris-to-Metal 4 path. The
+`0.3.1+mc26.2` implements the complete validated Iris-to-Metal 4 path. The
 input is the final GLSL after Iris has applied shader-pack directives,
 compatibility transforms, generated uniforms and Sodium vertex conventions;
 capturing the original pack source would not reproduce the program Iris runs.

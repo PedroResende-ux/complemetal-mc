@@ -1,11 +1,11 @@
 # Iris-to-Metal roadmap
 
-This roadmap records the completed `0.3.0+mc26.2` path. Every stage remains a
-separate fail-closed acceptance boundary; a later success never hides an
-earlier translation, state, resource, parity, lifecycle, or performance
-failure.
+This roadmap records the completed Stage 9 path and the `0.3.1+mc26.2`
+hardening release. Every stage remains a separate fail-closed acceptance
+boundary; a later success never hides an earlier translation, state, resource,
+parity, lifecycle, or performance failure.
 
-| Stage | Goal | `0.3.0` state | Exit evidence |
+| Stage | Goal | Stable state | Exit evidence |
 | --- | --- | --- | --- |
 | 0 | Minecraft 26.2 renderer foundation | Complete | Exact-JAR Fabric environment, native lifecycle and Metal 3 fallback |
 | 1 | Final Iris GLSL -> SPIR-V -> MSL cache | Complete | 231 Complementary programs and 462 stages, integrity-checked cold/warm cache |
@@ -18,14 +18,35 @@ failure.
 | 8 | Selective cutover | Complete | Fenced IOSurface presentation, paired FINAL OpenGL cancellation and fail-open recovery |
 | 9 | Full graph ownership and stable performance | Complete for the supported release matrix | Persistent Metal resources, frame-batched MTL4 execution, async presentation, lifecycle PASS, forced Metal 3 PASS and two matched A/B PASS results |
 
+## `0.3.1` hardening release
+
+The nine-stage architecture remains unchanged. `0.3.1` closes reliability
+gaps found while qualifying display changes and repeated lifecycle resets:
+
+- asynchronous translation/replay results are bound to a lifecycle generation
+  and stale work cannot be promoted;
+- captured texture/surface leases are released exactly once and unique retained
+  bytes drive backpressure;
+- incomplete graph resources fail open before OpenGL suppression;
+- GLFW topology, framebuffer scale, window replacement and wake-like gaps
+  rebuild only the display-facing bridge;
+- the final IOSurface uses an exact GPU-only BGRA presentation shader; and
+- GL bindings are destroyed before IOSurface recycling, preventing Metal pool
+  reuse while CGL still references the surface.
+
+The final `0.3.1` JAR passed Metal 4 and forced Metal 3 exact-JAR cold/warm
+matrices, including Overworld -> Nether -> End -> Overworld, Iris off/on,
+resize, fullscreen and surface suspend/restore. Physical cable and power-state
+actions remain separate hardware qualification, not unfinished Stage 9 code.
+
 ## Stage 9 release boundary
 
 Stage 9 replaces the supported live Iris shader-pass graph, not every piece of
 Minecraft. Metal owns the validated shader-pack SHADOW, GEOMETRY, DEFERRED,
 COMPOSITE and FINAL work. Minecraft UI and deliberately unsupported content
 continue through their normal renderer. The final Metal IOSurface is attached
-to a GL rectangle texture for the final framebuffer blit, so macOS does not
-perform a CPU output readback.
+to a GL rectangle texture for an exact GPU-only presentation pass, so macOS
+does not perform a CPU output readback.
 
 Production ownership has these prerequisites:
 
@@ -66,7 +87,10 @@ Complementary workload, not a fixed renderer limit.
 
 ## Release acceptance
 
-The exact packaged JAR must pass all of the following before publication:
+The initial Stage 9 publication required all of the following. A maintenance
+release repeats the correctness/runtime matrix and either repeats the matched
+performance gate or explicitly inherits it without publishing a new FPS
+claim:
 
 - Metal 4 cold and warm runs with full graph ownership required;
 - Metal 3 cold and warm runs with Iris/OpenGL ownership retained;
@@ -80,11 +104,13 @@ The exact packaged JAR must pass all of the following before publication:
   regression, and no stutter regression;
 - a second matched A/B in reverse launch order.
 
-The final stable exact JAR uses SHA-256
-`4e874abbde4fdbc5e6edd72bc6cd419e321a15ced9f255df67d86091953cb57e`.
-Its Metal 4 and Metal 3 cold/warm matrix plus both opposite-order A/B gates
-passed. The independent artifact evidence is recorded in
-[`RELEASE_CHECKLIST_0.3.0.md`](RELEASE_CHECKLIST_0.3.0.md).
+The final `0.3.1` exact JAR uses SHA-256
+`5c5bfd4511a1304ad0b32e2f1ab66f1da7e5f718c2d1dc72dec1c97e1ffd30b7`.
+Its Metal 4 and Metal 3 cold/warm matrices passed. The two opposite-order
+matched A/B gates remain the published `0.3.0` performance qualification;
+`0.3.1` does not attach a new FPS percentage to its correctness changes. The
+independent final-artifact evidence is recorded in
+[`RELEASE_CHECKLIST_0.3.1.md`](RELEASE_CHECKLIST_0.3.1.md).
 
 ## Explicitly deferred hardware validation
 
@@ -94,17 +120,20 @@ display reconnect, or real presented 200 Hz cadence. These require separate
 hardware-controlled runs and remain release exclusions, not hidden Stage 9
 successes.
 
-The post-release display-lifecycle branch has since delivered the reusable
-foundation for those runs: topology/backing/wake observation, fail-open
+The `0.3.1` display-lifecycle work delivered the reusable foundation for those
+runs: topology/backing/wake observation, fail-open
 display-only IOSurface reset, real window-present timing, and opt-in exact-JAR
 requirements for Retina, two-display migration and minimum refresh. With the
-built-in Retina panel and the 200 Hz VX24G10 active, strict cold/warm runs now
-pass real 2x backing and migration across both displays. The final 600-sample
+built-in Retina panel and the 200 Hz VX24G10 active, earlier strict cold/warm
+development runs passed real 2x backing and migration across both displays.
+The final 600-sample
 200 Hz phases measured 181.52/198.64 calls per second with p50 intervals of
 5.081/5.003 ms in the explicit VSync-off software-paced mode, zero >=100 ms
-stalls and zero ownership failures. Sustained native VSync-synchronised 200 Hz
-scanout, physical display disconnect/reconnect and physical sleep/wake remain
-open hardware gates. See
+stalls and zero ownership failures. Those measurements came from a development
+candidate rather than the final `0.3.1` SHA. Sustained native
+VSync-synchronised 200 Hz scanout, final-artifact Retina/migration
+qualification, physical display disconnect/reconnect and physical sleep/wake
+remain open hardware gates. See
 [`DISPLAY_LIFECYCLE_QA.md`](DISPLAY_LIFECYCLE_QA.md).
 
 ## Performance interpretation

@@ -28,6 +28,10 @@ final class IrisShadowReplayTextureSnapshotTest {
         "rgba16-float", true));
     assertEquals("native-surface-ring-exhausted",
         IrisGlTextureGpuHandoff.nativeCaptureFailure(-3));
+    assertTrue(IrisGlTextureGpuHandoff.retryableCaptureFailure(
+        IrisGlTextureGpuHandoff.nativeCaptureFailure(-3)));
+    assertFalse(IrisGlTextureGpuHandoff.retryableCaptureFailure(
+        IrisGlTextureGpuHandoff.nativeCaptureFailure(-10)));
     assertEquals("native-framebuffer-copy-or-fence-failed",
         IrisGlTextureGpuHandoff.nativeCaptureFailure(-10));
   }
@@ -164,6 +168,29 @@ final class IrisShadowReplayTextureSnapshotTest {
     assertTrue(retained.textures().get(19).shared());
     assertEquals(77, retained.textures().get(19).sharedHandle());
     assertArrayEquals(new byte[0], retained.textures().get(19).bytes());
+  }
+
+  @Test
+  void deduplicatesCapturedSurfaceHandlesBeforeAbandonment() {
+    IrisGlTextureMirror.TextureSnapshot first =
+        IrisGlTextureMirror.TextureSnapshot.fromGpuHandoff(
+            31, 1, "rgba8-unorm", 4, 2, 4, 703);
+    IrisGlTextureMirror.TextureSnapshot sameHandle =
+        IrisGlTextureMirror.TextureSnapshot.fromGpuHandoff(
+            32, 1, "rgba8-unorm", 4, 2, 4, 703);
+    IrisGlTextureMirror.TextureSnapshot second =
+        IrisGlTextureMirror.TextureSnapshot.fromGpuHandoff(
+            33, 1, "rgba8-unorm", 4, 2, 4, 701);
+    IrisGlTextureMirror.TextureMetadata metadata =
+        new IrisGlTextureMirror.TextureMetadata("rgba8-unorm",
+            1, 1, 1, 4, 1);
+    IrisGlTextureMirror.TextureSnapshot inline =
+        IrisGlTextureMirror.TextureSnapshot.fromReadback(
+            34, 1, metadata, 0, 0, new byte[] {1, 2, 3, 4});
+
+    assertArrayEquals(new long[] {701, 703},
+        IrisGlTextureGpuHandoff.uniqueSharedHandles(
+            List.of(first, sameHandle, second, inline)));
   }
 
   @Test

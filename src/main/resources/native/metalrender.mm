@@ -1,4 +1,5 @@
 #define GL_SILENCE_DEPRECATION
+#import <AppKit/NSWorkspace.h>
 #import <Foundation/NSProcessInfo.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
@@ -91,6 +92,10 @@ static std::atomic<bool> g_metal4RuntimeVerified{false};
 static std::atomic<bool> g_metal4ProbeAttempted{false};
 static std::atomic<bool> g_metal4ProbeInProgress{false};
 static std::atomic<bool> g_metal4DrawPathActive{false};
+static std::atomic<uint64_t> g_systemSleepCount{0};
+static std::atomic<uint64_t> g_systemWakeCount{0};
+static id g_systemWillSleepObserver = nil;
+static id g_systemDidWakeObserver = nil;
 // Keep long-lived references dynamically typed so merely loading the dylib on
 // macOS 14/15 cannot require a Metal 4 protocol. They are assigned and used as
 // typed MTL4 objects only inside explicit macOS 26 availability guards.
@@ -1201,6 +1206,30 @@ static void ensure_device() {
       configure_metal4_scaffold();
     }
   }
+}
+
+static void ensure_system_power_notifications() {
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    NSNotificationCenter *center =
+        [[NSWorkspace sharedWorkspace] notificationCenter];
+    g_systemWillSleepObserver = [center
+        addObserverForName:NSWorkspaceWillSleepNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *) {
+                  g_systemSleepCount.fetch_add(1,
+                                               std::memory_order_release);
+                }];
+    g_systemDidWakeObserver = [center
+        addObserverForName:NSWorkspaceDidWakeNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *) {
+                  g_systemWakeCount.fetch_add(1,
+                                              std::memory_order_release);
+                }];
+  });
 }
 
 struct MetalFeatureCaps {
@@ -3728,6 +3757,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nIsAvailable(
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nInit(
     JNIEnv *, jclass, jint width, jint height, jfloat scale) {
+  ensure_system_power_notifications();
   ensure_device();
   g_rtWidth = (int)width;
   g_rtHeight = (int)height;
@@ -3737,6 +3767,16 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nInit(
   load_shaders();
   set_iris_msl_compiler_ready(g_device != nil);
   return (g_device != nil) ? (jlong)0x1 : (jlong)0;
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetSystemSleepCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_systemSleepCount.load(std::memory_order_acquire);
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nGetSystemWakeCount(
+    JNIEnv *, jclass) {
+  return (jlong)g_systemWakeCount.load(std::memory_order_acquire);
 }
 extern "C" JNIEXPORT void JNICALL
 Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nResize(
@@ -10985,6 +11025,37 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCaptureIrisMetal4I
     }
     return (jlong)handoff.token;
   }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nReleaseIrisMetal4InputSurface(
+    JNIEnv *, jclass, jlong handle) {
+  std::lock_guard<std::mutex> executionLock(g_irisMetal4ExecutionMutex);
+  if (handle <= 0) {
+    return JNI_FALSE;
+  }
+  auto found = g_irisMetal4InputSurfaceHandoffs.find((uint64_t)handle);
+  if (found == g_irisMetal4InputSurfaceHandoffs.end()) {
+    // Immutable resident handles live in a different table and must survive.
+    return JNI_FALSE;
+  }
+  IrisMetal4InputHandoff &handoff = found->second;
+  if (handoff.inFlightFeedback) {
+    // A committed packet owns the surface until Metal completion feedback.
+    // Synchronous validation can finish before Java closes its frame lease;
+    // observe that already-signalled fence here instead of requiring another
+    // capture call to reap it.
+    if (@available(macOS 26.0, *)) {
+      if (!iris_metal4_submission_completed(handoff.inFlightFeedback)) {
+        return JNI_FALSE;
+      }
+      handoff.inFlightFeedback.reset();
+    } else {
+      return JNI_FALSE;
+    }
+  }
+  handoff.leased = false;
+  return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

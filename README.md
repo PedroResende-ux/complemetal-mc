@@ -1,11 +1,11 @@
 # MetalRender
 
 MetalRender is a Fabric client renderer for Apple Silicon Macs. Version
-`0.3.0+mc26.2` adds a stable Iris-to-Metal 4 path for Minecraft Java Edition
-26.2: Iris' final transformed GLSL is compiled through SPIR-V and MSL, cached
-as device-qualified Metal pipelines, and executed as one persistent
+`0.3.1+mc26.2` hardens the stable Iris-to-Metal 4 path for Minecraft Java
+Edition 26.2: Iris' final transformed GLSL is compiled through SPIR-V and MSL,
+cached as device-qualified Metal pipelines, and executed as one persistent
 Metal-owned frame graph. The final image is handed to Minecraft through a
-fenced IOSurface without a CPU pixel copy.
+fenced IOSurface and a GPU-only presentation pass without a CPU pixel copy.
 
 The release is deliberately fail-open. If Metal 4, a translated shader,
 pipeline state, resource binding, lifecycle state, or presentation surface is
@@ -18,7 +18,7 @@ renderer. It never guesses a missing binding or silently substitutes a shader.
 
 | Component | Validated configuration |
 | --- | --- |
-| MetalRender | `0.3.0+mc26.2` |
+| MetalRender | `0.3.1+mc26.2` |
 | Minecraft | Java Edition 26.2 |
 | Loader | Fabric Loader 0.19.3 or newer compatible build |
 | Fabric API | 0.156.0+26.2 or newer compatible 26.2 build |
@@ -28,7 +28,7 @@ renderer. It never guesses a missing binding or silently substitutes a shader.
 | Sodium | 0.9.1 for Minecraft 26.2 |
 | Shader-pack acceptance workload | Complementary Reimagined r5.8.1 |
 | Iris draw path | SHADOW, GEOMETRY, DEFERRED, COMPOSITE and FINAL graph owned by Metal 4 after parity validation |
-| Presentation | Asynchronous fenced IOSurface handoff; no CPU output copy and no steady-state `glFinish` |
+| Presentation | Asynchronous fenced IOSurface handoff plus exact GPU-only BGRA presentation; no CPU output copy and no steady-state `glFinish` |
 | Metal 3 / unavailable Metal 4 | Safe Iris/OpenGL or Minecraft fallback |
 
 The packaged native library is arm64-only with a macOS 14 deployment target,
@@ -37,7 +37,7 @@ on Apple Silicon macOS 26 or newer. Other shader packs are not advertised as
 prevalidated: supported states may use Metal after the same strict gates;
 unknown or unsupported states remain on Iris/OpenGL.
 
-The following are outside this release's validated scope:
+The following remain outside this release's final-artifact qualification:
 
 - true 2x Retina framebuffer backing;
 - physical macOS sleep/wake;
@@ -46,18 +46,23 @@ The following are outside this release's validated scope:
 - Intel Macs and non-macOS systems;
 - geometry-shader packs, because Metal has no direct geometry-shader stage.
 
-Post-`0.3.0` development now observes display topology, backing scale,
-framebuffer size, refresh-rate and likely wake boundaries, then rebuilds only
-the display-facing IOSurface/GL bridge while preserving Metal graph resources.
-Strict exact-JAR cold/warm runs with the built-in Retina panel and a 200 Hz
-VX24G10 both passed 2x backing, two-display migration and 600 real
+Version `0.3.1` observes display topology, backing scale, framebuffer size,
+refresh rate and likely wake boundaries, then rebuilds only the display-facing
+IOSurface/GL bridge while preserving Metal graph resources. It also fences
+lifecycle generations, retries cadence sampling only when a real display
+transition contaminates the sample, releases captured graph resources exactly
+once under backpressure, and destroys the GL binding before an IOSurface can
+return to the Metal pool.
+
+Earlier strict development-candidate runs with the built-in Retina panel and
+a 200 Hz VX24G10 passed 2x backing, two-display migration and 600 real
 `GlSurface.present()` samples. They measured 181.52/198.64 calls per second,
 with p50 intervals of 5.081/5.003 ms, VSync disabled, zero >=100 ms stalls and
-zero Metal ownership failures. This proves the tested path is not pinned to
-60 Hz and that Metal ownership survives a 1x-to-2x-to-200 Hz migration; it
-does not guarantee sustained or VSync-synchronised 200 Hz scanout. Physical
-display disconnect/reconnect and macOS sleep/wake still need controlled
-hardware validation. See [display lifecycle QA](docs/DISPLAY_LIFECYCLE_QA.md).
+zero Metal ownership failures. This proves that tested candidate was not
+pinned to 60 Hz; it does not qualify the final `0.3.1` artifact for sustained
+or VSync-synchronised 200 Hz scanout. Physical display disconnect/reconnect
+and macOS sleep/wake still need controlled hardware validation. See
+[display lifecycle QA](docs/DISPLAY_LIFECYCLE_QA.md).
 
 ## What Stage 9 delivers
 
@@ -86,10 +91,14 @@ Nether, End and return to Overworld, resize, fullscreen, surface suspend and
 restore, exact three-frame visual parity, persistent pipeline archives, and a
 forced Metal 3 fallback. See [the roadmap](docs/ROADMAP.md),
 [Metal 4 status](docs/METAL4_STATUS.md), [pipeline details](docs/IRIS_METAL_PIPELINE.md),
-[release checklist](docs/RELEASE_CHECKLIST_0.3.0.md), and
+[release checklist](docs/RELEASE_CHECKLIST_0.3.1.md), and
 [changelog](CHANGELOG.md).
 
 ## Performance evidence
+
+These matched measurements qualify the Stage 9 renderer introduced in
+`0.3.0`. Version `0.3.1` changes correctness, lifecycle and presentation
+ordering; it does not publish a newly measured FPS percentage.
 
 On the validated M4 Pro test scene at 1280x720 with Complementary Reimagined
 r5.8.1, render distance 8, simulation distance 5, fixed camera, noon and clear
@@ -128,7 +137,7 @@ the result.
 3. Install/select the shader pack, start the game, and run
    `/metalrender status`.
 
-No JVM enable flags are required for stable `0.3.0`. To disable the complete
+No JVM enable flags are required for stable `0.3.1`. To disable the complete
 Iris-to-Metal path for troubleshooting, add:
 
 ```text

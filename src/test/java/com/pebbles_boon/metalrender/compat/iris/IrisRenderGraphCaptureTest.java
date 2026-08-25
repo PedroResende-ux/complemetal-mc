@@ -11,6 +11,7 @@ import com.pebbles_boon.metalrender.compat.iris.IrisPipelineState.VertexAttribut
 import com.pebbles_boon.metalrender.compat.iris.IrisPipelineState.VertexBufferLayout;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
@@ -47,6 +48,64 @@ final class IrisRenderGraphCaptureTest {
     capture.beginFrame();
     assertEquals(2, capture.framesStarted());
     assertTrue(capture.captureFullGraphReplay());
+  }
+
+  @Test
+  void fullReplayByteBoundChargesUniqueRetainedPayloadOnce() {
+    IrisGlTextureMirror.TextureMetadata metadata =
+        new IrisGlTextureMirror.TextureMetadata("rgba8-unorm",
+            2, 1, 1, 4, 1);
+    IrisGlTextureMirror.TextureSnapshot inline =
+        IrisGlTextureMirror.TextureSnapshot.fromReadback(
+            41, 1, metadata, 0, 0,
+            new byte[] {1, 2, 3, 4, 5, 6, 7, 8});
+    IrisGlTextureMirror.TextureSnapshot shared =
+        IrisGlTextureMirror.TextureSnapshot.fromGpuHandoff(
+            42, 1, "rgba8-unorm", 2, 1, 4, 901);
+
+    assertEquals(8, IrisRenderGraphCapture.retainedFullReplayBytes(
+        new IrisShadowReplayBufferSnapshot.RetainedCapture(),
+        Map.of(41, inline, 42, shared)));
+  }
+
+  @Test
+  void fullReplayRequiresEveryDrawResourceCaptureToBeComplete() {
+    IrisShadowReplayBufferSnapshot completeBuffers =
+        new IrisShadowReplayBufferSnapshot(true, List.of(), List.of(),
+            Optional.empty(), Optional.empty(), Map.of(), Map.of(),
+            List.of());
+    IrisShadowReplayTextureSnapshot completeTextures =
+        IrisShadowReplayTextureSnapshot.emptyEnabled();
+    IrisShadowReplaySamplerSnapshot completeSamplers =
+        IrisShadowReplaySamplerSnapshot.emptyEnabled();
+
+    assertTrue(IrisRenderGraphCapture.fullReplayResourcesComplete(
+        completeBuffers, completeTextures, completeSamplers));
+    assertFalse(IrisRenderGraphCapture.fullReplayResourcesComplete(
+        new IrisShadowReplayBufferSnapshot(true, List.of(), List.of(),
+            Optional.empty(), Optional.empty(), Map.of(), Map.of(),
+            List.of("vertex-buffer-snapshot-unavailable")),
+        completeTextures, completeSamplers));
+    assertFalse(IrisRenderGraphCapture.fullReplayResourcesComplete(
+        completeBuffers,
+        new IrisShadowReplayTextureSnapshot(true, Map.of(),
+            List.of("sampled-texture-snapshot-unavailable")),
+        completeSamplers));
+    assertEquals("graph-frame-capture-backpressure",
+        IrisRenderGraphCapture.fullReplayResourceAbortReason(
+            completeBuffers,
+            new IrisShadowReplayTextureSnapshot(true, Map.of(),
+                List.of("sampled-texture-gpu-handoff-backpressure")),
+            completeSamplers));
+    assertFalse(IrisRenderGraphCapture.fullReplayResourcesComplete(
+        completeBuffers, completeTextures,
+        new IrisShadowReplaySamplerSnapshot(true, Map.of(),
+            List.of("sampler-state-parameter-unsupported"))));
+    assertEquals("graph-frame-resource-capture-incomplete",
+        IrisRenderGraphCapture.fullReplayResourceAbortReason(
+            completeBuffers, completeTextures,
+            new IrisShadowReplaySamplerSnapshot(true, Map.of(),
+                List.of("sampler-state-parameter-unsupported"))));
   }
 
   @Test

@@ -48,6 +48,10 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
   private static final int STARTUP_TIMEOUT_TICKS = 1_800;
   private static final int WORLD_TIMEOUT_TICKS = 3_600;
   private static final int SHADER_TIMEOUT_TICKS = 3_600;
+  // Client GameTest ticks are not guaranteed to map 1:1 to wall-clock game
+  // ticks. Keep physical prompts comfortably below the process timeout while
+  // allowing a human to reach, reconnect, or wake the display hardware.
+  private static final int PHYSICAL_ACTION_TIMEOUT_TICKS = 12_000;
   private static final long EXPECTED_COMPLEMENTARY_PROGRAMS = 231;
   private static final long EXPECTED_COMPLEMENTARY_STAGES = 462;
   private static final int MINIMUM_PERFORMANCE_SAMPLES = 600;
@@ -56,6 +60,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
   private static final int MAXIMUM_LIFECYCLE_INVALIDATIONS = 16;
   private static final int MINIMUM_PRESENTATION_SAMPLES = 120;
   private static final int MAXIMUM_PRESENTATION_SAMPLES = 5_000;
+  private static final int MAXIMUM_CADENCE_CAPTURE_ATTEMPTS = 3;
+  private static final int CADENCE_RETRY_SETTLE_TICKS = 80;
   private static volatile long lastReadinessDiagnosticNanos;
 
   @Override
@@ -146,6 +152,10 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         "metalrender.exactJar.requireRetina");
     boolean requireDisplayMigration = Boolean.getBoolean(
         "metalrender.exactJar.requireDisplayMigration");
+    boolean requireDisplayReconnect = Boolean.getBoolean(
+        "metalrender.exactJar.requireDisplayReconnect");
+    boolean requireSleepWake = Boolean.getBoolean(
+        "metalrender.exactJar.requireSleepWake");
     int minimumRefreshHz = integerProperty(
         "metalrender.exactJar.minimumRefreshHz", 0);
     int presentationSamples = integerProperty(
@@ -158,7 +168,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
             ? presentationSamples >= MINIMUM_PRESENTATION_SAMPLES
                 && presentationSamples <= MAXIMUM_PRESENTATION_SAMPLES
             : presentationSamples == 0 && minimumRefreshHz == 0
-                && !requireRetina && !requireDisplayMigration,
+                && !requireRetina && !requireDisplayMigration
+                && !requireDisplayReconnect && !requireSleepWake,
         "invalid hardware display QA profile");
     require(expectedSha.equals(sha256(exactJar)),
         "loaded release JAR SHA-256 differs from the prepared artifact");
@@ -462,8 +473,9 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           writeLifecycleEvidence(lifecycleEvidence);
           if (hardwareDisplay) {
             hardwareDisplayEvidence = verifyHardwareDisplays(context,
-                requireRetina, requireDisplayMigration, minimumRefreshHz,
-                presentationSamples);
+                requireRetina, requireDisplayMigration,
+                requireDisplayReconnect, requireSleepWake,
+                minimumRefreshHz, presentationSamples);
             writeHardwareDisplayEvidence(hardwareDisplayEvidence);
           }
         } else {
@@ -1446,9 +1458,43 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         waitForOwnershipAdvance(context, presentationStart, failures,
             "window resize");
 
+    DisplayLifecycleTracker.DisplayTarget fullscreenTarget =
+        context.computeOnClient(client -> {
+          List<DisplayLifecycleTracker.DisplayTarget> displays =
+              DisplayLifecycleTracker.displays();
+          require(!displays.isEmpty(),
+              "Stage 9 fullscreen found no connected GLFW display");
+          DisplayLifecycleTracker.DisplayState state =
+              DisplayLifecycleTracker.status().state();
+          if (state != null && state.monitorHandle() != 0) {
+            for (DisplayLifecycleTracker.DisplayTarget display : displays) {
+              if (display.handle() == state.monitorHandle()) {
+                return display;
+              }
+            }
+          }
+          return displays.stream()
+              .filter(DisplayLifecycleTracker.DisplayTarget::primary)
+              .findFirst().orElse(displays.getFirst());
+        });
+    int fullscreenX = fullscreenTarget.workX()
+        + Math.max(0,
+            (fullscreenTarget.workWidth() - resizedWidth) / 2);
+    int fullscreenY = fullscreenTarget.workY()
+        + Math.max(0,
+            (fullscreenTarget.workHeight() - resizedHeight) / 2);
     context.runOnClient(client -> {
       Window window = client.getWindow();
-      GLFW.glfwSetWindowPos(window.handle(), 0, 0);
+      GLFW.glfwSetWindowPos(window.handle(), fullscreenX, fullscreenY);
+      GLFW.glfwPollEvents();
+    });
+    context.waitFor(client -> {
+      Window window = client.getWindow();
+      return window.findBestMonitor() != null
+          && window.findBestMonitor().monitor() == fullscreenTarget.handle();
+    }, WORLD_TIMEOUT_TICKS);
+    context.runOnClient(client -> {
+      Window window = client.getWindow();
       window.toggleFullScreen();
       window.updateFullscreenIfChanged();
     });
@@ -1535,8 +1581,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
 
   private static HardwareDisplayEvidence verifyHardwareDisplays(
       ClientGameTestContext context, boolean requireRetina,
-      boolean requireDisplayMigration, int minimumRefreshHz,
-      int requestedSamples) {
+      boolean requireDisplayMigration, boolean requireDisplayReconnect,
+      boolean requireSleepWake, int minimumRefreshHz, int requestedSamples) {
     List<DisplayLifecycleTracker.DisplayTarget> displays =
         context.computeOnClient(client -> DisplayLifecycleTracker.displays());
     require(!displays.isEmpty(),
@@ -1551,7 +1597,8 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           window.getScreenWidth(), window.getScreenHeight(),
           client.options.framerateLimit().get(),
           client.options.enableVsync().get(),
-          client.options.inactivityFpsLimit().get(), state.monitorHandle());
+          client.options.inactivityFpsLimit().get(), state.monitorHandle(),
+          state.monitorName());
     });
     IrisTranslationCoordinator.FullGraphStatus ownershipStart =
         currentFullGraphStatus(context);
@@ -1656,16 +1703,16 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         && client.options.framerateLimit().get() == requestedFpsCap
         && MetalRenderClient.effectiveTargetFrameRate()
             >= Math.max(30, minimumRefreshHz), WORLD_TIMEOUT_TICKS);
-    context.waitTicks(80);
+    // Cold translation/pipeline work can finish immediately before this
+    // phase. Give the render loop a full eight seconds to settle so the
+    // cadence gate measures the display path rather than compiler tail work.
+    context.waitTicks(160);
+    StableCadenceCapture cadence = captureStableDisplayCadence(
+        context, requestedSamples, failureBaseline);
     IrisTranslationCoordinator.FullGraphStatus cadenceOwnershipStart =
-        currentFullGraphStatus(context);
-    context.runOnClient(client -> DisplayPresentationTracker.reset());
-    context.waitFor(client ->
-        DisplayPresentationTracker.snapshot().completionIntervalsNanos().length
-            >= requestedSamples, SHADER_TIMEOUT_TICKS);
+        cadence.ownershipStart();
     DisplayPresentationTracker.Snapshot presentation =
-        context.computeOnClient(
-            client -> DisplayPresentationTracker.snapshot());
+        cadence.presentation();
     long[] intervals = tail(presentation.completionIntervalsNanos(),
         requestedSamples);
     long[] durations = tail(presentation.presentDurationsNanos(),
@@ -1681,6 +1728,13 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     double expectedPeriodNanos = 1_000_000_000.0 / reportedRefreshHz;
     int requiredCadenceHz = minimumRefreshHz > 0
         ? minimumRefreshHz : reportedRefreshHz;
+    System.out.printf(Locale.ROOT,
+        "METALRENDER_HARDWARE_CADENCE_PROBE refresh=%dHz measured=%.2fHz "
+            + "samples=%d p50=%.3fms p95=%.3fms p99=%.3fms "
+            + "presentP50=%.3fms%n",
+        reportedRefreshHz, measuredHz, requestedSamples,
+        nanosToMillis(intervalP50), nanosToMillis(intervalP95),
+        nanosToMillis(intervalP99), nanosToMillis(durationP50));
     require(presentation.invalidSamples() == 0,
         "window presentation tracker rejected samples");
     require(cadenceStutters == 0,
@@ -1704,27 +1758,72 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     require(cadenceOwnershipEnd.ownershipFailures() == failureBaseline,
         "Metal ownership failed during display cadence capture");
 
+    DisplayReconnectEvidence reconnectEvidence =
+        DisplayReconnectEvidence.notRequired();
+    if (requireDisplayReconnect) {
+      reconnectEvidence = verifyPhysicalDisplayReconnect(context, displays,
+          refreshTarget, failureBaseline);
+    }
+    SleepWakeEvidence sleepWakeEvidence = SleepWakeEvidence.notRequired();
+    if (requireSleepWake) {
+      sleepWakeEvidence = verifyPhysicalSleepWake(context, failureBaseline);
+    }
+
+    DisplayLifecycleTracker.Status restoreLifecycleStart =
+        context.computeOnClient(client -> DisplayLifecycleTracker.status());
+    DisplayLifecycleTracker.DisplayState restoreState =
+        restoreLifecycleStart.state();
+    boolean restoreResetExpected = restoreState == null
+        || !restoreState.monitorName().equals(original.monitorName())
+        || restoreState.windowWidth() != original.width()
+        || restoreState.windowHeight() != original.height()
+        || restoreState.fullscreen();
     context.runOnClient(client -> {
       Window window = client.getWindow();
       client.options.framerateLimit().set(original.maxFps());
       client.getFramerateLimitTracker().setFramerateLimit(original.maxFps());
       client.options.enableVsync().set(original.vsync());
       client.options.inactivityFpsLimit().set(original.inactivityFpsLimit());
-      window.setWindowed(original.width(), original.height());
+      // macOS can restore a per-display Cocoa window size while the window is
+      // migrating after wake. Move first while preserving the current size;
+      // apply the original dimensions only after the original display owns
+      // the window again.
+      window.setWindowed(window.getScreenWidth(), window.getScreenHeight());
       GLFW.glfwSetWindowPos(window.handle(), original.x(), original.y());
     });
     context.waitFor(client -> {
       DisplayLifecycleTracker.DisplayState state =
           DisplayLifecycleTracker.status().state();
+      return state != null
+          && state.monitorName().equals(original.monitorName());
+    }, WORLD_TIMEOUT_TICKS);
+    context.runOnClient(client -> {
       Window window = client.getWindow();
-      return state != null && state.monitorHandle() == original.monitorHandle()
+      window.setWindowed(original.width(), original.height());
+      GLFW.glfwSetWindowSize(window.handle(), original.width(),
+          original.height());
+    });
+    context.waitFor(client -> {
+      DisplayLifecycleTracker.DisplayState state =
+          DisplayLifecycleTracker.status().state();
+      Window window = client.getWindow();
+      return state != null
+          && state.monitorName().equals(original.monitorName())
           && !window.isFullscreen()
           && window.getScreenWidth() == original.width()
           && window.getScreenHeight() == original.height();
     }, WORLD_TIMEOUT_TICKS);
+    if (restoreResetExpected) {
+      waitForDisplayReset(context, restoreLifecycleStart,
+          "hardware display restore");
+    }
+    IrisTranslationCoordinator.FullGraphStatus restoreOwnershipStart =
+        currentFullGraphStatus(context);
+    require(restoreOwnershipStart.ownershipFailures() == failureBaseline,
+        "Metal ownership failed before post-restore recovery");
     IrisTranslationCoordinator.FullGraphStatus restored =
         waitForOwnershipAdvance(context,
-            cadenceOwnershipEnd.ownershipFramesPresented(), failureBaseline,
+            restoreOwnershipStart.ownershipFramesPresented(), failureBaseline,
             "hardware display restore");
     DisplayLifecycleTracker.Status lifecycleEnd =
         context.computeOnClient(client -> DisplayLifecycleTracker.status());
@@ -1748,6 +1847,16 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         intervalP50, intervalP95, intervalP99, durationP50, measuredHz,
         cadenceStutters, ownershipPresentationDelta,
         displayTransitionDelta, displayResetDelta,
+        requireDisplayReconnect, reconnectEvidence.passed(),
+        reconnectEvidence.minimumConnectedDisplays(),
+        reconnectEvidence.reconnectedDisplays(),
+        reconnectEvidence.ownershipPresentationDelta(),
+        reconnectEvidence.transitionDelta(), reconnectEvidence.resetDelta(),
+        requireSleepWake, sleepWakeEvidence.passed(),
+        sleepWakeEvidence.systemSleepDelta(),
+        sleepWakeEvidence.systemWakeDelta(),
+        sleepWakeEvidence.resumeGapDelta(), sleepWakeEvidence.resetDelta(),
+        sleepWakeEvidence.ownershipPresentationDelta(),
         restored.ownershipFailures() - failureBaseline);
     System.out.printf(Locale.ROOT,
         "METALRENDER_HARDWARE_DISPLAY PASS displays=%d migration=%s "
@@ -1768,16 +1877,178 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
     return evidence;
   }
 
+  private static DisplayReconnectEvidence verifyPhysicalDisplayReconnect(
+      ClientGameTestContext context,
+      List<DisplayLifecycleTracker.DisplayTarget> initialTargets,
+      DisplayLifecycleTracker.DisplayTarget disconnectTarget,
+      long failureBaseline) {
+    require(initialTargets.size() >= 2,
+        "physical display reconnect QA requires two connected displays");
+    DisplayLifecycleTracker.DisplayTarget safeTarget = initialTargets.stream()
+        .filter(target -> target.handle() != disconnectTarget.handle())
+        .max(Comparator.comparingDouble(target -> Math.min(
+            target.contentScaleX(), target.contentScaleY())))
+        .orElseThrow(() -> new AssertionError(
+            "physical display reconnect QA has no safe remaining display"));
+    moveToDisplay(context, safeTarget, failureBaseline,
+        "pre-reconnect safe-display migration");
+    DisplayLifecycleTracker.Status lifecycleStart = context.computeOnClient(
+        client -> DisplayLifecycleTracker.status());
+    long presentationStart =
+        currentFullGraphStatus(context).ownershipFramesPresented();
+    int initialDisplayCount = initialTargets.size();
+    System.out.printf(Locale.ROOT,
+        "METALRENDER_PHYSICAL_ACTION_REQUIRED action=disconnect-display "
+            + "monitor=%s expectedDisplaysBelow=%d%n",
+        disconnectTarget.name(), initialDisplayCount);
+    System.out.flush();
+    context.waitFor(client -> {
+      List<DisplayLifecycleTracker.DisplayTarget> current =
+          DisplayLifecycleTracker.displays();
+      return current.size() < initialDisplayCount
+          && current.stream().noneMatch(target ->
+              sameDisplayIdentity(target, disconnectTarget));
+    }, PHYSICAL_ACTION_TIMEOUT_TICKS);
+    int minimumConnectedDisplays = context.computeOnClient(
+        client -> DisplayLifecycleTracker.displays().size());
+    IrisTranslationCoordinator.FullGraphStatus afterDisconnect =
+        waitForOwnershipAdvance(context, presentationStart, failureBaseline,
+            "physical display disconnect");
+    System.out.printf(Locale.ROOT,
+        "METALRENDER_PHYSICAL_ACTION_OBSERVED action=disconnect-display "
+            + "connectedDisplays=%d ownershipRecovered=true%n",
+        minimumConnectedDisplays);
+    System.out.printf(Locale.ROOT,
+        "METALRENDER_PHYSICAL_ACTION_REQUIRED action=reconnect-display "
+            + "monitor=%s expectedDisplays=%d%n",
+        disconnectTarget.name(), initialDisplayCount);
+    System.out.flush();
+    context.waitFor(client -> {
+      List<DisplayLifecycleTracker.DisplayTarget> current =
+          DisplayLifecycleTracker.displays();
+      return current.size() >= initialDisplayCount
+          && current.stream().anyMatch(target ->
+              sameDisplayIdentity(target, disconnectTarget));
+    }, PHYSICAL_ACTION_TIMEOUT_TICKS);
+    List<DisplayLifecycleTracker.DisplayTarget> reconnectedTargets =
+        context.computeOnClient(client -> DisplayLifecycleTracker.displays());
+    DisplayLifecycleTracker.DisplayTarget reconnectedTarget =
+        reconnectedTargets.stream()
+            .filter(target -> sameDisplayIdentity(target, disconnectTarget))
+            .findFirst().orElseThrow();
+    IrisTranslationCoordinator.FullGraphStatus afterReconnect =
+        waitForOwnershipAdvance(context,
+            afterDisconnect.ownershipFramesPresented(), failureBaseline,
+            "physical display reconnect");
+    moveToDisplay(context, reconnectedTarget, failureBaseline,
+        "reconnected display migration");
+    IrisTranslationCoordinator.FullGraphStatus completed =
+        currentFullGraphStatus(context);
+    DisplayLifecycleTracker.Status lifecycleEnd = context.computeOnClient(
+        client -> DisplayLifecycleTracker.status());
+    long transitionDelta =
+        lifecycleEnd.transitions() - lifecycleStart.transitions();
+    long resetDelta = lifecycleEnd.presentationResets()
+        - lifecycleStart.presentationResets();
+    long presentationDelta = completed.ownershipFramesPresented()
+        - presentationStart;
+    require(minimumConnectedDisplays < initialDisplayCount,
+        "display count did not fall during physical disconnect");
+    require(reconnectedTargets.size() >= initialDisplayCount,
+        "display count did not recover after physical reconnect");
+    require(transitionDelta >= 2 && resetDelta >= 2,
+        "display lifecycle did not record disconnect and reconnect resets");
+    require(presentationDelta
+            >= 3L * LIFECYCLE_PRESENTATIONS_PER_TRANSITION,
+        "Metal ownership did not recover across physical reconnect");
+    require(completed.ownershipFailures() == failureBaseline,
+        "Metal ownership failed across physical display reconnect");
+    System.out.printf(Locale.ROOT,
+        "METALRENDER_PHYSICAL_ACTION_OBSERVED action=reconnect-display "
+            + "connectedDisplays=%d ownershipRecovered=true "
+            + "transitions=%d resets=%d%n",
+        reconnectedTargets.size(), transitionDelta, resetDelta);
+    return new DisplayReconnectEvidence(true, true,
+        minimumConnectedDisplays, reconnectedTargets.size(),
+        presentationDelta, transitionDelta, resetDelta);
+  }
+
+  private static SleepWakeEvidence verifyPhysicalSleepWake(
+      ClientGameTestContext context, long failureBaseline) {
+    long systemSleepStart = context.computeOnClient(
+        client -> NativeBridge.nGetSystemSleepCount());
+    long systemWakeStart = context.computeOnClient(
+        client -> NativeBridge.nGetSystemWakeCount());
+    DisplayLifecycleTracker.Status lifecycleStart = context.computeOnClient(
+        client -> DisplayLifecycleTracker.status());
+    long presentationStart =
+        currentFullGraphStatus(context).ownershipFramesPresented();
+    System.out.println(
+        "METALRENDER_PHYSICAL_ACTION_REQUIRED action=sleep-wake "
+            + "minimumSleepSeconds=6");
+    System.out.flush();
+    context.waitFor(client -> {
+      DisplayLifecycleTracker.Status lifecycle =
+          DisplayLifecycleTracker.status();
+      return NativeBridge.nGetSystemSleepCount() > systemSleepStart
+          && NativeBridge.nGetSystemWakeCount() > systemWakeStart
+          && lifecycle.resumeGaps() > lifecycleStart.resumeGaps();
+    }, PHYSICAL_ACTION_TIMEOUT_TICKS);
+    IrisTranslationCoordinator.FullGraphStatus completed =
+        waitForOwnershipAdvance(context, presentationStart, failureBaseline,
+            "physical sleep/wake");
+    long systemSleepDelta = context.computeOnClient(
+        client -> NativeBridge.nGetSystemSleepCount()) - systemSleepStart;
+    long systemWakeDelta = context.computeOnClient(
+        client -> NativeBridge.nGetSystemWakeCount()) - systemWakeStart;
+    DisplayLifecycleTracker.Status lifecycleEnd = context.computeOnClient(
+        client -> DisplayLifecycleTracker.status());
+    long resumeGapDelta =
+        lifecycleEnd.resumeGaps() - lifecycleStart.resumeGaps();
+    long resetDelta = lifecycleEnd.presentationResets()
+        - lifecycleStart.presentationResets();
+    long presentationDelta = completed.ownershipFramesPresented()
+        - presentationStart;
+    require(systemSleepDelta > 0 && systemWakeDelta > 0
+            && resumeGapDelta > 0 && resetDelta > 0,
+        "physical sleep/wake notifications did not produce a safe reset");
+    require(presentationDelta >= LIFECYCLE_PRESENTATIONS_PER_TRANSITION,
+        "Metal ownership did not recover after physical sleep/wake");
+    require(completed.ownershipFailures() == failureBaseline,
+        "Metal ownership failed after physical sleep/wake");
+    System.out.printf(Locale.ROOT,
+        "METALRENDER_PHYSICAL_ACTION_OBSERVED action=sleep-wake "
+            + "systemSleep=%d systemWake=%d resumeGaps=%d resets=%d "
+            + "ownershipRecovered=true%n",
+        systemSleepDelta, systemWakeDelta, resumeGapDelta, resetDelta);
+    return new SleepWakeEvidence(true, true, systemSleepDelta,
+        systemWakeDelta, resumeGapDelta, resetDelta, presentationDelta);
+  }
+
+  private static boolean sameDisplayIdentity(
+      DisplayLifecycleTracker.DisplayTarget left,
+      DisplayLifecycleTracker.DisplayTarget right) {
+    return left.name().equals(right.name())
+        && left.modeWidth() == right.modeWidth()
+        && left.modeHeight() == right.modeHeight()
+        && left.refreshRate() == right.refreshRate();
+  }
+
   private static DisplayLifecycleTracker.DisplayState moveToDisplay(
       ClientGameTestContext context,
       DisplayLifecycleTracker.DisplayTarget target, long failureBaseline,
       String stage) {
-    long presentationBaseline =
-        currentFullGraphStatus(context).ownershipFramesPresented();
     int width = Math.max(640, Math.min(960, target.workWidth() - 80));
     int height = Math.max(360, Math.min(540, target.workHeight() - 80));
     int x = target.workX() + Math.max(0, (target.workWidth() - width) / 2);
     int y = target.workY() + Math.max(0, (target.workHeight() - height) / 2);
+    DisplayLifecycleTracker.Status lifecycleStart =
+        context.computeOnClient(client -> DisplayLifecycleTracker.status());
+    DisplayLifecycleTracker.DisplayState initial = lifecycleStart.state();
+    boolean resetExpected = initial == null
+        || initial.monitorHandle() != target.handle()
+        || initial.windowWidth() != width || initial.windowHeight() != height
+        || initial.fullscreen();
     context.runOnClient(client -> {
       Window window = client.getWindow();
       if (window.isFullscreen()) {
@@ -1796,16 +2067,104 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           && window.getScreenHeight() == height
           && window.getWidth() > 0 && window.getHeight() > 0;
     }, WORLD_TIMEOUT_TICKS);
-    waitForOwnershipAdvance(context, presentationBaseline, failureBaseline,
-        stage);
+    if (resetExpected) {
+      waitForDisplayReset(context, lifecycleStart, stage);
+    }
+    IrisTranslationCoordinator.FullGraphStatus ownershipStart =
+        currentFullGraphStatus(context);
+    require(ownershipStart.ownershipFailures() == failureBaseline,
+        "Stage 9 ownership failed before " + stage + " recovery");
+    waitForOwnershipAdvance(context,
+        ownershipStart.ownershipFramesPresented(), failureBaseline, stage);
     return context.computeOnClient(
         client -> DisplayLifecycleTracker.status().state());
+  }
+
+  private static DisplayLifecycleTracker.Status waitForDisplayReset(
+      ClientGameTestContext context,
+      DisplayLifecycleTracker.Status baseline, String stage) {
+    context.waitFor(client -> {
+      DisplayLifecycleTracker.Status status =
+          DisplayLifecycleTracker.status();
+      return status.transitions() > baseline.transitions()
+          && status.presentationResets() > baseline.presentationResets();
+    }, WORLD_TIMEOUT_TICKS);
+    DisplayLifecycleTracker.Status status = context.computeOnClient(
+        client -> DisplayLifecycleTracker.status());
+    require(status.transitions() > baseline.transitions()
+            && status.presentationResets() > baseline.presentationResets(),
+        "display lifecycle did not reset during " + stage);
+    return status;
   }
 
   private static long[] tail(long[] values, int count) {
     require(values.length >= count,
         "not enough presentation samples");
     return Arrays.copyOfRange(values, values.length - count, values.length);
+  }
+
+  private static StableCadenceCapture captureStableDisplayCadence(
+      ClientGameTestContext context, int requestedSamples,
+      long failureBaseline) {
+    for (int attempt = 1;
+         attempt <= MAXIMUM_CADENCE_CAPTURE_ATTEMPTS; attempt++) {
+      if (attempt > 1) {
+        context.waitTicks(CADENCE_RETRY_SETTLE_TICKS);
+      }
+      DisplayLifecycleTracker.Status lifecycleStart =
+          context.computeOnClient(client -> DisplayLifecycleTracker.status());
+      IrisTranslationCoordinator.FullGraphStatus ownershipStart =
+          currentFullGraphStatus(context);
+      require(ownershipStart.ownershipFailures() == failureBaseline,
+          "Metal ownership failed before display cadence capture");
+      context.runOnClient(client -> DisplayPresentationTracker.reset());
+      context.waitFor(client -> DisplayPresentationTracker.snapshot()
+              .completionIntervalsNanos().length >= requestedSamples,
+          SHADER_TIMEOUT_TICKS);
+      DisplayPresentationTracker.Snapshot presentation =
+          context.computeOnClient(
+              client -> DisplayPresentationTracker.snapshot());
+      DisplayLifecycleTracker.Status lifecycleEnd =
+          context.computeOnClient(client -> DisplayLifecycleTracker.status());
+      IrisTranslationCoordinator.FullGraphStatus ownershipEnd =
+          currentFullGraphStatus(context);
+      require(ownershipEnd.ownershipFailures() == failureBaseline,
+          "Metal ownership failed during display cadence capture");
+      if (sameStableDisplayState(lifecycleStart, lifecycleEnd)) {
+        return new StableCadenceCapture(presentation, ownershipStart);
+      }
+      System.out.printf(Locale.ROOT,
+          "METALRENDER_HARDWARE_CADENCE_RETRY attempt=%d/%d "
+              + "transitions=%d resets=%d reason=%s%n",
+          attempt, MAXIMUM_CADENCE_CAPTURE_ATTEMPTS,
+          lifecycleEnd.transitions() - lifecycleStart.transitions(),
+          lifecycleEnd.presentationResets()
+              - lifecycleStart.presentationResets(),
+          lifecycleEnd.lastReason());
+    }
+    throw new AssertionError(
+        "display lifecycle did not remain stable during cadence capture");
+  }
+
+  private static boolean sameStableDisplayState(
+      DisplayLifecycleTracker.Status start,
+      DisplayLifecycleTracker.Status end) {
+    if (start.transitions() != end.transitions()
+        || start.presentationResets() != end.presentationResets()
+        || start.resumeGaps() != end.resumeGaps()
+        || start.state() == null || end.state() == null) {
+      return false;
+    }
+    DisplayLifecycleTracker.DisplayState before = start.state();
+    DisplayLifecycleTracker.DisplayState after = end.state();
+    return before.windowHandle() == after.windowHandle()
+        && before.monitorHandle() == after.monitorHandle()
+        && before.windowWidth() == after.windowWidth()
+        && before.windowHeight() == after.windowHeight()
+        && before.framebufferWidth() == after.framebufferWidth()
+        && before.framebufferHeight() == after.framebufferHeight()
+        && before.refreshRate() == after.refreshRate()
+        && before.fullscreen() == after.fullscreen();
   }
 
   private static IrisTranslationCoordinator.FullGraphStatus
@@ -1915,7 +2274,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
   private static void writeLifecycleEvidence(LifecycleEvidence evidence) {
     String json = String.format(Locale.ROOT, """
         {
-          "schemaVersion": 1,
+          "schemaVersion": 2,
           "status": %s,
           "resizePassed": %s,
           "fullscreenPassed": %s,
@@ -1948,7 +2307,7 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       HardwareDisplayEvidence evidence) {
     String json = String.format(Locale.ROOT, """
         {
-          "schemaVersion": 1,
+          "schemaVersion": 2,
           "status": %s,
           "connectedDisplays": %d,
           "displayMigrationRequired": %s,
@@ -1972,6 +2331,20 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
           "ownershipPresentationDelta": %d,
           "displayTransitionDelta": %d,
           "displayResetDelta": %d,
+          "displayReconnectRequired": %s,
+          "displayReconnectPassed": %s,
+          "minimumConnectedDisplaysDuringReconnect": %d,
+          "reconnectedDisplays": %d,
+          "reconnectOwnershipPresentationDelta": %d,
+          "reconnectTransitionDelta": %d,
+          "reconnectResetDelta": %d,
+          "sleepWakeRequired": %s,
+          "sleepWakePassed": %s,
+          "systemSleepDelta": %d,
+          "systemWakeDelta": %d,
+          "resumeGapDelta": %d,
+          "sleepWakeResetDelta": %d,
+          "sleepWakeOwnershipPresentationDelta": %d,
           "ownershipFailureDelta": %d
         }
         """, quote(evidence.status()), evidence.connectedDisplays(),
@@ -1988,6 +2361,16 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
         evidence.presentCallP50Nanos(), evidence.measuredPresentationHz(),
         evidence.presentationStutters(), evidence.ownershipPresentationDelta(),
         evidence.displayTransitionDelta(), evidence.displayResetDelta(),
+        evidence.displayReconnectRequired(),
+        evidence.displayReconnectPassed(),
+        evidence.minimumConnectedDisplaysDuringReconnect(),
+        evidence.reconnectedDisplays(),
+        evidence.reconnectOwnershipPresentationDelta(),
+        evidence.reconnectTransitionDelta(), evidence.reconnectResetDelta(),
+        evidence.sleepWakeRequired(), evidence.sleepWakePassed(),
+        evidence.systemSleepDelta(), evidence.systemWakeDelta(),
+        evidence.resumeGapDelta(), evidence.sleepWakeResetDelta(),
+        evidence.sleepWakeOwnershipPresentationDelta(),
         evidence.ownershipFailureDelta());
     writeAtomicJson("metalrender.exactJar.hardwareDisplayEvidencePath", json);
   }
@@ -2083,7 +2466,30 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
   private record WindowPlacement(int x, int y, int width, int height,
                                  int maxFps, boolean vsync,
                                  InactivityFpsLimit inactivityFpsLimit,
-                                 long monitorHandle) {
+                                 long monitorHandle, String monitorName) {
+  }
+
+  private record StableCadenceCapture(
+      DisplayPresentationTracker.Snapshot presentation,
+      IrisTranslationCoordinator.FullGraphStatus ownershipStart) {
+  }
+
+  private record DisplayReconnectEvidence(
+      boolean required, boolean passed, int minimumConnectedDisplays,
+      int reconnectedDisplays, long ownershipPresentationDelta,
+      long transitionDelta, long resetDelta) {
+    private static DisplayReconnectEvidence notRequired() {
+      return new DisplayReconnectEvidence(false, false, 0, 0, 0, 0, 0);
+    }
+  }
+
+  private record SleepWakeEvidence(
+      boolean required, boolean passed, long systemSleepDelta,
+      long systemWakeDelta, long resumeGapDelta, long resetDelta,
+      long ownershipPresentationDelta) {
+    private static SleepWakeEvidence notRequired() {
+      return new SleepWakeEvidence(false, false, 0, 0, 0, 0, 0);
+    }
   }
 
   private record HardwareDisplayEvidence(
@@ -2098,11 +2504,20 @@ public final class ExactJarClientGameTest implements FabricClientGameTest {
       long presentCallP50Nanos, double measuredPresentationHz,
       long presentationStutters, long ownershipPresentationDelta,
       long displayTransitionDelta, long displayResetDelta,
+      boolean displayReconnectRequired, boolean displayReconnectPassed,
+      int minimumConnectedDisplaysDuringReconnect, int reconnectedDisplays,
+      long reconnectOwnershipPresentationDelta,
+      long reconnectTransitionDelta, long reconnectResetDelta,
+      boolean sleepWakeRequired, boolean sleepWakePassed,
+      long systemSleepDelta, long systemWakeDelta, long resumeGapDelta,
+      long sleepWakeResetDelta, long sleepWakeOwnershipPresentationDelta,
       long ownershipFailureDelta) {
     private static HardwareDisplayEvidence notRequired() {
       return new HardwareDisplayEvidence("NOT_REQUIRED", 0, false, false,
           false, false, "not-required", 0.0, 0.0, 0, 0, "not-required",
-          "not-required", 0, 0, 0, 0, 0, 0.0, 0, 0, 0, 0, 0);
+          "not-required", 0, 0, 0, 0, 0, 0.0, 0, 0, 0, 0,
+          false, false, 0, 0, 0, 0, 0,
+          false, false, 0, 0, 0, 0, 0, 0);
     }
   }
 

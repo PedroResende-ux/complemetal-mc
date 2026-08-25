@@ -24,12 +24,44 @@ final class IrisTranslationCoordinatorTest {
         "graph-native-resource-generation-stale"));
     assertTrue(IrisTranslationCoordinator.recoverableOwnershipInvalidation(
         "graph-frame-texture-generation-stale"));
+    assertTrue(IrisTranslationCoordinator.recoverableOwnershipInvalidation(
+        "graph-frame-display-generation-stale"));
     assertFalse(IrisTranslationCoordinator.recoverableOwnershipInvalidation(
         "graph-native-presentation-size-unsupported"));
     assertFalse(IrisTranslationCoordinator.recoverableOwnershipInvalidation(
         "graph-native-draw-pipeline-state-mismatch"));
     assertFalse(IrisTranslationCoordinator.recoverableOwnershipInvalidation(
         null));
+    assertTrue(IrisTranslationCoordinator.retryableFullGraphCaptureAbort(
+        "graph-frame-capture-backpressure"));
+    assertFalse(IrisTranslationCoordinator.retryableFullGraphCaptureAbort(
+        "graph-frame-resource-capture-incomplete"));
+  }
+
+  @Test
+  void displayPresentationGenerationRejectsEveryStaleFrame() {
+    assertTrue(IrisTranslationCoordinator
+        .displayPresentationGenerationMatches(3, 3));
+    assertFalse(IrisTranslationCoordinator
+        .displayPresentationGenerationMatches(2, 3));
+    assertFalse(IrisTranslationCoordinator
+        .displayPresentationGenerationMatches(0, 0));
+  }
+
+  @Test
+  void fullGraphOwnershipDisablesLegacyFinalCutoverCapture() {
+    IrisSelectiveCutoverGate.Status armed =
+        new IrisSelectiveCutoverGate.Status(
+            IrisSelectiveCutoverGate.Mode.ARMED, 4, 2,
+            false, 0, 0, 0, 0);
+    assertTrue(IrisTranslationCoordinator.legacyCutoverCaptureEligible(
+        false, 0, IrisRenderGraph.Phase.FINAL, armed));
+    assertFalse(IrisTranslationCoordinator.legacyCutoverCaptureEligible(
+        true, 0, IrisRenderGraph.Phase.FINAL, armed));
+    assertFalse(IrisTranslationCoordinator.legacyCutoverCaptureEligible(
+        false, 1, IrisRenderGraph.Phase.FINAL, armed));
+    assertFalse(IrisTranslationCoordinator.legacyCutoverCaptureEligible(
+        false, 0, IrisRenderGraph.Phase.COMPOSITE, armed));
   }
 
   @Test
@@ -40,6 +72,16 @@ final class IrisTranslationCoordinatorTest {
     assertTrue(IrisTranslationCoordinator.fullGraphParityConverged(
         new IrisVisualParityGate.Status(6, 5, 1, 3,
             0.0015, 0.2, 27, false)));
+  }
+
+  @Test
+  void preOwnershipCaptureAbortsRetryWithinStrictBound() {
+    assertTrue(IrisTranslationCoordinator.fullGraphCaptureAbortRetryAllowed(1));
+    assertTrue(IrisTranslationCoordinator.fullGraphCaptureAbortRetryAllowed(
+        IrisTranslationCoordinator.DEFAULT_FULL_GRAPH_FRAME_ATTEMPTS - 1L));
+    assertFalse(IrisTranslationCoordinator.fullGraphCaptureAbortRetryAllowed(
+        IrisTranslationCoordinator.DEFAULT_FULL_GRAPH_FRAME_ATTEMPTS));
+    assertFalse(IrisTranslationCoordinator.fullGraphCaptureAbortRetryAllowed(0));
   }
 
   @Test

@@ -361,6 +361,12 @@ public final class NativeBridge {
 
   public static native long nInit(int width, int height, float scale);
 
+  /** Process-lifetime macOS workspace power notifications. */
+  public static native long nGetSystemSleepCount();
+
+  /** Process-lifetime macOS workspace wake notifications. */
+  public static native long nGetSystemWakeCount();
+
   public static native void nResize(long handle, int width, int height,
       float scale);
 
@@ -681,6 +687,12 @@ public final class NativeBridge {
    */
   public static native long nCaptureIrisMetal4InputSurface(
       int glTexture, int width, int height, int kind);
+
+  /**
+   * Abandons a captured, not-yet-submitted IOSurface lease. Resident texture
+   * handles and already submitted surfaces are left untouched.
+   */
+  public static native boolean nReleaseIrisMetal4InputSurface(long handle);
 
   /** Uploads one immutable RGBA8 mirror generation into resident Metal. */
   public static native long nUploadIrisMetal4InputTexture(

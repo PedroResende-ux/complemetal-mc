@@ -270,22 +270,28 @@ public record IrisShadowReplayTextureSnapshot(
                 target, mipLevel, layer, mirror, allowPackedFloatHandoff);
         if (gpuCapture.isPresent()) {
           snapshot = gpuCapture.orElseThrow();
-        } else if (System.getProperty(
-                "metalrender.exactJar.expectedPath") != null
-            && IrisGlTextureGpuHandoff.supportsDirectGpuHandoff(
-                snapshot.format(), allowPackedFloatHandoff)) {
+        } else if (IrisGlTextureGpuHandoff.supportsDirectGpuHandoff(
+            snapshot.format(), allowPackedFloatHandoff)) {
           String failure = IrisGlTextureGpuHandoff.lastCaptureFailure();
           String residentFailure =
               IrisGlTextureGpuHandoff.lastResidentFailure();
-          String key = texture + ":" + generation + ":" + residentFailure
-              + ":" + failure;
-          if (GPU_HANDOFF_DIAGNOSTICS.size() < MAX_READBACK_DIAGNOSTICS
-              && GPU_HANDOFF_DIAGNOSTICS.add(key)) {
-            MetalLogger.info(
-                "exact-JAR large GPU handoff unavailable: texture=%d generation=%d target=0x%s metadata=%s residentFailure=%s captureFailure=%s",
-                texture, generation, Integer.toHexString(target),
-                snapshot.format() + "/" + snapshot.width() + "x"
-                    + snapshot.height(), residentFailure, failure);
+          if (System.getProperty(
+                  "metalrender.exactJar.expectedPath") != null) {
+            String key = texture + ":" + generation + ":" + residentFailure
+                + ":" + failure;
+            if (GPU_HANDOFF_DIAGNOSTICS.size() < MAX_READBACK_DIAGNOSTICS
+                && GPU_HANDOFF_DIAGNOSTICS.add(key)) {
+              MetalLogger.info(
+                  "exact-JAR large GPU handoff unavailable: texture=%d generation=%d target=0x%s metadata=%s residentFailure=%s captureFailure=%s",
+                  texture, generation, Integer.toHexString(target),
+                  snapshot.format() + "/" + snapshot.width() + "x"
+                      + snapshot.height(), residentFailure, failure);
+            }
+          }
+          if (retained != null
+              && IrisGlTextureGpuHandoff.retryableCaptureFailure(failure)) {
+            blockers.add(category + "-gpu-handoff-backpressure");
+            return;
           }
         }
       }
@@ -316,21 +322,27 @@ public record IrisShadowReplayTextureSnapshot(
           IrisGlTextureGpuHandoff.capture(texture, generation, target,
               mipLevel, layer, mirror, allowPackedFloatHandoff);
       snapshot = gpuCapture.orElse(null);
-      if (snapshot == null && System.getProperty(
-              "metalrender.exactJar.expectedPath") != null
-          && metadata != null
+      if (snapshot == null && metadata != null
           && IrisGlTextureGpuHandoff.supportsDirectGpuHandoff(
               metadata.format(), allowPackedFloatHandoff)) {
         String failure = IrisGlTextureGpuHandoff.lastCaptureFailure();
-        String key = "initial:" + texture + ":" + generation + ":"
-            + failure;
-        if (GPU_HANDOFF_DIAGNOSTICS.size() < MAX_READBACK_DIAGNOSTICS
-            && GPU_HANDOFF_DIAGNOSTICS.add(key)) {
-          MetalLogger.info(
-              "exact-JAR initial GPU handoff unavailable: texture=%d generation=%d target=0x%s metadata=%s captureFailure=%s",
-              texture, generation, Integer.toHexString(target),
-              metadata.format() + "/" + metadata.width() + "x"
-                  + metadata.height(), failure);
+        if (System.getProperty(
+                "metalrender.exactJar.expectedPath") != null) {
+          String key = "initial:" + texture + ":" + generation + ":"
+              + failure;
+          if (GPU_HANDOFF_DIAGNOSTICS.size() < MAX_READBACK_DIAGNOSTICS
+              && GPU_HANDOFF_DIAGNOSTICS.add(key)) {
+            MetalLogger.info(
+                "exact-JAR initial GPU handoff unavailable: texture=%d generation=%d target=0x%s metadata=%s captureFailure=%s",
+                texture, generation, Integer.toHexString(target),
+                metadata.format() + "/" + metadata.width() + "x"
+                    + metadata.height(), failure);
+          }
+        }
+        if (retained != null
+            && IrisGlTextureGpuHandoff.retryableCaptureFailure(failure)) {
+          blockers.add(category + "-gpu-handoff-backpressure");
+          return;
         }
       }
     }

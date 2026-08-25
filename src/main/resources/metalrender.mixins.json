@@ -22,6 +22,7 @@
     "OptionsSaveMixin",
     "ChunkLoadMixin",
     "TextureAtlasAnimationMixin",
+    "accessor.WindowAccessor",
     "accessor.BillboardParticleAccessor",
     "accessor.ParticleAccessor",
     "accessor.ParticleGroupAccessor",

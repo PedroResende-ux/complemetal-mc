@@ -304,6 +304,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   private final AtomicInteger fullGraphCapturesOutstanding =
       new AtomicInteger();
   private final AtomicLong fullGraphCaptureRequests = new AtomicLong();
+  private final AtomicLong fullGraphCaptureAborts = new AtomicLong();
   private final AtomicLong fullGraphFramesObserved = new AtomicLong();
   private final AtomicLong fullGraphFramesPlanned = new AtomicLong();
   private final AtomicLong fullGraphFramesAttempted = new AtomicLong();
@@ -336,6 +337,10 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   private final AtomicLong fullGraphOwnershipCommandsSuppressed =
       new AtomicLong();
   private final AtomicLong fullGraphOwnershipFailures = new AtomicLong();
+  private final AtomicLong displayPresentationGeneration =
+      new AtomicLong(1);
+  private final AtomicLong displayTransitionCaptureAbortDeadlineNanos =
+      new AtomicLong();
   private final AtomicBoolean fullGraphWorkerSubmissionLogged =
       new AtomicBoolean();
   private final AtomicReference<String> fullGraphOwnershipLastFailure =
@@ -811,15 +816,27 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   }
 
   /** Render-thread query used to retain live FINAL resources only when armed. */
-  static boolean cutoverCaptureRequested(IrisRenderGraph.Phase phase) {
+  static boolean cutoverCaptureRequested(IrisRenderGraph.Phase phase,
+      IrisProgramIdentityRegistry.Registration registration,
+      IrisGlStateSnapshot snapshot) {
     IrisTranslationCoordinator coordinator = ACTIVE.get();
-    if (coordinator == null || !isCutoverOptedIn()
-        || phase != IrisRenderGraph.Phase.FINAL
-        || coordinator.fullGraphCapturesOutstanding.get() != 0) {
+    if (coordinator == null || !isCutoverOptedIn()) {
       return false;
     }
     IrisSelectiveCutoverGate.Status status = coordinator.cutoverGate.status();
-    return status.currentFrame() >= 0 && !status.frameFallback()
+    return legacyCutoverCaptureEligible(
+        coordinator.productionOwnershipReady(),
+        coordinator.fullGraphCapturesOutstanding.get(), phase, status)
+        && coordinator.cutoverPipelineIdentities.containsKey(
+            IrisPipelineStateCapture.lookupKey(registration, snapshot));
+  }
+
+  static boolean legacyCutoverCaptureEligible(boolean fullGraphOwnershipReady,
+      int fullGraphCapturesOutstanding, IrisRenderGraph.Phase phase,
+      IrisSelectiveCutoverGate.Status status) {
+    return !fullGraphOwnershipReady && fullGraphCapturesOutstanding == 0
+        && phase == IrisRenderGraph.Phase.FINAL && status != null
+        && status.currentFrame() >= 0 && !status.frameFallback()
         && (status.mode() == IrisSelectiveCutoverGate.Mode.ARMED
             || status.mode() == IrisSelectiveCutoverGate.Mode.ACTIVE);
   }
@@ -857,14 +874,27 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   }
 
   /** Releases a reservation rejected by the render-thread capture bounds. */
-  static void fullGraphCaptureAborted() {
+  static void fullGraphCaptureAborted(String reason) {
     IrisTranslationCoordinator coordinator = ACTIVE.get();
     if (coordinator != null) {
-      if (coordinator.productionOwnershipReady()) {
-        coordinator.recordFullGraphOwnershipFailure(
-            "graph-frame-capture-aborted");
+      boolean ownershipReady = coordinator.productionOwnershipReady();
+      String normalized = BoundedReasonSet.normalizeReason(
+          reason == null || reason.isBlank()
+              ? "graph-frame-capture-aborted" : reason);
+      boolean displayTransition =
+          coordinator.consumeDisplayTransitionCaptureAbort();
+      if (ownershipReady && (displayTransition
+          || retryableFullGraphCaptureAbort(normalized))) {
+        // A reserved frame aborted before graph planning, so introduce the
+        // matching planned terminal outcome before recording its invalidation.
+        coordinator.fullGraphFramesPlanned.incrementAndGet();
+        coordinator.recordFullGraphOwnershipInvalidation(
+            displayTransition ? "display-transition-capture-aborted"
+                : normalized);
+      } else if (ownershipReady) {
+        coordinator.recordFullGraphOwnershipFailure(normalized);
       } else {
-        coordinator.recordFullGraphBlocked("graph-frame-capture-aborted");
+        coordinator.recordFullGraphCaptureAbort();
       }
       coordinator.releaseFullGraphCaptureReservation();
     }
@@ -1236,6 +1266,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         pending.orElseThrow();
     long fullGraphPlanStarted = capturedFrame.fullReplayCaptured()
         ? System.nanoTime() : 0;
+    boolean fullGraphCaptureTransferred = false;
     renderGraphsAttempted.incrementAndGet();
     try {
       IrisRenderGraphBuilder.Result result =
@@ -1296,8 +1327,10 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           }
           releaseFullGraphCaptureReservation();
         } else {
-          if (!prepareFullMetalGraphFrame(capturedFrame, executionPlan,
+          if (prepareFullMetalGraphFrame(capturedFrame, executionPlan,
               resourceResolution.resources())) {
+            fullGraphCaptureTransferred = true;
+          } else {
             releaseFullGraphCaptureReservation();
           }
         }
@@ -1343,6 +1376,11 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         releaseFullGraphCaptureReservation();
       }
     } finally {
+      if (capturedFrame.fullReplayCaptured()
+          && !fullGraphCaptureTransferred) {
+        IrisGlTextureGpuHandoff.abandonCapturedSurfaces(
+            capturedFrame.fullReplayTextures());
+      }
       if (fullGraphPlanStarted != 0) {
         fullGraphPlanTiming.record(System.nanoTime()
             - fullGraphPlanStarted);
@@ -1500,6 +1538,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         // The previously completed surface remains reusable while the GPU
         // queue drains. This is normal bounded back-pressure, not a graph
         // ownership failure.
+        IrisGlTextureGpuHandoff.abandonCapturedSurfaces(
+            capturedFrame.fullReplayTextures());
         releaseFullGraphCaptureReservation();
         return true;
       }
@@ -1516,7 +1556,9 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         prepared = new PreparedMetalGraphFrame(
             presentationFrame, nativeResources.bindings(),
             complete.writtenResourceIds(), null, presentationState,
-            encodedPacket, PreparedMetalGraphFrame.Mode.PRESENTATION);
+            encodedPacket, displayPresentationGeneration.get(),
+            capturedFrame.fullReplayTextures(),
+            PreparedMetalGraphFrame.Mode.PRESENTATION);
       } catch (RuntimeException failure) {
         encodedPacket.close();
         recordFullGraphOwnershipFailure("graph-frame-prepare-failed");
@@ -1595,6 +1637,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     preparedMetalGraphFrames.offer(new PreparedMetalGraphFrame(
         complete.frame(), nativeResources.bindings(),
         complete.writtenResourceIds(), openGlFrame.orElseThrow(), null, null,
+        displayPresentationGeneration.get(),
+        capturedFrame.fullReplayTextures(),
         PreparedMetalGraphFrame.Mode.VALIDATION));
     fullGraphFramesPlanned.incrementAndGet();
     return true;
@@ -1928,6 +1972,13 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     }
     preparedMetalGraphFrameCount.decrementAndGet();
     try {
+      if (!displayPresentationGenerationMatches(
+          prepared.displayPresentationGeneration(),
+          displayPresentationGeneration.get())) {
+        recordFullGraphOwnershipInvalidation(
+            "graph-frame-display-generation-stale");
+        return;
+      }
       if (prepared.frame().contextGeneration()
           != pipelineStateCapture.tracker().contextGeneration()) {
         if (prepared.mode() == PreparedMetalGraphFrame.Mode.PRESENTATION
@@ -2061,6 +2112,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       if (prepared.encodedPacket() != null) {
         prepared.encodedPacket().close();
       }
+      IrisGlTextureGpuHandoff.abandonCapturedSurfaces(
+          prepared.fullReplayTextures());
       releaseFullGraphCaptureReservation();
     }
   }
@@ -2070,6 +2123,16 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         && readyGraphPresentations.size()
             < DEFAULT_FULL_GRAPH_PRESENTATION_QUEUE_CAPACITY) {
       PendingGraphPresentation pending = inFlightGraphPresentations.peekFirst();
+      if (!displayPresentationGenerationMatches(
+          pending.displayPresentationGeneration(),
+          displayPresentationGeneration.get())) {
+        inFlightGraphPresentations.removeFirst();
+        metalGraphExecutor.discardPresentation(pending.token());
+        decrementGraphPresentationBacklog();
+        recordFullGraphOwnershipInvalidation(
+            "graph-frame-display-generation-stale");
+        continue;
+      }
       NativeIrisMetalGraphExecutor.PresentationStatus status =
           metalGraphExecutor.pollPresentation(pending.token());
       if (status.state()
@@ -2080,7 +2143,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       if (status.state()
           == NativeIrisMetalGraphExecutor.PresentationState.READY) {
         readyGraphPresentations.addLast(new ReadyGraphPresentation(status,
-            pending.presentationState()));
+            pending.presentationState(),
+            pending.displayPresentationGeneration()));
         fullGraphOwnershipReady.incrementAndGet();
         continue;
       }
@@ -2091,6 +2155,13 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
   }
 
   private void submitFullGraphPresentation(PreparedMetalGraphFrame prepared) {
+    long displayGeneration = prepared.displayPresentationGeneration();
+    if (!displayPresentationGenerationMatches(displayGeneration,
+        displayPresentationGeneration.get())) {
+      recordFullGraphOwnershipInvalidation(
+          "graph-frame-display-generation-stale");
+      return;
+    }
     long started = System.nanoTime();
     NativeIrisMetalGraphExecutor.PresentationSubmission submission =
         metalGraphExecutor.submitForPresentation(prepared.frame(),
@@ -2098,10 +2169,28 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     fullGraphSubmitTiming.record(System.nanoTime() - started);
     if (submission.outcome()
         == NativeIrisMetalGraphExecutor.Outcome.SUCCEEDED) {
+      if (!displayPresentationGenerationMatches(displayGeneration,
+          displayPresentationGeneration.get())) {
+        metalGraphExecutor.discardPresentation(submission.token());
+        recordFullGraphOwnershipInvalidation(
+            "graph-frame-display-generation-stale");
+        return;
+      }
       markInitializedMetalGraphTokens(prepared);
+      PendingGraphPresentation pending = new PendingGraphPresentation(
+          submission.token(), prepared.presentationState(),
+          displayGeneration);
       graphPresentationBacklog.incrementAndGet();
-      inFlightGraphPresentations.addLast(new PendingGraphPresentation(
-          submission.token(), prepared.presentationState()));
+      inFlightGraphPresentations.addLast(pending);
+      if (!displayPresentationGenerationMatches(displayGeneration,
+              displayPresentationGeneration.get())
+          && inFlightGraphPresentations.remove(pending)) {
+        metalGraphExecutor.discardPresentation(submission.token());
+        decrementGraphPresentationBacklog();
+        recordFullGraphOwnershipInvalidation(
+            "graph-frame-display-generation-stale");
+        return;
+      }
       fullGraphOwnershipSubmissions.incrementAndGet();
       fullGraphOperations.addAndGet(submission.steps());
       fullGraphClears.addAndGet(submission.clears());
@@ -2140,6 +2229,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
           "graph-frame-worker-submit-exception");
     } finally {
       prepared.encodedPacket().close();
+      IrisGlTextureGpuHandoff.abandonCapturedSurfaces(
+          prepared.fullReplayTextures());
       releaseFullGraphCaptureReservation();
     }
   }
@@ -2155,7 +2246,17 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
 
   static boolean recoverableOwnershipInvalidation(String reason) {
     return "graph-native-resource-generation-stale".equals(reason)
-        || "graph-frame-texture-generation-stale".equals(reason);
+        || "graph-frame-texture-generation-stale".equals(reason)
+        || "graph-frame-display-generation-stale".equals(reason);
+  }
+
+  static boolean retryableFullGraphCaptureAbort(String reason) {
+    return "graph-frame-capture-backpressure".equals(reason);
+  }
+
+  static boolean displayPresentationGenerationMatches(long captured,
+      long current) {
+    return captured > 0 && captured == current;
   }
 
   private void markInitializedMetalGraphTokens(
@@ -2171,6 +2272,21 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       MetalLogger.warn("Iris full Metal graph blocked (%d/%d): %s",
           blocked, DEFAULT_FULL_GRAPH_FRAME_ATTEMPTS, reason);
     }
+  }
+
+  private void recordFullGraphCaptureAbort() {
+    long aborted = fullGraphCaptureAborts.incrementAndGet();
+    if (!fullGraphCaptureAbortRetryAllowed(aborted)) {
+      recordFullGraphBlocked("graph-frame-capture-aborted");
+      return;
+    }
+    MetalLogger.info(
+        "Iris full Metal graph capture aborted (%d/%d); retrying before ownership",
+        aborted, DEFAULT_FULL_GRAPH_FRAME_ATTEMPTS);
+  }
+
+  static boolean fullGraphCaptureAbortRetryAllowed(long aborted) {
+    return aborted > 0 && aborted < DEFAULT_FULL_GRAPH_FRAME_ATTEMPTS;
   }
 
   private void dumpExactFullGraphParity(byte[] openGl, byte[] metal,
@@ -2552,7 +2668,17 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       return;
     }
     boolean promoted = false;
-    ReadyGraphPresentation ready = readyGraphPresentations.peekFirst();
+    ReadyGraphPresentation ready;
+    while ((ready = readyGraphPresentations.peekFirst()) != null
+        && !displayPresentationGenerationMatches(
+            ready.displayPresentationGeneration(),
+            displayPresentationGeneration.get())) {
+      readyGraphPresentations.removeFirst();
+      metalGraphExecutor.discardPresentation(ready.status().token());
+      decrementGraphPresentationBacklog();
+      recordFullGraphOwnershipInvalidation(
+          "graph-frame-display-generation-stale");
+    }
     if (ready != null && metalGraphExecutor.promotePresentation(
         ready.status())) {
       readyGraphPresentations.removeFirst();
@@ -2590,33 +2716,80 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     if (phase == IrisRenderGraph.Phase.FINAL) {
       frame.finalPresentationState = pending;
     }
-    if (IrisRenderGraphCapture.global().captureFullGraphReplay()
-        && (!pending.replayBuffers().captureEnabled()
-            || !pending.replayTextures().captureEnabled()
-            || !pending.replaySamplers().captureEnabled()
-            || !supportedReplayCommand(pending.command()))) {
-      frame.degraded = true;
-      frame.lastFailure = "graph-ownership-draw-capture-incomplete";
-    }
+    // This draw belongs to the next asynchronously prepared graph, while the
+    // armed ownership frame presents only a previously completed surface.
+    // IrisRenderGraphCapture is the single authority for rejecting an
+    // incomplete capture and releasing its transient IOSurfaces. Marking the
+    // already safe presentation degraded here would turn bounded capture
+    // backpressure during a display transition into a false ownership
+    // failure.
     frame.commandsSuppressed++;
     fullGraphOwnershipCommandsSuppressed.incrementAndGet();
     return true;
   }
 
   private void invalidateDisplayPresentationInternal(String reason) {
+    // Bracket the native reset with two generations. Frames prepared before
+    // the transition and frames that race the reset are both rejected; only
+    // captures prepared after the reset may become visible.
+    displayPresentationGeneration.incrementAndGet();
+    long now = System.nanoTime();
+    displayTransitionCaptureAbortDeadlineNanos.updateAndGet(deadline ->
+        deadline > now ? deadline : now + 5_000_000_000L);
     ownershipFrame = null;
     lastOwnershipPresentationState = null;
     lastOwnershipPresentationWidth = 0;
     lastOwnershipPresentationHeight = 0;
-    IrisMetalCutoverPresenter.global().resetPresentationBindings();
+    // Framebuffer-sized Iris inputs change generation across Retina/fullscreen
+    // transitions. A presentation-only reset would retain obsolete resident
+    // inputs until their bounded native caches filled, forcing incomplete
+    // captures. Reset transient graph/input resources while preserving the
+    // already compiled MSL libraries and pipeline archive.
+    IrisMetalCutoverPresenter.global().reset();
+    IrisGlTextureGpuHandoff.reset();
+    IrisMetalBufferResidentCache.reset();
+    PendingGraphPresentation inFlight;
+    while ((inFlight = inFlightGraphPresentations.pollFirst()) != null) {
+      metalGraphExecutor.discardPresentation(inFlight.token());
+    }
+    ReadyGraphPresentation ready;
+    while ((ready = readyGraphPresentations.pollFirst()) != null) {
+      metalGraphExecutor.discardPresentation(ready.status().token());
+    }
+    graphPresentationBacklog.set(0);
+    PreparedMetalGraphFrame abandoned;
+    while ((abandoned = preparedMetalGraphFrames.poll()) != null) {
+      preparedMetalGraphFrameCount.decrementAndGet();
+      if (abandoned.encodedPacket() != null) {
+        abandoned.encodedPacket().close();
+      }
+      IrisGlTextureGpuHandoff.abandonCapturedSurfaces(
+          abandoned.fullReplayTextures());
+      releaseFullGraphCaptureReservation();
+      if (productionOwnershipReady()) {
+        recordFullGraphOwnershipInvalidation(
+            "graph-frame-display-generation-stale");
+      }
+    }
+    initializedMetalGraphTokens.clear();
+    currentMetalGraphTextures.set(Map.of());
+    metalGraphResourceNativeTextureCount.set(0);
+    metalGraphResourceNativeTextureBytes.set(0);
+    displayPresentationGeneration.incrementAndGet();
     if (productionOwnershipReady()) {
-      // This transition invalidates only the presentation bridge. It is not a
-      // planned graph frame and therefore must not enter the frame-accounting
-      // invalidation counter.
       MetalLogger.info(
-          "Iris full Metal display presentation reset: %s; awaiting fresh IOSurface",
+          "Iris full Metal display graph reset: %s; awaiting fresh capture",
           BoundedReasonSet.normalizeReason(reason));
     }
+  }
+
+  private boolean consumeDisplayTransitionCaptureAbort() {
+    long deadline = displayTransitionCaptureAbortDeadlineNanos.get();
+    if (deadline != 0 && System.nanoTime() <= deadline) {
+      return true;
+    }
+    displayTransitionCaptureAbortDeadlineNanos.compareAndSet(deadline, 0);
+    return false;
   }
 
   private boolean suppressFullGraphOperationInternal() {
@@ -2766,6 +2939,19 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       IrisPipelineStateCapture.PendingState pending) {
     Objects.requireNonNull(pending, "pending");
     IrisSelectiveCutoverGate.Status gateStatus = cutoverGate.status();
+    IrisRenderGraph.Phase capturePhase = IrisRenderGraphCapture.global()
+        .currentPhase();
+    boolean unsubmittedLegacyCapture = pending.replayTextures()
+        .captureEnabled() && legacyCutoverCaptureEligible(false,
+            fullGraphCapturesOutstanding.get(), capturePhase, gateStatus);
+    if (productionOwnershipReady()) {
+      // Full-graph ownership supersedes the legacy same-frame FINAL bridge.
+      // Keeping both capture paths active leases one IOSurface per visible
+      // frame even though tryFullGraphCutover wins first, eventually starving
+      // the next post-display-reset graph capture.
+      abandonLegacyCutoverCapture(pending, unsubmittedLegacyCapture);
+      return false;
+    }
     // A full-graph validation frame must execute the complete OpenGL baseline.
     // Suppressing its FINAL draw would compare Metal against a stale/cleared
     // attachment and could falsely approve or reject the native graph.
@@ -2776,6 +2962,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         || (gateStatus.mode() != IrisSelectiveCutoverGate.Mode.ARMED
             && gateStatus.mode() != IrisSelectiveCutoverGate.Mode.ACTIVE)
         || !pending.replayBuffers().captureEnabled()) {
+      abandonLegacyCutoverCapture(pending, unsubmittedLegacyCapture);
       return false;
     }
     cutoverDrawsObserved.incrementAndGet();
@@ -2784,17 +2971,20 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         IrisPipelineStateCapture.lookupKey(pending));
     if (identity == null) {
       cutoverLastFailure.set("cutover-pipeline-identity-unavailable");
+      abandonLegacyCutoverCapture(pending, unsubmittedLegacyCapture);
       return false;
     }
     CompiledMetalPipeline compiled = compiledMetalPipelines.get(identity);
     if (compiled == null) {
       cutoverLastFailure.set("compiled-cutover-pipeline-unavailable");
+      abandonLegacyCutoverCapture(pending, unsubmittedLegacyCapture);
       return false;
     }
     IrisProgramIdentityRegistry.ResolvedProgram program =
         pending.registration().resolved().orElse(null);
     if (program == null) {
       cutoverLastFailure.set("cutover-program-identity-unresolved");
+      abandonLegacyCutoverCapture(pending, unsubmittedLegacyCapture);
       return false;
     }
     String shaderKey = program.shaderKey().sha256();
@@ -2802,6 +2992,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     IrisMslArgumentLayout msl = mslArgumentLayouts.get(shaderKey);
     if (semantic == null || msl == null) {
       cutoverLastFailure.set("cutover-argument-layout-unavailable");
+      abandonLegacyCutoverCapture(pending, unsubmittedLegacyCapture);
       return false;
     }
 
@@ -2849,6 +3040,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       if (!blockers.isEmpty()) {
         recordCutoverFailure("cutover-prerequisite-blocked");
       }
+      abandonLegacyCutoverCapture(pending, unsubmittedLegacyCapture);
       return false;
     }
 
@@ -2916,10 +3108,20 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       return true;
     } catch (IllegalArgumentException | IllegalStateException
         | LinkageError failure) {
+      abandonLegacyCutoverCapture(pending, unsubmittedLegacyCapture);
       cutoverGate.metalEncodeCompleted(ticket, false, false);
       recordCutoverFailure("cutover-replay-exception");
       return false;
     }
+  }
+
+  private static void abandonLegacyCutoverCapture(
+      IrisPipelineStateCapture.PendingState pending, boolean unsubmitted) {
+    if (!unsubmitted) {
+      return;
+    }
+    IrisGlTextureGpuHandoff.abandonCapturedSurfaces(
+        pending.replayTextures().textures().values());
   }
 
   private TargetExtent cutoverTargetExtent(
@@ -4221,6 +4423,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       if (abandoned.encodedPacket() != null) {
         abandoned.encodedPacket().close();
       }
+      IrisGlTextureGpuHandoff.abandonCapturedSurfaces(
+          abandoned.fullReplayTextures());
     }
     preparedMetalGraphFrameCount.set(0);
     initializedMetalGraphTokens.clear();
@@ -4355,9 +4559,10 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
 
   private record PendingGraphPresentation(
       long token,
-      IrisPipelineStateCapture.PendingState presentationState) {
+      IrisPipelineStateCapture.PendingState presentationState,
+      long displayPresentationGeneration) {
     private PendingGraphPresentation {
-      if (token <= 0) {
+      if (token <= 0 || displayPresentationGeneration <= 0) {
         throw new IllegalArgumentException("invalid pending presentation");
       }
       Objects.requireNonNull(presentationState, "presentationState");
@@ -4366,11 +4571,12 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
 
   private record ReadyGraphPresentation(
       NativeIrisMetalGraphExecutor.PresentationStatus status,
-      IrisPipelineStateCapture.PendingState presentationState) {
+      IrisPipelineStateCapture.PendingState presentationState,
+      long displayPresentationGeneration) {
     private ReadyGraphPresentation {
       Objects.requireNonNull(status, "status");
       Objects.requireNonNull(presentationState, "presentationState");
-      if (status.state()
+      if (displayPresentationGeneration <= 0 || status.state()
           != NativeIrisMetalGraphExecutor.PresentationState.READY) {
         throw new IllegalArgumentException("presentation is not ready");
       }
@@ -4411,6 +4617,8 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       IrisVisualParityCapture.CapturedFrame openGlFrame,
       IrisPipelineStateCapture.PendingState presentationState,
       IrisMetalGraphFramePacketEncoder.DirectPacket encodedPacket,
+      long displayPresentationGeneration,
+      List<IrisGlTextureMirror.TextureSnapshot> fullReplayTextures,
       long drawCount,
       Mode mode) {
     private PreparedMetalGraphFrame(
@@ -4420,16 +4628,21 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
         IrisVisualParityCapture.CapturedFrame openGlFrame,
         IrisPipelineStateCapture.PendingState presentationState,
         IrisMetalGraphFramePacketEncoder.DirectPacket encodedPacket,
+        long displayPresentationGeneration,
+        List<IrisGlTextureMirror.TextureSnapshot> fullReplayTextures,
         Mode mode) {
       this(frame, writtenTokens(bindings, writtenResourceIds), openGlFrame,
-          presentationState, encodedPacket, drawCount(frame), mode);
+          presentationState, encodedPacket, displayPresentationGeneration,
+          List.copyOf(fullReplayTextures), drawCount(frame), mode);
     }
 
     private PreparedMetalGraphFrame {
       Objects.requireNonNull(frame, "frame");
       writtenTokens = List.copyOf(writtenTokens);
+      fullReplayTextures = List.copyOf(fullReplayTextures);
       Objects.requireNonNull(mode, "mode");
-      if (writtenTokens.isEmpty() || drawCount < 0) {
+      if (writtenTokens.isEmpty() || displayPresentationGeneration <= 0
+          || drawCount < 0) {
         throw new IllegalArgumentException("invalid prepared Metal graph");
       }
       if (mode == Mode.VALIDATION

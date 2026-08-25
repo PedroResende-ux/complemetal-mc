@@ -78,6 +78,7 @@ public final class IrisRenderGraphCapture {
     }
     if (current != null) {
       framesRejected.incrementAndGet();
+      abortFullReplay(current);
     }
     if (queued.get() >= FRAME_QUEUE_CAPACITY) {
       current = null;
@@ -117,21 +118,30 @@ public final class IrisRenderGraphCapture {
       return;
     }
     if (current.fullReplay) {
-      if (!pending.replayBuffers().captureEnabled()
-          || !pending.replayTextures().captureEnabled()
-          || !pending.replaySamplers().captureEnabled()) {
+      String resourceAbortReason = fullReplayResourceAbortReason(
+          pending.replayBuffers(), pending.replayTextures(),
+          pending.replaySamplers());
+      if (!resourceAbortReason.isEmpty()) {
         current.fullReplayComplete = false;
+        current.preferFullReplayAbortReason(resourceAbortReason);
       }
       try {
-        current.fullReplayBytes = Math.addExact(current.fullReplayBytes,
-            retainedReplayBytes(pending));
+        // Buffer and texture capture tables are frame-local and immutable.
+        // Repeated draws reuse their entries, so charge the actual retained
+        // set instead of adding the same payload once per draw.
+        current.fullReplayBytes = retainedFullReplayBytes(
+            current.fullReplayBuffers, current.fullReplayTextures);
         if (current.fullReplayBytes > MAX_FULL_REPLAY_CAPTURE_BYTES) {
           current.overflowed = true;
           current.fullReplayComplete = false;
+          current.preferFullReplayAbortReason(
+              "graph-frame-capture-byte-capacity-exceeded");
         }
       } catch (ArithmeticException overflow) {
         current.overflowed = true;
         current.fullReplayComplete = false;
+        current.preferFullReplayAbortReason(
+            "graph-frame-capture-byte-capacity-exceeded");
       }
       if (current.fullReplayParity && (phase == Phase.FINAL
           || IrisVisualParityCapture.diagnosticGraphReadback(pending))
@@ -552,23 +562,19 @@ public final class IrisRenderGraphCapture {
     }
     if (finished.events.isEmpty() || finished.overflowed) {
       framesRejected.incrementAndGet();
-      if (finished.fullReplay) {
-        IrisTranslationCoordinator.fullGraphCaptureAborted();
-      }
+      abortFullReplay(finished);
       return;
     }
     int count = queued.incrementAndGet();
     if (count > FRAME_QUEUE_CAPACITY) {
       queued.decrementAndGet();
-      if (finished.fullReplay) {
-        IrisTranslationCoordinator.fullGraphCaptureAborted();
-      }
+      abortFullReplay(finished);
       return;
     }
     boolean fullReplayCaptured = finished.fullReplay
         && finished.fullReplayComplete;
     if (finished.fullReplay && !fullReplayCaptured) {
-      IrisTranslationCoordinator.fullGraphCaptureAborted();
+      abortFullReplay(finished);
     }
     ArrayList<FinalOutputCapture> finalOutputCaptures = new ArrayList<>();
     if (fullReplayCaptured && finished.fullReplayParity) {
@@ -593,7 +599,9 @@ public final class IrisRenderGraphCapture {
     queue.offer(new PendingFrame(finished.events, finished.phases,
         fullReplayCaptured,
         fullReplayCaptured ? finished.fullReplayBytes : 0,
-        fullReplayCaptured ? finalOutputCaptures : List.of()));
+        fullReplayCaptured ? finalOutputCaptures : List.of(),
+        fullReplayCaptured
+            ? List.copyOf(finished.fullReplayTextures.values()) : List.of()));
     if (fullReplayCaptured) {
       fullReplayFramesCompleted++;
       if (System.getProperty("metalrender.exactJar.expectedPath") != null
@@ -648,8 +656,19 @@ public final class IrisRenderGraphCapture {
 
   public synchronized void freeze() {
     frozen = true;
+    abortFullReplay(current);
     current = null;
     phase = Phase.UNKNOWN;
+  }
+
+  private static void abortFullReplay(FrameBuilder frame) {
+    if (frame == null || !frame.fullReplay) {
+      return;
+    }
+    IrisGlTextureGpuHandoff.abandonCapturedSurfaces(
+        frame.fullReplayTextures.values());
+    IrisTranslationCoordinator.fullGraphCaptureAborted(
+        frame.fullReplayAbortReason);
   }
 
   public synchronized boolean frozen() {
@@ -936,21 +955,25 @@ public final class IrisRenderGraphCapture {
                              java.util.Set<Phase> phases,
                              boolean fullReplayCaptured,
                              long fullReplayBytes,
-                             List<FinalOutputCapture> finalOutputCaptures) {
+                             List<FinalOutputCapture> finalOutputCaptures,
+                             List<IrisGlTextureMirror.TextureSnapshot>
+                                 fullReplayTextures) {
     public PendingFrame(List<RawEvent> events,
         java.util.Set<Phase> phases) {
-      this(events, phases, false, 0, List.of());
+      this(events, phases, false, 0, List.of(), List.of());
     }
 
     public PendingFrame {
       events = List.copyOf(events);
       phases = java.util.Set.copyOf(phases);
       finalOutputCaptures = List.copyOf(finalOutputCaptures);
+      fullReplayTextures = List.copyOf(fullReplayTextures);
       if (events.isEmpty()) {
         throw new IllegalArgumentException("render graph frame is empty");
       }
       if (fullReplayBytes < 0 || !fullReplayCaptured
-          && (fullReplayBytes != 0 || !finalOutputCaptures.isEmpty())) {
+          && (fullReplayBytes != 0 || !finalOutputCaptures.isEmpty()
+              || !fullReplayTextures.isEmpty())) {
         throw new IllegalArgumentException("invalid full replay frame");
       }
     }
@@ -1066,6 +1089,7 @@ public final class IrisRenderGraphCapture {
     private final Map<ResourceHandle, IrisVisualParityCapture.CapturedFrame>
         diagnosticReplayTargets = new LinkedHashMap<>();
     private boolean fullReplayComplete;
+    private String fullReplayAbortReason = "";
     private long fullReplayBytes;
     private boolean overflowed;
     private Object lastSignature;
@@ -1077,24 +1101,57 @@ public final class IrisRenderGraphCapture {
       this.fullReplayStartedNanos = fullReplayStartedNanos;
       fullReplayComplete = fullReplay;
     }
-  }
 
-  private static long retainedReplayBytes(
-      IrisPipelineStateCapture.PendingState pending) {
-    long bytes = 0;
-    for (IrisShadowReplayBufferSnapshot.BufferImage image
-        : pending.replayBuffers().images()) {
-      if (!image.shared()) {
-        bytes = Math.addExact(bytes, image.byteLength());
+    private void preferFullReplayAbortReason(String reason) {
+      if (reason == null || reason.isBlank()) {
+        return;
+      }
+      if (fullReplayAbortReason.isEmpty()
+          || fullReplayAbortReason.equals(
+              "graph-frame-resource-capture-incomplete")
+          && reason.equals("graph-frame-capture-backpressure")) {
+        fullReplayAbortReason = reason;
       }
     }
+  }
+
+  static long retainedFullReplayBytes(
+      IrisShadowReplayBufferSnapshot.RetainedCapture buffers,
+      Map<Integer, IrisGlTextureMirror.TextureSnapshot> textures) {
+    long bytes = Objects.requireNonNull(buffers, "buffers").retainedBytes();
     for (IrisGlTextureMirror.TextureSnapshot texture
-        : pending.replayTextures().textures().values()) {
+        : Objects.requireNonNull(textures, "textures").values()) {
       if (!texture.shared()) {
         bytes = Math.addExact(bytes, texture.byteLength());
       }
     }
     return bytes;
+  }
+
+  static boolean fullReplayResourcesComplete(
+      IrisShadowReplayBufferSnapshot buffers,
+      IrisShadowReplayTextureSnapshot textures,
+      IrisShadowReplaySamplerSnapshot samplers) {
+    return fullReplayResourceAbortReason(buffers, textures, samplers)
+        .isEmpty();
+  }
+
+  static String fullReplayResourceAbortReason(
+      IrisShadowReplayBufferSnapshot buffers,
+      IrisShadowReplayTextureSnapshot textures,
+      IrisShadowReplaySamplerSnapshot samplers) {
+    Objects.requireNonNull(buffers, "buffers");
+    Objects.requireNonNull(textures, "textures");
+    Objects.requireNonNull(samplers, "samplers");
+    if (buffers.drawComplete() && textures.complete()
+        && samplers.complete()) {
+      return "";
+    }
+    if (textures.blockers().stream().anyMatch(
+        reason -> reason.endsWith("-gpu-handoff-backpressure"))) {
+      return "graph-frame-capture-backpressure";
+    }
+    return "graph-frame-resource-capture-incomplete";
   }
 
 }

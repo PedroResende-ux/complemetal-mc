@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender.display;
 
 import com.mojang.blaze3d.platform.Monitor;
 import com.mojang.blaze3d.platform.Window;
+import com.pebbles_boon.metalrender.sodium.mixins.accessor.WindowAccessor;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.Collections;
@@ -196,33 +197,62 @@ public final class DisplayLifecycleTracker {
         window.isFocused());
   }
 
-  /** Repairs a missed GLFW backing-size callback before lifecycle analysis. */
-  public static boolean synchronizeFramebufferSize(Window window) {
+  /** Repairs missed GLFW window/backing callbacks before lifecycle analysis. */
+  public static boolean synchronizeWindowGeometry(Window window) {
     Objects.requireNonNull(window, "window");
     long handle = window.handle();
     if (handle == 0) {
       return false;
     }
     try (MemoryStack stack = MemoryStack.stackPush()) {
-      IntBuffer width = stack.mallocInt(1);
-      IntBuffer height = stack.mallocInt(1);
-      GLFW.glfwGetFramebufferSize(handle, width, height);
-      int directWidth = width.get(0);
-      int directHeight = height.get(0);
-      if (!requiresFramebufferSync(window.getWidth(), window.getHeight(),
-          directWidth, directHeight)) {
+      IntBuffer windowWidth = stack.mallocInt(1);
+      IntBuffer windowHeight = stack.mallocInt(1);
+      IntBuffer framebufferWidth = stack.mallocInt(1);
+      IntBuffer framebufferHeight = stack.mallocInt(1);
+      GLFW.glfwGetWindowSize(handle, windowWidth, windowHeight);
+      GLFW.glfwGetFramebufferSize(handle, framebufferWidth,
+          framebufferHeight);
+      int directWindowWidth = windowWidth.get(0);
+      int directWindowHeight = windowHeight.get(0);
+      int directFramebufferWidth = framebufferWidth.get(0);
+      int directFramebufferHeight = framebufferHeight.get(0);
+      if (!requiresWindowGeometrySync(window.getScreenWidth(),
+          window.getScreenHeight(), window.getWidth(), window.getHeight(),
+          directWindowWidth, directWindowHeight, directFramebufferWidth,
+          directFramebufferHeight)) {
         return false;
       }
-      window.setWidth(directWidth);
-      window.setHeight(directHeight);
+      WindowAccessor accessor = (WindowAccessor) (Object) window;
+      if (window.getScreenWidth() != directWindowWidth
+          || window.getScreenHeight() != directWindowHeight) {
+        accessor.metalrender$setWindowWidth(directWindowWidth);
+        accessor.metalrender$setWindowHeight(directWindowHeight);
+      }
+      if (window.getWidth() != directFramebufferWidth
+          || window.getHeight() != directFramebufferHeight) {
+        // Calling Window.onFramebufferResize here looks attractive, but on
+        // macOS it may re-enter the client event handler before the backing
+        // migration has settled and leave the cached framebuffer unchanged.
+        // Store the already-validated GLFW dimensions first; the caller then
+        // performs one ordered Minecraft framebuffer/GUI rebuild.
+        window.setWidth(directFramebufferWidth);
+        window.setHeight(directFramebufferHeight);
+      }
       return true;
     }
   }
 
-  static boolean requiresFramebufferSync(int cachedWidth, int cachedHeight,
-      int directWidth, int directHeight) {
-    return directWidth > 0 && directHeight > 0
-        && (cachedWidth != directWidth || cachedHeight != directHeight);
+  static boolean requiresWindowGeometrySync(int cachedWindowWidth,
+      int cachedWindowHeight, int cachedFramebufferWidth,
+      int cachedFramebufferHeight, int directWindowWidth,
+      int directWindowHeight, int directFramebufferWidth,
+      int directFramebufferHeight) {
+    return directWindowWidth > 0 && directWindowHeight > 0
+        && directFramebufferWidth > 0 && directFramebufferHeight > 0
+        && (cachedWindowWidth != directWindowWidth
+            || cachedWindowHeight != directWindowHeight
+            || cachedFramebufferWidth != directFramebufferWidth
+            || cachedFramebufferHeight != directFramebufferHeight);
   }
 
   private static long topologyFingerprint() {

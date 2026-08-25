@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1+mc26.2 - 2026-08-25
 
 ### Display lifecycle and high-refresh QA
 
@@ -12,19 +12,39 @@
 - Measure completed Minecraft `GlSurface.present()` calls in a bounded tracker
   and add strict exact-JAR gates for Retina backing, two-display migration and
   minimum-refresh cadence.
-- Pass strict cold and warm two-display runs with a real 2x Retina backing,
+- During development, pass strict cold and warm two-display runs with a real
+  2x Retina backing,
   migration back to a 200 Hz VX24G10, and 600 present-call samples at
   181.52/198.64 Hz. The p50 intervals were 5.081/5.003 ms, with zero >=100 ms
   stalls and zero ownership failures. Sustained/native VSync-synchronised
-  200 Hz scanout is not claimed.
+  200 Hz scanout is not claimed, and those physical gates were not repeated
+  for the final release SHA after later presentation/reset fixes.
 - Repair a missed Cocoa/GLFW Retina backing-size callback by synchronizing the
   direct framebuffer dimensions into Minecraft and invoking its normal resize
   handler before display-lifecycle analysis.
 - Fix display-only reset destroying active graph presentation tokens during a
   resize/lifecycle transition, and fix cadence accounting after a GLFW window
   replacement.
+- Fence every asynchronous translation and replay result to its lifecycle
+  generation, discard stale completions, and bound the capture-abort grace so
+  a display transition cannot promote data from the previous surface epoch.
+- Release every retained texture/surface lease exactly once when capture is
+  rejected, queued, completed or cancelled. Count unique retained bytes for
+  backpressure and reject incomplete graph resources before cutover.
+- Replace the ambiguous framebuffer blit with an exact GPU-only rectangle
+  texture presentation shader. It uses framebuffer coordinates, corrects the
+  IOSurface BGRA channel order, preserves caller GL state and reached exact
+  3/3 FINAL parity with zero RMSE and zero maximum channel delta.
+- Destroy GL rectangle-texture bindings before native IOSurfaces are recycled.
+  This closes an intermittent pool-reuse race that produced black/magenta
+  640x384 tiles after a lifecycle reset while keeping the output path free of
+  CPU pixel copies.
+- Discard and retry a cadence sample only when lifecycle counters prove that
+  resize/fullscreen/display migration contaminated the sample; genuine stalls
+  on a stable display still fail the gate.
 - Add unit-tested exact-JAR lifecycle/hardware validators to the normal Gradle
-  `check` task. The exact-JAR manifest/result schema is now version 4.
+  `check` task. The exact-JAR manifest/result schema is now version 5 and the
+  in-game driver schema is version 14.
 
 ## 0.3.0+mc26.2
 

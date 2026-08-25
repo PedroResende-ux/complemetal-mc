@@ -91,14 +91,16 @@ final class DisplayLifecycleTrackerTest {
 
   @Test
   void missedCocoaBackingCallbackRequiresMinecraftFramebufferSync() {
-    assertTrue(DisplayLifecycleTracker.requiresFramebufferSync(
-        960, 540, 1920, 1080));
-    assertTrue(DisplayLifecycleTracker.requiresFramebufferSync(
-        1920, 1080, 960, 540));
-    assertFalse(DisplayLifecycleTracker.requiresFramebufferSync(
-        1920, 1080, 1920, 1080));
-    assertFalse(DisplayLifecycleTracker.requiresFramebufferSync(
-        1920, 1080, 0, 0));
+    assertTrue(DisplayLifecycleTracker.requiresWindowGeometrySync(
+        960, 540, 960, 540, 960, 540, 1920, 1080));
+    assertTrue(DisplayLifecycleTracker.requiresWindowGeometrySync(
+        960, 540, 1920, 1080, 1512, 949, 3024, 1898));
+    assertTrue(DisplayLifecycleTracker.requiresWindowGeometrySync(
+        1512, 949, 3024, 1898, 960, 540, 1920, 1080));
+    assertFalse(DisplayLifecycleTracker.requiresWindowGeometrySync(
+        960, 540, 1920, 1080, 960, 540, 1920, 1080));
+    assertFalse(DisplayLifecycleTracker.requiresWindowGeometrySync(
+        960, 540, 1920, 1080, 0, 0, 0, 0));
   }
 
   @Test

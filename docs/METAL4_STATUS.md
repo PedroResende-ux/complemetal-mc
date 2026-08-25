@@ -1,11 +1,11 @@
 # Metal 4 implementation status
 
-This document is part of the `0.3.0+mc26.2` release contract. Runtime status
+This document is part of the `0.3.1+mc26.2` release contract. Runtime status
 must distinguish Metal 4 availability, active Iris graph ownership and the
 Metal 3/OpenGL fallback; creating an MTL4 object alone is not an active draw
 claim.
 
-| Area | Stable `0.3.0` status |
+| Area | Stable `0.3.1` status |
 | --- | --- |
 | Metal 4 API/runtime detection | Implemented with a real command-buffer and completion-feedback probe |
 | MTL4 command queue and allocator | Active for the Iris graph on supported macOS 26 systems |
@@ -18,29 +18,30 @@ claim.
 | Hazards | Explicit RAW/WAR/WAW tracking and MTL4 barriers |
 | Texture input | IOSurface handoff or bounded resident Metal texture |
 | Vertex/index input | Bounded resident Metal buffer cache |
-| Presentation | Asynchronous fenced IOSurface handoff; reusable last completed surface |
+| Presentation | Asynchronous fenced IOSurface handoff; exact GPU-only BGRA presentation; reusable last completed surface |
 | Visual parity | Three consecutive exact final-frame comparisons required before ownership |
 | Metal 3 fallback | Iris/OpenGL remains visible; no MTL4 draw ownership |
 | Resize/fullscreen/surface restore | Exact-JAR validated |
 | Overworld/Nether/End transition | Exact-JAR validated |
 | Iris shader toggle/reload | Exact-JAR validated |
 | Matched frame-time gate | Passed twice in opposite launch orders |
-| True 2x Retina backing | Not validated; outside stable scope |
+| True 2x Retina backing | Passed on an earlier development candidate; outside final-artifact qualification |
 | Physical sleep/wake | Not validated; outside stable scope |
 | External display reconnect | Not validated; outside stable scope |
-| Real presented 200 Hz | Not validated; outside stable scope |
+| Real presented 200 Hz | Software-paced development probe passed; native synchronized scanout is not claimed |
 
-## Post-`0.3.0` display lifecycle follow-up
+## `0.3.1` display and replay hardening
 
-The development branch now has an explicit GLFW display-state observer and a
+The stable client now has an explicit GLFW display-state observer and a
 display-only native reset. Monitor topology, active monitor, backing scale,
 framebuffer size, visibility/iconification, window recreation and a likely
 sleep/wake gap invalidate the presentation bridge fail-open. Translation,
 pipeline archives, in-flight graph presentation tokens, persistent graph
 attachments and resident Metal inputs remain intact.
 
-Cold and warm exact-JAR runs passed with both the built-in Retina panel and the
-200 Hz VX24G10 active. The strict runs moved the live window through both
+Earlier development-candidate cold and warm exact-JAR runs passed with both
+the built-in Retina panel and the 200 Hz VX24G10 active. The strict runs moved
+the live window through both
 displays, verified a real 2x framebuffer on Retina, returned to the external
 200 Hz mode and retained Metal graph ownership with three display resets per
 run. Around the actual Minecraft `GlSurface.present()` call, 600 samples
@@ -50,12 +51,24 @@ profile is explicitly `software-paced-vsync-off`: it verifies a high-refresh
 path rather than a 60 Hz clamp, but not guaranteed or VSync-synchronised 200 Hz
 scanout.
 
-The run also exposed and fixed a missed Cocoa/GLFW backing-size callback:
+The hardware-candidate run also exposed and fixed a missed Cocoa/GLFW
+backing-size callback:
 GLFW reported the correct 1920x1080 backing for a 960x540 Retina window while
 Minecraft still cached 960x540. The client now synchronizes the direct GLFW
 framebuffer size and invokes Minecraft's normal framebuffer-resize handling
-before lifecycle analysis. Physical display disconnect/reconnect and physical
-sleep/wake remain unperformed hardware actions. Exact evidence and
+before lifecycle analysis.
+
+The final `0.3.1` release additionally fences asynchronous work to its display
+lifecycle generation, releases captured surface leases exactly once, and
+rejects incomplete resources before graph ownership. Its final presentation
+uses an exact rectangle-texture shader with framebuffer coordinates and BGRA
+channel order instead of an ambiguous framebuffer blit. GL bindings are
+deleted before native IOSurfaces return to the Metal pool, closing the
+post-reset black/magenta-tile race found during warm QA.
+
+The exact final JAR passed automated Metal 4 and forced Metal 3 cold/warm runs
+without physical monitor actions. Physical display disconnect/reconnect and
+physical sleep/wake remain unperformed hardware actions. Exact evidence and
 reproduction commands are in
 [`DISPLAY_LIFECYCLE_QA.md`](DISPLAY_LIFECYCLE_QA.md).
 
@@ -65,7 +78,7 @@ The complete Iris-to-Metal path defaults on only when all static conditions
 are true:
 
 - the classes come from a packaged stable version such as
-  `0.3.0+mc26.2`, not a dev or prerelease classpath;
+  `0.3.1+mc26.2`, not a dev or prerelease classpath;
 - the OS is macOS 26 or newer;
 - the process architecture is Apple Silicon.
 
@@ -111,12 +124,14 @@ blocking so startup cannot suppress a frame without an image.
 
 ## Performance status
 
-The Stage 9 candidate passed two 600-frame matched warm-cache A/B gates in
+The Stage 9 renderer passed two 600-frame matched warm-cache A/B gates in
 opposite launch orders. Metal improved every required CPU and GPU percentile,
 with no >=100 ms stutters and no MTL4 commit-feedback errors. Detailed numbers
-and the exact scenario are in [README.md](../README.md) and the final stable
-artifact evidence is in
-[`RELEASE_CHECKLIST_0.3.0.md`](RELEASE_CHECKLIST_0.3.0.md).
+and the exact scenario are in [README.md](../README.md). Those measurements
+were made for `0.3.0`; `0.3.1` is a correctness/lifecycle maintenance release
+and does not claim a newly measured FPS percentage. Its final exact-artifact
+evidence is in
+[`RELEASE_CHECKLIST_0.3.1.md`](RELEASE_CHECKLIST_0.3.1.md).
 
 The measured uplift applies to the tested M4 Pro, 1280x720 Complementary
 Reimagined r5.8.1 scenario. A GPU-bound pack or resolution can show a smaller
@@ -127,5 +142,5 @@ gain because shader math and memory traffic are not removed by translation.
 Stable means full graph ownership only for states that pass every strict gate.
 Unsupported content retains Iris/OpenGL or Minecraft rendering. Native
 entity/particle replacement, experimental mesh shaders, Hi-Z culling,
-MetalFX conformance, physical power/display lifecycle and 200 Hz presentation
-are not implied by the Stage 9 Iris graph release.
+MetalFX conformance, physical power/display lifecycle and native synchronized
+200 Hz presentation are not implied by the Stage 9 Iris graph release.

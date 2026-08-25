@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender.compat.iris;
 
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import java.util.LinkedHashMap;
+import java.util.Collection;
 import java.util.Map;
 import java.util.Optional;
 
@@ -190,6 +191,34 @@ final class IrisGlTextureGpuHandoff {
     return LAST_RESIDENT_FAILURE.get();
   }
 
+  static long[] uniqueSharedHandles(
+      Collection<IrisGlTextureMirror.TextureSnapshot> snapshots) {
+    if (snapshots == null || snapshots.isEmpty()) {
+      return new long[0];
+    }
+    return snapshots.stream().filter(java.util.Objects::nonNull)
+        .filter(IrisGlTextureMirror.TextureSnapshot::shared)
+        .mapToLong(IrisGlTextureMirror.TextureSnapshot::sharedHandle)
+        .filter(handle -> handle > 0).distinct().sorted().toArray();
+  }
+
+  /** Releases dynamic capture leases that never reached a Metal packet. */
+  static void abandonCapturedSurfaces(
+      Collection<IrisGlTextureMirror.TextureSnapshot> snapshots) {
+    if (!NativeBridge.isLibLoaded()) {
+      return;
+    }
+    for (long handle : uniqueSharedHandles(snapshots)) {
+      try {
+        // Immutable resident handles intentionally return false here. The
+        // native side releases only an unsubmitted dynamic surface lease.
+        NativeBridge.nReleaseIrisMetal4InputSurface(handle);
+      } catch (RuntimeException | LinkageError unavailable) {
+        return;
+      }
+    }
+  }
+
   private static <T> Optional<T> captureFailure(String reason) {
     LAST_CAPTURE_FAILURE.set(reason == null || reason.isBlank()
         ? "unknown" : reason);
@@ -212,6 +241,10 @@ final class IrisGlTextureGpuHandoff {
       case -12 -> "native-copy-fence-timeout";
       default -> "native-capture-failed-" + code;
     };
+  }
+
+  static boolean retryableCaptureFailure(String reason) {
+    return "native-surface-ring-exhausted".equals(reason);
   }
 
   static boolean supportsDirectGpuHandoff(String format) {
