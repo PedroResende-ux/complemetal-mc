@@ -253,12 +253,25 @@ public final class MetalRenderHookState {
     return framePrepared && !framePresented;
   }
 
-  public static boolean canReplaceTerrain() {
+  /**
+   * Pre-presentation gate used by the Sodium 1.21.1 render-layer hook.
+   * Presentation itself cannot be required here because this hook runs before
+   * vanilla finishes the level render.
+   */
+  public static boolean canReplaceTerrainDuringFrame() {
     MetalRenderConfig config = MetalRenderClient.getConfig();
     return config != null && config.enableFastTerrainReplacement &&
         !IrisCompatibility.requiresShaderCompatibilityMode() &&
         screenshotFallbackFrames == 0 &&
-        isMetalFrameUsable() && presentationReady;
+        isMetalFrameUsable();
+  }
+
+  /**
+   * Post-presentation gate retained for code paths which intentionally require
+   * a completed Metal handoff.
+   */
+  public static boolean canReplaceTerrain() {
+    return canReplaceTerrainDuringFrame() && presentationReady;
   }
 
   public static boolean canReplaceEntities() {
