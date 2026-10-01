@@ -617,12 +617,17 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$dispatchCompute(int x, int y, int z,
       CallbackInfo ci) {
     try {
-      metalrender$capture().dispatch(
+      boolean captured = metalrender$capture().dispatch(
           metalrender$capture().captureDispatchCommand(x, y, z));
       // A captured dispatch is replayed by the Metal graph executor. Do not
       // also execute the original OpenGL dispatch while full graph ownership
       // is active.
-      if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      if (captured
+          && IrisTranslationCoordinator.suppressFullGraphOperation()) {
+        ci.cancel();
+      } else if (!captured
+          && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+              "graph-ownership-dispatch-program-unresolved")) {
         ci.cancel();
       }
     } catch (IllegalArgumentException error) {
@@ -646,9 +651,14 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$dispatchComputeIndirect(long offset,
       CallbackInfo ci) {
     try {
-      metalrender$capture().dispatch(
+      boolean captured = metalrender$capture().dispatch(
           metalrender$capture().captureIndirectDispatchCommand(offset));
-      if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+      if (captured
+          && IrisTranslationCoordinator.suppressFullGraphOperation()) {
+        ci.cancel();
+      } else if (!captured
+          && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+              "graph-ownership-indirect-dispatch-program-unresolved")) {
         ci.cancel();
       }
     } catch (IllegalArgumentException error) {
