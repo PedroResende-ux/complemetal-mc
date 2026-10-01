@@ -6767,6 +6767,17 @@ static jlongArray run_iris_metal4_graph_frame(
             [encoder endEncoding];
             pendingWrites.insert(operation.firstResource);
             transfers++;
+          } else if (operation.kind == 6) {
+            // Compute graph packets are structurally captured and validated
+            // on the Java side, but native compute dispatch remains gated
+            // separately until its workgroup ABI and resource-state encoder
+            // are fully established. Never reinterpret a dispatch as a draw.
+            status = 0;
+            reason = 5;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph compute dispatch execution unavailable"
+                         userInfo:nil];
           } else {
             size_t runEnd = operationIndex + 1;
             while (runEnd < packet.operations.size() &&
