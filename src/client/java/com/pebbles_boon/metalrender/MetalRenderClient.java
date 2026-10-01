@@ -730,7 +730,7 @@ public class MetalRenderClient {
       String configuredRoot = System.getProperty(
           "metalrender.experimental.irisMetalCacheRoot");
       Path cacheRoot = configuredRoot == null || configuredRoot.isBlank()
-          ? Minecraft.getInstance().gameDirectory.toPath()
+          ? net.neoforged.fml.loading.FMLPaths.GAMEDIR.get()
               .resolve(".cache").resolve("metalrender")
           : Path.of(configuredRoot);
       if (IrisTranslationCoordinator.startIfEnabled(cacheRoot)) {
