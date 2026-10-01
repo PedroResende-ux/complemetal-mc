@@ -117,11 +117,19 @@ public sealed interface IrisExecutionCommand {
     }
   }
 
-  record Dispatch(int groupsX, int groupsY, int groupsZ)
+  record Dispatch(int groupsX, int groupsY, int groupsZ,
+                   int localSizeX, int localSizeY, int localSizeZ)
       implements IrisExecutionCommand {
+    public Dispatch(int groupsX, int groupsY, int groupsZ) {
+      this(groupsX, groupsY, groupsZ, 1, 1, 1);
+    }
+
     public Dispatch {
-      if (groupsX <= 0 || groupsY <= 0 || groupsZ <= 0) {
-        throw new IllegalArgumentException("invalid compute group count");
+      if (groupsX <= 0 || groupsY <= 0 || groupsZ <= 0
+          || localSizeX <= 0 || localSizeY <= 0 || localSizeZ <= 0
+          || (long) localSizeX * localSizeY * localSizeZ > 1024L) {
+        throw new IllegalArgumentException(
+            "invalid compute dispatch/workgroup dimensions");
       }
     }
   }
