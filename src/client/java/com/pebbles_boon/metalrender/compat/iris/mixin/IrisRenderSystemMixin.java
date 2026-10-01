@@ -234,16 +234,22 @@ public abstract class IrisRenderSystemMixin {
     }
   }
 
-  @Inject(method = "clearBufferSubData", at = @At("HEAD"), require = 0,
+  @Inject(method = "clearBufferSubData", at = @At("RETURN"), require = 0,
       remap = false)
   private static void metalrender$clearBufferSubData(int target,
       int internalFormat, long offset, long size, int format, int type,
       int[] values, CallbackInfo ci) {
-    // Metal graph replay has no buffer-clear operation yet. Keep the real GL
-    // call intact and invalidate only the candidate graph, so an unsupported
-    // buffer mutation cannot be silently omitted from the rendered frame.
-    IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
-        "graph-frame-buffer-clear-unimplemented");
+    int buffer = metalrender$vertices().boundBuffer(target);
+    if (buffer <= 0) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-clear-binding-unavailable");
+      return;
+    }
+    if (!com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global()
+        .clearZero(buffer, offset, size, internalFormat, format, type, values)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-clear-format-unsupported");
+    }
   }
 
   @Inject(method = "createFramebuffer", at = @At("RETURN"),
