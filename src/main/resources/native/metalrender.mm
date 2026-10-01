@@ -5529,6 +5529,7 @@ static bool parse_iris_metal4_graph_frame(
       }
       try {
         operation.colorTargets.resize(targetCount);
+        operation.colorTargetMips.assign(targetCount, 0);
       } catch (...) {
         return false;
       }
@@ -5651,6 +5652,7 @@ static bool parse_iris_metal4_graph_frame(
       }
       try {
         operation.colorTargets.resize(targetCount);
+        operation.colorTargetMips.assign(targetCount, 0);
       } catch (...) {
         return false;
       }
