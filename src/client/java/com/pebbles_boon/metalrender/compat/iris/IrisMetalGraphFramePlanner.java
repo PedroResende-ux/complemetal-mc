@@ -254,12 +254,18 @@ public final class IrisMetalGraphFramePlanner {
           written.add(target);
         }
       }
+      Set<Integer> storageImageWriteTextures = pipeline.pending()
+          .resourceBindings().imageUnits().values().stream()
+          .filter(binding -> binding.texture() > 0
+              && binding.access() != 0x88B8)
+          .map(IrisGlResourceBindingSnapshot.ImageUnitBinding::texture)
+          .collect(java.util.stream.Collectors.toUnmodifiableSet());
       validateDrawResourceRouting(plan, pipeline, tokensById, initialized,
           targets.allTargets(), handlesById,
-          resolved.sampledTextureNames());
+          resolved.sampledTextureNames(), storageImageWriteTextures);
       Map<Integer, Integer> overrides = textureOverrides(plan, pipeline,
           tokensById, idsByTextureName, initialized, targets.allTargets(),
-          resolved.sampledTextureNames());
+          resolved.sampledTextureNames(), storageImageWriteTextures);
       Map<Integer, Integer> externalBuffers = inputBuffers.register(
           resolved.requiredBufferImages());
       Map<Integer, Integer> externalTextures = inputTextures.register(
@@ -645,7 +651,8 @@ public final class IrisMetalGraphFramePlanner {
       IrisRenderExecutionPlan.PipelineStep pipeline,
       Map<Integer, Long> tokensById, Map<Integer, List<Integer>> idsByName,
       Set<Integer> initialized, Set<Integer> targets,
-      Set<Integer> sampledTextureNames) {
+      Set<Integer> sampledTextureNames,
+      Set<Integer> storageImageWriteTextures) {
     int diagnosticCutNode = Integer.getInteger(
         EXACT_JAR_DIAGNOSTIC_CUT_NODE_PROPERTY, -1);
     int diagnosticCutTexture = Integer.getInteger(
@@ -672,9 +679,13 @@ public final class IrisMetalGraphFramePlanner {
         }
         continue;
       }
+      boolean storageImageWrite =
+          storageImageWriteTextures.contains(glName);
       List<Integer> candidates = idsByName.getOrDefault(glName, List.of())
           .stream().filter(tokensById::containsKey)
-          .filter(initialized::contains).toList();
+          .filter(resourceId -> storageImageWrite
+              || initialized.contains(resourceId))
+          .toList();
       if (candidates.size() > 1) {
         throw unsupported("graph-frame-texture-override-ambiguous");
       }
@@ -745,7 +756,8 @@ public final class IrisMetalGraphFramePlanner {
       IrisRenderExecutionPlan.PipelineStep pipeline,
       Map<Integer, Long> tokensById, Set<Integer> initialized,
       Set<Integer> targets, Map<Integer, ResourceHandle> handlesById,
-      Set<Integer> sampledTextureNames) {
+      Set<Integer> sampledTextureNames,
+      Set<Integer> storageImageWriteTextures) {
     for (Integer target : targets) {
       if (!initialized.contains(target)) {
         throw unsupported("graph-frame-render-target-uninitialized");
@@ -757,7 +769,12 @@ public final class IrisMetalGraphFramePlanner {
         continue;
       }
       if (use.access().writes() && !targets.contains(use.resourceId())) {
-        throw unsupported("graph-frame-storage-image-write-unimplemented");
+        ResourceHandle writeHandle = handlesById.get(use.resourceId());
+        if (writeHandle == null
+            || writeHandle.kind() != ResourceKind.TEXTURE
+            || !storageImageWriteTextures.contains(writeHandle.name())) {
+          throw unsupported("graph-frame-storage-image-write-unimplemented");
+        }
       }
       if (!use.access().reads() || initialized.contains(use.resourceId())) {
         continue;
