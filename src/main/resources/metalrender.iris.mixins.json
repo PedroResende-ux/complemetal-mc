@@ -5,7 +5,9 @@
   "plugin": "com.pebbles_boon.metalrender.compat.iris.mixin.IrisMixinPlugin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [],
-  "client": [],
+  "client": [
+    "Iris1211RenderingPipelineMixin"
+  ],
   "injectors": {
     "defaultRequire": 0
   }
