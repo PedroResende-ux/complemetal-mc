@@ -22,6 +22,13 @@ public class GL30CMixin {
 
   @Inject(method = "glDeleteVertexArrays", at = @At("HEAD"), remap = false,
       require = 0)
+  private static void metalrender$deleteVertexArray(int array,
+      CallbackInfo ci) {
+    IrisGlVertexArrayTracker.global().deleteVertexArray(array);
+  }
+
+  @Inject(method = "glDeleteVertexArrays", at = @At("HEAD"), remap = false,
+      require = 0)
   private static void metalrender$deleteVertexArrays(int[] arrays,
       CallbackInfo ci) {
     if (arrays == null) {
