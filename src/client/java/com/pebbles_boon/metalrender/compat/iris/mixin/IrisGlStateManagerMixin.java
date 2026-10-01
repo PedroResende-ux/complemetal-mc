@@ -122,13 +122,6 @@ public abstract class IrisGlStateManagerMixin {
     }
   }
 
-  @Inject(method = "_glBufferData(ILjava/nio/ByteBuffer;I)V",
-      at = @At("RETURN"))
-  private static void metalrender$bufferDataExit(int target,
-      ByteBuffer bytes, int usage, CallbackInfo ci) {
-    metalrender$exitBufferDataScope();
-  }
-
   @Inject(method = "_glBufferData(IJI)V", at = @At("HEAD"))
   private static void metalrender$bufferDataSizeEnter(int target, long size,
       int usage, CallbackInfo ci) {
