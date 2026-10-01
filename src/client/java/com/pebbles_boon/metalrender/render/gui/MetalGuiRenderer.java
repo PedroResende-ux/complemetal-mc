@@ -1,6 +1,6 @@
 package com.pebbles_boon.metalrender.render.gui;
 
-import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceLocation;
 
 public class MetalGuiRenderer {
   private static MetalGuiRenderer instance;
@@ -51,7 +51,7 @@ public class MetalGuiRenderer {
     frameStarted = false;
   }
 
-  public void setTexture(Identifier texture) {
+  public void setTexture(ResourceLocation texture) {
   }
 
   public void addQuad(float x1, float y1, float x2, float y2, float z, float u1,
