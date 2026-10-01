@@ -606,8 +606,18 @@ public abstract class IrisRenderSystemMixin {
     try {
       metalrender$capture().dispatch(
           metalrender$capture().captureDispatchCommand(x, y, z));
+      // A captured dispatch is replayed by the Metal graph executor. Do not
+      // also execute the original OpenGL dispatch while full graph ownership
+      // is active.
+      if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+        ci.cancel();
+      }
     } catch (IllegalArgumentException error) {
       metalrender$capture().dispatch();
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-dispatch-capture-failed")) {
+        ci.cancel();
+      }
     }
   }
 
