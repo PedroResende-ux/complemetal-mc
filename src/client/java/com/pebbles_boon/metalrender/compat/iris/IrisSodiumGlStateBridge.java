@@ -1,6 +1,9 @@
 package com.pebbles_boon.metalrender.compat.iris;
 
 import net.caffeinemc.mods.sodium.client.gl.buffer.GlBuffer;
+import org.lwjgl.opengl.GL15C;
+import org.lwjgl.opengl.GL20C;
+import org.lwjgl.opengl.GL30C;
 import net.caffeinemc.mods.sodium.client.gl.buffer.GlBufferMapping;
 import java.nio.ByteBuffer;
 import java.util.concurrent.ConcurrentHashMap;
@@ -99,6 +102,33 @@ public final class IrisSodiumGlStateBridge {
     MappingRange range = MAPPINGS.get(buffer);
     if (range != null) {
       refresh(buffer, range);
+    }
+  }
+
+  /**
+   * Reconciles Sodium's state-cache with the actual GL context immediately
+   * before a direct terrain submission. Sodium intentionally skips redundant
+   * binds, so a Java-side observer cannot assume every bind call was replayed.
+   */
+  public static void synchronizeForDraw() {
+    try {
+      int program = GL20C.glGetInteger(GL20C.GL_CURRENT_PROGRAM);
+      if (program > 0) {
+        IrisPipelineStateCapture.global().useProgram(program);
+      }
+
+      int vao = GL30C.glGetInteger(GL30C.GL_VERTEX_ARRAY_BINDING);
+      bindVertexArray(vao);
+
+      int arrayBuffer =
+          GL15C.glGetInteger(GL15C.GL_ARRAY_BUFFER_BINDING);
+      bindBuffer(GL15C.GL_ARRAY_BUFFER, arrayBuffer);
+
+      int elementBuffer =
+          GL15C.glGetInteger(GL15C.GL_ELEMENT_ARRAY_BUFFER_BINDING);
+      bindBuffer(GL15C.GL_ELEMENT_ARRAY_BUFFER, elementBuffer);
+    } catch (RuntimeException | LinkageError ignored) {
+      // State synchronization is observational and fail-open.
     }
   }
 
