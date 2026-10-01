@@ -63,7 +63,7 @@ public abstract class WorldRendererTerrainMixin {
 
     if (!MetalRenderHookState.isFramePrepared()
         || worldRenderer.getLastDrawnChunkCount() <= 0
-        || !MetalRenderHookState.canReplaceTerrain()) {
+        || !MetalRenderHookState.canReplaceTerrainDuringFrame()) {
       return;
     }
 
