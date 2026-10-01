@@ -4316,6 +4316,9 @@ struct IrisShadowDraw {
   uint32_t groupsX = 0;
   uint32_t groupsY = 0;
   uint32_t groupsZ = 0;
+  uint32_t localSizeX = 0;
+  uint32_t localSizeY = 0;
+  uint32_t localSizeZ = 0;
   struct Indexed {
     uint64_t offset = 0;
     uint32_t count = 0;
@@ -4463,8 +4466,15 @@ static bool parse_iris_shadow_replay_packet_data(
     if (!reader.u32(result.draw.groupsX) ||
         !reader.u32(result.draw.groupsY) ||
         !reader.u32(result.draw.groupsZ) ||
+        !reader.u32(result.draw.localSizeX) ||
+        !reader.u32(result.draw.localSizeY) ||
+        !reader.u32(result.draw.localSizeZ) ||
         result.draw.groupsX == 0 || result.draw.groupsY == 0 ||
         result.draw.groupsZ == 0 ||
+        result.draw.localSizeX == 0 || result.draw.localSizeY == 0 ||
+        result.draw.localSizeZ == 0 ||
+        (uint64_t)result.draw.localSizeX *
+            result.draw.localSizeY * result.draw.localSizeZ > 1024ULL ||
         result.draw.groupsX > 1048576 || result.draw.groupsY > 1048576 ||
         result.draw.groupsZ > 1048576)
       return false;
