@@ -21,6 +21,10 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.IntBuffer;
+import org.lwjgl.opengl.GL15C;
+import org.lwjgl.system.MemoryUtil;
 
 /**
  * Observes the Mojang OpenGL facade. Calls remain untouched until the
@@ -280,6 +284,115 @@ public abstract class IrisGlStateManagerMixin {
   private static void metalrender$deleteFramebuffer(int framebuffer,
       CallbackInfo ci) {
     metalrender$state().deleteFramebuffer(framebuffer);
+  }
+
+  /**
+   * Mirrors the classic 1.21.1 texture allocation entry point. The texture
+   * name is recovered from the active texture unit because this API has no
+   * texture-id argument.
+   */
+  @Inject(method = "_texImage2D", at = @At("RETURN"))
+  private static void metalrender$texImage2D(int target, int level,
+      int internalFormat, int width, int height, int border,
+      int format, int type, IntBuffer pixels, CallbackInfo ci) {
+    if (!IrisGlTextureMirror.isEnabled() || target != 0x0DE1
+        || level != 0 || width <= 0 || height <= 0) {
+      return;
+    }
+    IrisGlResourceBindingSnapshot.TextureUnitBinding binding =
+        metalrender$resources().activeTextureBinding(target);
+    if (binding == null || binding.texture() <= 0) {
+      return;
+    }
+    int texture = binding.texture();
+    int bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat).orElse(0);
+    if (bytesPerPixel <= 0) {
+      bytesPerPixel = IrisGlFormat.exactUploadBytesPerPixel(
+          internalFormat, format, type).orElse(0);
+    }
+    if (bytesPerPixel <= 0) {
+      return;
+    }
+    String cacheFormat = IrisGlFormat.cacheName(internalFormat)
+        .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
+    if (!IrisGlTextureMirror.global().define(texture, cacheFormat,
+        width, height, 1, 1, bytesPerPixel)) {
+      return;
+    }
+    if (pixels == null || bytesPerPixel != Integer.BYTES) {
+      return;
+    }
+    long required = (long) width * height * bytesPerPixel;
+    if (required > pixels.remaining() * (long) Integer.BYTES
+        || required > Integer.MAX_VALUE) {
+      return;
+    }
+    ByteBuffer encoded = ByteBuffer.allocateDirect(
+        Math.toIntExact(required)).order(ByteOrder.nativeOrder());
+    IntBuffer copy = encoded.asIntBuffer();
+    copy.put(pixels.duplicate());
+    encoded.limit(Math.toIntExact(required));
+    IrisGlTextureMirror.global().write(texture, 0, 0, 0, 0, width, height,
+        width, encoded);
+  }
+
+  /**
+   * Mirrors both direct native-memory uploads (the normal NativeImage path)
+   * and PBO-backed uploads when a pixel-unpack buffer is bound.
+   */
+  @Inject(method = "_texSubImage2D", at = @At("RETURN"), require = 0)
+  private static void metalrender$texSubImage2D(int target, int level,
+      int xOffset, int yOffset, int width, int height, int format,
+      int type, long pixels, CallbackInfo ci) {
+    if (!IrisGlTextureMirror.isEnabled() || target != 0x0DE1
+        || level < 0 || width <= 0 || height <= 0 || pixels <= 0) {
+      return;
+    }
+
+    IrisGlResourceBindingSnapshot.TextureUnitBinding binding =
+        metalrender$resources().activeTextureBinding(target);
+    if (binding == null || binding.texture() <= 0) {
+      return;
+    }
+    int texture = binding.texture();
+    IrisGlTextureMirror mirror = IrisGlTextureMirror.global();
+    var metadata = mirror.metadata(texture, level, 0).orElse(null);
+    if (metadata == null) {
+      return;
+    }
+
+    int bytesPerPixel = IrisGlFormat.exactUploadBytesPerPixel(
+        metadata.format().startsWith("gl-0x")
+            ? 0 : 0, format, type).orElse(metadata.bytesPerPixel());
+    if (bytesPerPixel != metadata.bytesPerPixel()) {
+      bytesPerPixel = metadata.bytesPerPixel();
+    }
+    long rowBytes = (long) width * bytesPerPixel;
+    long required = rowBytes * height;
+    if (rowBytes <= 0 || required <= 0 || required > Integer.MAX_VALUE
+        || (rowBytes & 3L) != 0) {
+      return;
+    }
+
+    try {
+      int pbo = GL15C.glGetInteger(GL15C.GL_PIXEL_UNPACK_BUFFER_BINDING);
+      ByteBuffer source;
+      if (pbo > 0) {
+        long generation = IrisGlBufferMirror.global().generation(pbo);
+        var snapshot = IrisGlBufferMirror.global().snapshot(
+            pbo, generation, pixels, required).orElse(null);
+        if (snapshot == null) {
+          return;
+        }
+        source = ByteBuffer.wrap(snapshot.bytes());
+      } else {
+        source = MemoryUtil.memByteBuffer(pixels, Math.toIntExact(required));
+      }
+      mirror.write(texture, level, 0, xOffset, yOffset, width, height, width,
+          source);
+    } catch (IllegalArgumentException | RuntimeException ignored) {
+      // Upload metadata remains valid; unknown pixel layouts fail closed.
+    }
   }
 
   @Inject(method = "_deleteTexture", at = @At("TAIL"))
