@@ -280,8 +280,7 @@ public abstract class IrisGlCommandEncoderMixin {
   @Inject(method = "drawFromBuffers", at = @At("HEAD"), cancellable = true)
   private void metalrender$drawFromBuffers(@Coerce Object pass,
       int baseVertex, int firstIndex, int indexCount, IndexType indexType,
-      GlRenderPipeline pipeline, int instanceCount, int baseInstance,
-      CallbackInfo ci) {
+      GlRenderPipeline pipeline, int instanceCount, CallbackInfo ci) {
     if (metalrender$isHighLevelDrawCaptureActive()) {
       DRAW_FROM_BUFFERS_NESTED.set(Boolean.TRUE);
       return;
@@ -320,8 +319,7 @@ public abstract class IrisGlCommandEncoderMixin {
   @Inject(method = "drawFromBuffers", at = @At("RETURN"))
   private void metalrender$drawFromBuffersComplete(@Coerce Object pass,
       int baseVertex, int firstIndex, int indexCount, IndexType indexType,
-      GlRenderPipeline pipeline, int instanceCount, int baseInstance,
-      CallbackInfo ci) {
+      GlRenderPipeline pipeline, int instanceCount, CallbackInfo ci) {
     if (DRAW_FROM_BUFFERS_NESTED.get() != null) {
       DRAW_FROM_BUFFERS_NESTED.remove();
       return;
@@ -330,7 +328,7 @@ public abstract class IrisGlCommandEncoderMixin {
     IrisVisualParityCapture.global().endDrawInvocation();
   }
 
-  @Inject(method = "executeDraws", at = @At(value = "INVOKE",
+  @Inject(method = "executeDraws", require = 0, at = @At(value = "INVOKE",
       target = "Lcom/mojang/blaze3d/opengl/GlCommandEncoder;validateDraw(Lcom/mojang/blaze3d/opengl/GlRenderPass;Lcom/mojang/blaze3d/IndexType;)V",
       shift = At.Shift.AFTER), cancellable = true)
   private void metalrender$executeDraws(@Coerce Object pass,
@@ -402,7 +400,7 @@ public abstract class IrisGlCommandEncoderMixin {
     }
   }
 
-  @Inject(method = "executeDraws", at = @At("RETURN"))
+  @Inject(method = "executeDraws", require = 0, at = @At("RETURN"))
   private void metalrender$executeDrawsComplete(@Coerce Object pass,
       IndexType indexType, PointerBuffer indices, IntBuffer counts,
       IntBuffer baseVertices, int drawCount, CallbackInfo ci) {
@@ -410,7 +408,7 @@ public abstract class IrisGlCommandEncoderMixin {
     IrisVisualParityCapture.global().endDrawInvocation();
   }
 
-  @Inject(method = "executeDrawIndirect", at = @At(value = "INVOKE",
+  @Inject(method = "executeDrawIndirect", require = 0, at = @At(value = "INVOKE",
       target = "Lcom/mojang/blaze3d/opengl/GlCommandEncoder;validateDraw(Lcom/mojang/blaze3d/opengl/GlRenderPass;Lcom/mojang/blaze3d/IndexType;)V",
       shift = At.Shift.AFTER), cancellable = true)
   private void metalrender$executeDrawIndirect(@Coerce Object pass,
@@ -449,7 +447,7 @@ public abstract class IrisGlCommandEncoderMixin {
     }
   }
 
-  @Inject(method = "executeDrawIndirect", at = @At("RETURN"))
+  @Inject(method = "executeDrawIndirect", require = 0, at = @At("RETURN"))
   private void metalrender$executeDrawIndirectComplete(@Coerce Object pass,
       IndexType indexType, GlBuffer indirectBuffer, long offset,
       int drawCount, CallbackInfo ci) {
