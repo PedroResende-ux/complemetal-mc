@@ -9525,7 +9525,8 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
             captured.mipLevel >= texture.mipmapLevelCount ||
             expectedWidth != captured.width ||
             expectedHeight != captured.height ||
-            (texture.usage & MTLTextureUsageShaderRead) == 0 ||
+            (texture.usage & (MTLTextureUsageShaderRead |
+                MTLTextureUsageShaderWrite)) == 0 ||
             !iris_shadow_add_bounded(sampledTextureBytes, logicalBytes,
                 kIrisShadowReplayMaximumTextureBytes)) {
           outcome = 0;
