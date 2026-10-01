@@ -67,6 +67,37 @@ public record IrisMetalGraphResourcePlan(List<Allocation> allocations) {
         usages[use.resourceId()] |= usage;
       }
     }
+    // Graphics passes can write storage images without using them as
+    // framebuffer attachments. Mark those exact image-bound textures as
+    // shader-writable so their persistent Metal allocation is created with
+    // MTLTextureUsageShaderWrite.
+    for (IrisRenderExecutionPlan.Step step : plan.steps()) {
+      if (!(step instanceof IrisRenderExecutionPlan.PipelineStep pipeline)) {
+        continue;
+      }
+      IrisGlResourceBindingSnapshot bindings =
+          pipeline.pending().resourceBindings();
+      if (bindings == null) {
+        continue;
+      }
+      for (IrisGlResourceBindingSnapshot.ImageUnitBinding binding
+          : bindings.imageUnits().values()) {
+        if (binding.texture() <= 0 || binding.access() == 0x88B8) {
+          continue;
+        }
+        for (IrisRenderExecutionPlan.ResourceBinding resourceBinding
+            : plan.resourceBindings()) {
+          IrisGlStateSnapshot.ResourceHandle handle =
+              resourceBinding.handle();
+          if (handle.kind()
+              == IrisGlStateSnapshot.ResourceKind.TEXTURE
+              && handle.name() == binding.texture()) {
+            usages[resourceBinding.resourceId()] |= USAGE_SHADER_WRITE;
+          }
+        }
+      }
+    }
+
     // Mutable OpenGL textures are commonly defined with only level zero and
     // acquire the rest of their storage when glGenerateMipmap runs. The graph
     // snapshot therefore legitimately reports one level even though the
