@@ -485,6 +485,10 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_drawElements", at = @At("HEAD"), cancellable = true)
   private static void metalrender$drawElements(int mode, int count, int type,
       long indices, CallbackInfo ci) {
+    if (IrisSodiumImmediateDrawCommandListMixin
+        .metalrender$isHighLevelDrawActive()) {
+      return;
+    }
     METALRENDER_MOJANG_DRAW_SCOPE.set(Boolean.TRUE);
     IrisVisualParityCapture.global().beginDrawInvocation();
     int bytes = switch (type) {
@@ -534,6 +538,10 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_drawElements", at = @At("RETURN"))
   private static void metalrender$drawElementsComplete(int mode, int count,
       int type, long indices, CallbackInfo ci) {
+    if (IrisSodiumImmediateDrawCommandListMixin
+        .metalrender$isHighLevelDrawActive()) {
+      return;
+    }
     metalrender$finishMojangDraw();
   }
 
