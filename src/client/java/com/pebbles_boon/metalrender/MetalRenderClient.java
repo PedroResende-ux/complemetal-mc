@@ -726,6 +726,9 @@ public class MetalRenderClient {
   }
 
   private static void startIrisTranslationIfEnabled() {
+    if (!IrisCompatibility.isIrisLoaded()) {
+      return;
+    }
     try {
       String configuredRoot = System.getProperty(
           "metalrender.experimental.irisMetalCacheRoot");
