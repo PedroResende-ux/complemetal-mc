@@ -78,8 +78,10 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_clear", at = @At("HEAD"), cancellable = true)
   private static void metalrender$clear(int mask, boolean checkError,
       CallbackInfo ci) {
-    IrisRenderGraphCapture.global().legacyClearBoundFramebuffer(mask);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global()
+        .legacyClearBoundFramebuffer(mask);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
