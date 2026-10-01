@@ -1,5 +1,5 @@
 plugins {
-    id 'net.neoforged.moddev' version '2.0.42-beta'
+    id 'net.neoforged.moddev' version '2.0.148'
     id 'maven-publish'
 }
 
@@ -17,7 +17,8 @@ java {
     withSourcesJar()
 }
 
-repositories {    mavenCentral()
+repositories {
+    mavenCentral()
     maven {
         name = "Modrinth"
         url = "https://api.modrinth.com/maven"
@@ -27,10 +28,10 @@ repositories {    mavenCentral()
 dependencies {
     minecraft "com.mojang:minecraft:${minecraft_version}"
     implementation "net.neoforged:neoforge:${neoforge_version}"
-    compileOnly "maven.modrinth:AANobbMI:${sodium_maven_version}"
-    compileOnly "maven.modrinth:YL57xq9U:${iris_maven_version}"
-    runtimeOnly "maven.modrinth:AANobbMI:${sodium_maven_version}"
-    runtimeOnly "maven.modrinth:YL57xq9U:${iris_maven_version}"
+    compileOnly "maven.modrinth:sodium:${sodium_version}"
+    compileOnly "maven.modrinth:iris:${iris_version}"
+    localRuntime "maven.modrinth:sodium:${sodium_version}"
+    localRuntime "maven.modrinth:iris:${iris_version}"
 
     testImplementation platform("org.junit:junit-bom:${junit_version}")
     testImplementation "org.junit.jupiter:junit-jupiter"
@@ -44,7 +45,7 @@ neoForge {
     runs {
         client {
             client()
-            sourceSet sourceSets.client
+            sourceSet(sourceSets.client)
             vmArg "-Djava.library.path=${projectDir}/src/main/resources"
             vmArg "--enable-native-access=ALL-UNNAMED"
             vmArg "-Xmx8g"
@@ -55,8 +56,8 @@ neoForge {
 
     mods {
         complemetal {
-            sourceSet sourceSets.main
-            sourceSet sourceSets.client
+            sourceSet(sourceSets.main)
+            sourceSet(sourceSets.client)
         }
     }
 }
