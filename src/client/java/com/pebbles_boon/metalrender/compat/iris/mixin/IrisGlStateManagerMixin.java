@@ -471,7 +471,8 @@ public abstract class IrisGlStateManagerMixin {
   }
 
   private static void metalrender$finishMojangDraw() {
-    metalrender$finishMojangDraw();
+    METALRENDER_MOJANG_DRAW_SCOPE.remove();
+    IrisVisualParityCapture.global().endDrawInvocation();
   }
 
   @Inject(method = "_drawElements", at = @At("HEAD"), cancellable = true)
@@ -509,14 +510,14 @@ public abstract class IrisGlStateManagerMixin {
       } else if (pending.isEmpty()
           && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
               "graph-ownership-direct-indexed-unresolved")) {
-        IrisVisualParityCapture.global().endDrawInvocation();
+        metalrender$finishMojangDraw();
         ci.cancel();
       }
     } catch (IllegalArgumentException error) {
       metalrender$capture().draw(mode);
       if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
           "graph-ownership-direct-indexed-invalid")) {
-        IrisVisualParityCapture.global().endDrawInvocation();
+        metalrender$finishMojangDraw();
         ci.cancel();
       }
     }
@@ -526,8 +527,7 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_drawElements", at = @At("RETURN"))
   private static void metalrender$drawElementsComplete(int mode, int count,
       int type, long indices, CallbackInfo ci) {
-    METALRENDER_MOJANG_DRAW_SCOPE.remove();
-    IrisVisualParityCapture.global().endDrawInvocation();
+    metalrender$finishMojangDraw();
   }
 
 
