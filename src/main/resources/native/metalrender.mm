@@ -5248,6 +5248,25 @@ static void iris_graph_prepared_draw_append_residency_allocations(
 static bool iris_graph_prepared_draw_can_share_pass(
     const IrisMetal4GraphPreparedDraw *first,
     const IrisMetal4GraphPreparedDraw *next) API_AVAILABLE(macos(26.0));
+static bool iris_graph_presentation_source_level(
+    const IrisMetal4GraphFramePacket &packet, uint32_t resourceId,
+    uint32_t &level) {
+  for (size_t operationIndex = packet.operations.size();
+       operationIndex > 0; operationIndex--) {
+    const auto &operation = packet.operations[operationIndex - 1];
+    if (operation.kind != 5)
+      continue;
+    for (size_t index = 0; index < operation.colorTargets.size(); index++) {
+      if (operation.colorTargets[index].second != resourceId)
+        continue;
+      level = index < operation.colorTargetMips.size()
+          ? operation.colorTargetMips[index] : 0;
+      return true;
+    }
+  }
+  return false;
+}
+
 static NSUInteger iris_graph_draw_color_target_mip(
     const IrisMetal4GraphFrameOperation &operation, uint32_t slot)
     API_AVAILABLE(macos(26.0)) {
@@ -6270,7 +6289,10 @@ static jlongArray run_iris_metal4_graph_frame(
         if (packet.presentationResourceId >= 0) {
           id<MTLTexture> source = textureFor(
               (uint32_t)packet.presentationResourceId);
-          if (!source) {
+          uint32_t presentationSourceMip = 0;
+          if (!source || !iris_graph_presentation_source_level(
+                  packet, (uint32_t)packet.presentationResourceId,
+                  presentationSourceMip)) {
             status = 0;
             reason = kIrisGraphReasonPresentationTextureMissing;
             @throw [NSException
@@ -6296,9 +6318,21 @@ static jlongArray run_iris_metal4_graph_frame(
                            reason:@"graph presentation format unsupported"
                          userInfo:nil];
           }
-          if (source.width == 0 || source.height == 0 ||
-              source.width > UINT32_MAX || source.height > UINT32_MAX ||
-              source.width > SIZE_MAX / 4u) {
+          if (presentationSourceMip >= source.mipmapLevelCount) {
+            status = 0;
+            reason = kIrisGraphReasonPresentationSizeUnsupported;
+            @throw [NSException
+                exceptionWithName:@"MetalRenderGraphUnsupported"
+                           reason:@"graph presentation mip unavailable"
+                         userInfo:nil];
+          }
+          NSUInteger sourceWidth = std::max((NSUInteger)1,
+              source.width >> presentationSourceMip);
+          NSUInteger sourceHeight = std::max((NSUInteger)1,
+              source.height >> presentationSourceMip);
+          if (sourceWidth == 0 || sourceHeight == 0 ||
+              sourceWidth > UINT32_MAX || sourceHeight > UINT32_MAX ||
+              sourceWidth > SIZE_MAX / 4u) {
             status = 0;
             reason = kIrisGraphReasonPresentationSizeUnsupported;
             @throw [NSException
@@ -6307,9 +6341,9 @@ static jlongArray run_iris_metal4_graph_frame(
                          userInfo:nil];
           }
           size_t bytesPerRow = IOSurfaceAlignProperty(
-              kIOSurfaceBytesPerRow, (size_t)source.width * 4u);
+              kIOSurfaceBytesPerRow, (size_t)sourceWidth * 4u);
           if (bytesPerRow == 0 ||
-              source.height > SIZE_MAX / bytesPerRow) {
+              sourceHeight > SIZE_MAX / bytesPerRow) {
             status = 0;
             reason = kIrisGraphReasonPresentationSizeUnsupported;
             @throw [NSException
@@ -6318,16 +6352,16 @@ static jlongArray run_iris_metal4_graph_frame(
                          userInfo:nil];
           }
           NSDictionary *surfaceProperties = @{
-            (id)kIOSurfaceWidth : @(source.width),
-            (id)kIOSurfaceHeight : @(source.height),
+            (id)kIOSurfaceWidth : @(sourceWidth),
+            (id)kIOSurfaceHeight : @(sourceHeight),
             (id)kIOSurfaceBytesPerElement : @4,
             (id)kIOSurfaceBytesPerRow : @(bytesPerRow),
             (id)kIOSurfaceAllocSize :
-                @(bytesPerRow * (size_t)source.height),
+                @(bytesPerRow * (size_t)sourceHeight),
             (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
           };
           presentationSurface = iris_metal4_acquire_graph_surface(
-              (uint32_t)source.width, (uint32_t)source.height);
+              (uint32_t)sourceWidth, (uint32_t)sourceHeight);
           if (!presentationSurface) {
             presentationSurface = IOSurfaceCreate(
                 (__bridge CFDictionaryRef)surfaceProperties);
@@ -6351,8 +6385,8 @@ static jlongArray run_iris_metal4_graph_frame(
                                            reason:@"presentation allocation failed"
                                          userInfo:nil];
           }
-          presentationWidth = (uint32_t)source.width;
-          presentationHeight = (uint32_t)source.height;
+          presentationWidth = (uint32_t)sourceWidth;
+          presentationHeight = (uint32_t)sourceHeight;
           retained.push_back({UINT32_MAX, presentationTexture});
           presentationTextureRetained = true;
         }
@@ -7055,7 +7089,7 @@ static jlongArray run_iris_metal4_graph_frame(
           profileBarrierCalls++;
           [encoder copyFromTexture:source
                        sourceSlice:0
-                       sourceLevel:0
+                       sourceLevel:presentationSourceMip
                       sourceOrigin:MTLOriginMake(0, 0, 0)
                         sourceSize:MTLSizeMake(presentationWidth,
                                              presentationHeight, 1)
