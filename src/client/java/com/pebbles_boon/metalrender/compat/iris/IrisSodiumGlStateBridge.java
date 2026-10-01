@@ -61,6 +61,10 @@ public final class IrisSodiumGlStateBridge {
       return;
     }
     IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
+    // Persistent Sodium staging mappings can be written without an explicit
+    // flush before the copy. Refresh the source mapping before taking the
+    // mirror snapshot so region-arena uploads contain current mesh bytes.
+    refresh(source.handle());
     long sourceGeneration = mirror.generation(source.handle());
     var snapshot = mirror.snapshot(source.handle(), sourceGeneration,
         readOffset, bytes).orElse(null);
