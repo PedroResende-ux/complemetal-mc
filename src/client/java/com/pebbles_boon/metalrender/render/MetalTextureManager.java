@@ -396,12 +396,4 @@ public final class MetalTextureManager {
     markAtlasDirty();
   }
 
-  /**
-   * Accessor for the private 1.21.1 LightTexture#lightTexture DynamicTexture.
-   */
-  @org.spongepowered.asm.mixin.Mixin(LightTexture.class)
-  public interface AccessorLightTexture {
-    @org.spongepowered.asm.mixin.gen.Accessor("lightTexture")
-    DynamicTexture complemetal$getLightTexture();
-  }
 }
