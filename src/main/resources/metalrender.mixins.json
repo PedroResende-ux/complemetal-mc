@@ -20,7 +20,8 @@
     "accessor.AccessorLightTexture",
     "lwjgl.GL11CMixin",
     "lwjgl.GL15CMixin",
-    "lwjgl.GL30CMixin"
+    "lwjgl.GL30CMixin",
+    "lwjgl.GL33CMixin"
   ],
   "injectors": {
     "defaultRequire": 1
