@@ -3,6 +3,7 @@ package com.pebbles_boon.metalrender.compat.iris;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.IntBuffer;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -13,6 +14,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import org.lwjgl.opengl.GL20C;
+import org.lwjgl.opengl.GL43C;
+import org.lwjgl.system.MemoryStack;
 
 /**
  * Bounded render-thread capture bridge for unique Iris GL pipeline variants.
@@ -337,6 +341,27 @@ public final class IrisPipelineStateCapture {
 
   public void dispatch() {
     dispatch(new IrisExecutionCommand.UnknownDispatch());
+  }
+
+  private IrisExecutionCommand.Dispatch captureDispatchCommand(
+      int groupsX, int groupsY, int groupsZ) {
+    int program = currentGlProgram;
+    if (program <= 0) {
+      throw new IllegalArgumentException("compute dispatch has no program");
+    }
+    try (MemoryStack stack = MemoryStack.stackPush()) {
+      IntBuffer workgroup = stack.mallocInt(3);
+      GL20C.glGetProgramiv(program, GL43C.GL_COMPUTE_WORK_GROUP_SIZE,
+          workgroup);
+      int localX = workgroup.get(0);
+      int localY = workgroup.get(1);
+      int localZ = workgroup.get(2);
+      return new IrisExecutionCommand.Dispatch(groupsX, groupsY, groupsZ,
+          localX, localY, localZ);
+    } catch (RuntimeException failure) {
+      throw new IllegalArgumentException(
+          "compute workgroup size unavailable", failure);
+    }
   }
 
   public void dispatch(IrisExecutionCommand command) {
