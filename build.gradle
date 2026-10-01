@@ -59,7 +59,7 @@ neoForge {
                 vmArg "-Dmetalrender.experimental.irisMetalPipeline=true"
                 vmArg "-Dmetalrender.experimental.irisMetalTranslation=true"
             }
-            if (project.hasProperty('irisGraph')) {
+            if (project.hasProperty('irisGraph') || project.hasProperty('irisGraphOwnership')) {
                 vmArg "-Dmetalrender.experimental.irisMetalPipeline=true"
                 vmArg "-Dmetalrender.experimental.irisMetalTranslation=true"
                 vmArg "-Dmetalrender.experimental.irisMetalLibraryValidation=true"
