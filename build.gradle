@@ -69,10 +69,6 @@ neoForge {
     }
 }
 
-configurations {
-    runtimeClasspath.extendsFrom localRuntime
-}
-
 sourceSets {
     test {
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
@@ -87,10 +83,6 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.withType(Test).configureEach {
     useJUnitPlatform()
-}
-
-tasks.named("compileTestJava") {
-    dependsOn tasks.named("compileClientJava")
 }
 
 tasks.withType(AbstractArchiveTask).configureEach {
