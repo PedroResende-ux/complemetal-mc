@@ -215,8 +215,7 @@ public final class IrisRenderGraphCapture {
 
   public synchronized boolean memoryBarrier(int bits) {
     if (current != null && bits >= 0) {
-      add(new RawBarrier(phase, bits));
-      return true;
+      return add(new RawBarrier(phase, bits));
     }
     return false;
   }
@@ -265,8 +264,7 @@ public final class IrisRenderGraphCapture {
       writes = unresolved == null ? List.of() : List.of(unresolved);
     }
     if (!reads.isEmpty() || !writes.isEmpty()) {
-      add(new RawTransfer(phase, reads, writes, command));
-      return true;
+      return add(new RawTransfer(phase, reads, writes, command));
     }
     return false;
   }
@@ -298,8 +296,7 @@ public final class IrisRenderGraphCapture {
           : new IrisTransferCommand.CopyTexSubImage2D(sourceFramebuffer,
               sourceTexture, destination.handle(), target, level,
               destinationX, destinationY, sourceX, sourceY, width, height);
-      add(new RawTransfer(phase, reads, List.of(destination), command));
-      return true;
+      return add(new RawTransfer(phase, reads, List.of(destination), command));
     }
     return false;
   }
@@ -389,11 +386,13 @@ public final class IrisRenderGraphCapture {
     }
     RawResource resource = texture(texture);
     if (resource != null) {
-      add(new RawTransfer(phase, List.of(resource), List.of(resource),
+      boolean added = add(new RawTransfer(phase, List.of(resource), List.of(resource),
           new IrisTransferCommand.GenerateMipmaps(resource.handle(),
               target)));
-      captureDiagnosticGeneratedMip(resource.handle(), texture, target);
-      return true;
+      if (added) {
+        captureDiagnosticGeneratedMip(resource.handle(), texture, target);
+      }
+      return added;
     }
     return false;
   }
@@ -479,8 +478,7 @@ public final class IrisRenderGraphCapture {
     }
     IrisClearCommand command = IrisClearCommand.colorFloat(resource.handle(),
         0, red, green, blue, alpha, region);
-    add(new RawClear(phase, command, List.of(resource)));
-    return true;
+    return add(new RawClear(phase, command, List.of(resource)));
   }
 
   public synchronized boolean clearDepthTexture(int texture, double depth,
@@ -546,10 +544,9 @@ public final class IrisRenderGraphCapture {
           continue;
         }
         colorObserved = true;
-        add(new RawClear(phase, IrisClearCommand.colorFloat(handle, 0,
+        captured |= add(new RawClear(phase, IrisClearCommand.colorFloat(handle, 0,
             legacyClearRed, legacyClearGreen, legacyClearBlue,
             legacyClearAlpha, Optional.empty()), List.of(resource)));
-        captured = true;
       }
       complete &= colorObserved;
     }
@@ -586,8 +583,7 @@ public final class IrisRenderGraphCapture {
     IrisClearCommand command = depth
         ? IrisClearCommand.depth(handle, 1.0, Optional.empty())
         : IrisClearCommand.stencil(handle, 0);
-    add(new RawClear(phase, command, List.of(resource)));
-    return depth || stencil;
+    return add(new RawClear(phase, command, List.of(resource)));
   }
 
   private boolean clearFramebuffer(int framebuffer,
@@ -602,8 +598,7 @@ public final class IrisRenderGraphCapture {
       writes = unresolved == null ? List.of() : List.of(unresolved);
     }
     if (!writes.isEmpty()) {
-      add(new RawClear(phase, command, writes));
-      return true;
+      return add(new RawClear(phase, command, writes));
     }
     return false;
   }
@@ -846,17 +841,20 @@ public final class IrisRenderGraphCapture {
     return Optional.empty();
   }
 
-  private void add(RawEvent event) {
-    if (current.events.size() >= MAX_EVENTS_PER_FRAME) {
-      current.overflowed = true;
-      return;
+  private boolean add(RawEvent event) {
+    if (current == null || current.events.size() >= MAX_EVENTS_PER_FRAME) {
+      if (current != null) {
+        current.overflowed = true;
+      }
+      return false;
     }
     if (!(event instanceof RawDraw) && event.equals(current.lastSignature)) {
-      return;
+      return true;
     }
     current.events.add(event);
     current.lastSignature = event instanceof RawDraw ? null : event;
     current.phases.add(event.phase());
+    return true;
   }
 
   private void addTexture(List<RawResource> resources, int name) {
