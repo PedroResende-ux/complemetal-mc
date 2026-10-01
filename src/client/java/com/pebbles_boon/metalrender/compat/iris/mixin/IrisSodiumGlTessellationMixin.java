@@ -17,7 +17,7 @@ import org.spongepowered.asm.mixin.injection.Redirect;
     remap = false)
 public abstract class IrisSodiumGlTessellationMixin {
   @Redirect(method = "bindAttributes", at = @At(value = "INVOKE",
-      target = "Lorg/lwjgl/opengl/GL30C;glVertexAttribIPointer(IIIII)V"),
+      target = "Lorg/lwjgl/opengl/GL30C;glVertexAttribIPointer(IIIIJ)V"),
       require = 0, remap = false)
   private void metalrender$integerAttribute(int index, int size, int type,
       int stride, long pointer) {
@@ -27,7 +27,7 @@ public abstract class IrisSodiumGlTessellationMixin {
   }
 
   @Redirect(method = "bindAttributes", at = @At(value = "INVOKE",
-      target = "Lorg/lwjgl/opengl/GL20C;glVertexAttribPointer(IIZIZIJ)V"),
+      target = "Lorg/lwjgl/opengl/GL20C;glVertexAttribPointer(IIIZIJ)V"),
       require = 0, remap = false)
   private void metalrender$attribute(int index, int size, int type,
       boolean normalized, int stride, long pointer) {
