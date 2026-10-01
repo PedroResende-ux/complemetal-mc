@@ -46,7 +46,7 @@ public abstract class WorldRendererTerrainMixin {
       return;
     }
 
-    if (!MetalRenderHookState.isFramePreparedForTesting()) {
+    if (!MetalRenderHookState.isFramePrepared()) {
       return;
     }
 
