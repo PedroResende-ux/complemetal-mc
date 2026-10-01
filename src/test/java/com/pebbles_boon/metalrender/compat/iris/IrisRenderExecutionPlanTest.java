@@ -33,6 +33,15 @@ final class IrisRenderExecutionPlanTest {
   }
 
   @Test
+  void doesNotRejectLegacyIndirectDispatchMarker() {
+    IrisRenderExecutionPlan plan = plan(
+        new IrisExecutionCommand.IndirectDispatch(0), List.of());
+    assertTrue(plan.structurallyComplete());
+    assertFalse(plan.structuralBlockers().contains(
+        "indirect-buffer-mirroring-required"));
+  }
+
+  @Test
   void reportsReplayBlockersWithoutInventingMissingData() {
     IrisRenderGraph.Resource incomplete = new IrisRenderGraph.Resource(0,
         IrisRenderGraph.ResourceKind.TEXTURE, "runtime-texture", 0);
