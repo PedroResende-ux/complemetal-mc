@@ -76,7 +76,7 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
               offsets,
               counts,
               bases,
-              IrisExecutionCommand.Source.UNSPECIFIED));
+              IrisExecutionCommand.Source.SODIUM_COMMAND_LIST));
 
       if (pending.isPresent()
           && IrisTranslationCoordinator.tryFullGraphCutover(
