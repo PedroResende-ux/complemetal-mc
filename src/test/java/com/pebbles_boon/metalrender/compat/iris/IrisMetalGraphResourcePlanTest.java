@@ -54,6 +54,54 @@ final class IrisMetalGraphResourcePlanTest {
   }
 
   @Test
+  void marksFullSurfaceMsaaColorResolveResourcesAsRenderTargets() {
+    ResourceHandle source = new ResourceHandle(ResourceKind.TEXTURE,
+        51, 8, 7);
+    ResourceHandle destination = new ResourceHandle(ResourceKind.TEXTURE,
+        52, 9, 7);
+    IrisRenderGraph.Resource sourceResource = new IrisRenderGraph.Resource(
+        0, IrisRenderGraph.ResourceKind.TEXTURE, "rgba8-unorm", 4,
+        64, 64, 1, 1);
+    IrisRenderGraph.Resource destinationResource =
+        new IrisRenderGraph.Resource(1, IrisRenderGraph.ResourceKind.TEXTURE,
+            "rgba8-unorm", 1, 64, 64, 1, 1);
+    IrisRenderGraph.ResourceUse read = new IrisRenderGraph.ResourceUse(0,
+        IrisRenderGraph.Access.READ);
+    IrisRenderGraph.ResourceUse write = new IrisRenderGraph.ResourceUse(1,
+        IrisRenderGraph.Access.WRITE);
+    IrisRenderGraph.Node blit = new IrisRenderGraph.Node(0,
+        IrisRenderGraph.NodeKind.BLIT, IrisRenderGraph.Phase.COMPOSITE,
+        "0".repeat(64), "0".repeat(64), 0, List.of(read, write));
+    IrisRenderGraph graph = new IrisRenderGraph(
+        List.of(sourceResource, destinationResource), List.of(blit), List.of());
+    IrisTransferCommand command = new IrisTransferCommand.BlitFramebuffer(
+        new ResourceHandle(ResourceKind.FRAMEBUFFER, 61, 1, 7),
+        new ResourceHandle(ResourceKind.FRAMEBUFFER, 62, 1, 7),
+        0, 0, 64, 64, 0, 0, 64, 64,
+        IrisTransferCommand.GL_COLOR_BUFFER_BIT,
+        IrisTransferCommand.GL_NEAREST);
+    IrisRenderExecutionPlan plan = new IrisRenderExecutionPlan(graph,
+        List.of(new IrisRenderExecutionPlan.TransferStep(0, 0,
+            IrisRenderGraph.NodeKind.BLIT, IrisRenderGraph.Phase.COMPOSITE,
+            List.of(read, write), command)),
+        List.of(new IrisRenderExecutionPlan.ResourceBinding(0, source),
+            new IrisRenderExecutionPlan.ResourceBinding(1, destination)));
+
+    IrisMetalGraphResourcePlan.Complete complete = assertInstanceOf(
+        IrisMetalGraphResourcePlan.Complete.class,
+        IrisMetalGraphResourcePlan.build(plan));
+
+    assertEquals(2, complete.plan().allocations().size());
+    assertEquals(IrisMetalGraphResourcePlan.USAGE_SHADER_READ
+        | IrisMetalGraphResourcePlan.USAGE_RENDER_TARGET,
+        complete.plan().allocations().get(0).usage());
+    assertEquals(IrisMetalGraphResourcePlan.USAGE_SHADER_READ
+        | IrisMetalGraphResourcePlan.USAGE_RENDER_TARGET
+        | IrisMetalGraphResourcePlan.USAGE_TRANSFER_DESTINATION,
+        complete.plan().allocations().get(1).usage());
+  }
+
+  @Test
   void failsClosedWhenTransientResourceIdentitiesAreMissing() {
     ResourceHandle target = new ResourceHandle(ResourceKind.TEXTURE,
         42, 5, 7);
