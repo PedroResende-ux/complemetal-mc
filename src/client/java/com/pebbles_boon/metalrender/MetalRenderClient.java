@@ -297,7 +297,7 @@ public class MetalRenderClient {
       return;
     }
     try {
-      mc.execute(() -> mc.gui.setScreen(new MetalRenderSettingsScreen(mc.gui.screen())));
+      mc.execute(() -> mc.setScreen(new MetalRenderSettingsScreen(mc.screen)));
       MetalLogger.info("settings screen opened");
     } catch (Exception e) {
       MetalLogger.warn("settings screen open failed: %s", e.getMessage());
