@@ -283,7 +283,7 @@ public final class NativeBridge {
   private static String implementationVersion() {
     String version = NativeBridge.class.getPackage().getImplementationVersion();
     if (version == null || version.isBlank()) {
-      version = fabricMetadataVersion();
+      version = neoforgeMetadataVersion();
     }
     if (version == null || version.isBlank()) {
       version = System.getProperty("metalrender.version", "development");
@@ -292,12 +292,11 @@ public final class NativeBridge {
   }
 
   /**
-   * Fabric's Knot class loader does not always expose JAR package manifest
-   * attributes through {@link Package}. Resolve the same version from loader
-   * metadata without adding a hard Fabric runtime dependency to the standalone
-   * packaged-payload smoke test.
+   * NeoForge does not always expose JAR package manifest attributes through
+   * {@link Package}. Resolve the same version from loader metadata without
+   * adding any native-runtime dependency to the packaged-payload smoke test.
    */
-  private static String fabricMetadataVersion() {
+  private static String neoforgeMetadataVersion() {
     try {
       return ModList.get().getModContainerById("complemetal")
           .map(container -> container.getModInfo().getVersion().toString())
