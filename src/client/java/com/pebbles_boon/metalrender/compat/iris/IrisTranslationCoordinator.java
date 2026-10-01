@@ -2798,7 +2798,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
 
   private boolean suppressFullGraphOperationInternal() {
     OwnershipFrame frame = ownershipFrame;
-    if (frame == null) {
+    if (frame == null || !renderGraphCapture.hasActiveFrame()) {
       return false;
     }
     frame.commandsSuppressed++;
