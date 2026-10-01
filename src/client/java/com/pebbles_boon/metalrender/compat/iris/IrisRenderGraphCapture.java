@@ -213,24 +213,26 @@ public final class IrisRenderGraphCapture {
     }
   }
 
-  public synchronized void memoryBarrier(int bits) {
+  public synchronized boolean memoryBarrier(int bits) {
     if (current != null && bits >= 0) {
       add(new RawBarrier(phase, bits));
+      return true;
     }
+    return false;
   }
 
-  public synchronized void blitFramebuffer(int source, int destination) {
-    blitFramebuffer(source, destination, GL_COLOR_BUFFER_BIT
+  public synchronized boolean blitFramebuffer(int source, int destination) {
+    return blitFramebuffer(source, destination, GL_COLOR_BUFFER_BIT
         | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
   }
 
-  public synchronized void blitFramebuffer(int source, int destination,
+  public synchronized boolean blitFramebuffer(int source, int destination,
       int mask) {
-    blitFramebuffer(source, destination, mask,
+    return blitFramebuffer(source, destination, mask,
         new IrisTransferCommand.Unknown(IrisRenderGraph.NodeKind.BLIT));
   }
 
-  public synchronized void blitFramebuffer(int source, int destination,
+  public synchronized boolean blitFramebuffer(int source, int destination,
       int sourceX0, int sourceY0, int sourceX1, int sourceY1,
       int destinationX0, int destinationY0,
       int destinationX1, int destinationY1, int mask, int filter) {
@@ -238,19 +240,19 @@ public final class IrisRenderGraphCapture {
     ResourceHandle destinationHandle = state.framebufferHandle(destination)
         .orElse(null);
     if (sourceHandle == null || destinationHandle == null) {
-      return;
+      return false;
     }
-    blitFramebuffer(source, destination, mask,
+    return blitFramebuffer(source, destination, mask,
         new IrisTransferCommand.BlitFramebuffer(sourceHandle,
             destinationHandle, sourceX0, sourceY0, sourceX1, sourceY1,
             destinationX0, destinationY0, destinationX1, destinationY1,
             mask, filter));
   }
 
-  private void blitFramebuffer(int source, int destination, int mask,
+  private boolean blitFramebuffer(int source, int destination, int mask,
       IrisTransferCommand command) {
     if (current == null) {
-      return;
+      return false;
     }
     List<RawResource> reads = framebufferTextures(source, mask);
     List<RawResource> writes = framebufferTextures(destination, mask);
@@ -264,14 +266,16 @@ public final class IrisRenderGraphCapture {
     }
     if (!reads.isEmpty() || !writes.isEmpty()) {
       add(new RawTransfer(phase, reads, writes, command));
+      return true;
     }
+    return false;
   }
 
-  public synchronized void copyTexture(int destinationTexture, int target,
+  public synchronized boolean copyTexture(int destinationTexture, int target,
       int level, int destinationX, int destinationY, int sourceX,
       int sourceY, int width, int height, int readBuffer) {
     if (current == null) {
-      return;
+      return false;
     }
     RawResource destination = texture(destinationTexture);
     ResourceHandle sourceFramebuffer = state.readFramebufferHandle()
@@ -295,16 +299,18 @@ public final class IrisRenderGraphCapture {
               sourceTexture, destination.handle(), target, level,
               destinationX, destinationY, sourceX, sourceY, width, height);
       add(new RawTransfer(phase, reads, List.of(destination), command));
+      return true;
     }
+    return false;
   }
 
-  public synchronized void copyBoundTexture(int target, int level,
+  public synchronized boolean copyBoundTexture(int target, int level,
       int internalFormat, int sourceX, int sourceY, int width, int height,
       int border, int readBuffer) {
     IrisGlResourceBindingSnapshot.TextureUnitBinding active =
         IrisGlResourceBindingTracker.global().activeTextureBinding(target);
     if (active == null || current == null) {
-      return;
+      return false;
     }
     RawResource destination = texture(active.texture());
     ResourceHandle sourceFramebuffer = state.readFramebufferHandle()
@@ -328,7 +334,9 @@ public final class IrisRenderGraphCapture {
               sourceTexture, destination.handle(), target, level,
               internalFormat, sourceX, sourceY, width, height, border);
       add(new RawTransfer(phase, reads, List.of(destination), command));
+      return true;
     }
+    return false;
   }
 
   private ResourceHandle framebufferCopyTexture(int framebuffer,
@@ -375,9 +383,9 @@ public final class IrisRenderGraphCapture {
         && !format.equals("runtime-texture") ? GL_COLOR_BUFFER_BIT : 0;
   }
 
-  public synchronized void generateMipmaps(int texture, int target) {
+  public synchronized boolean generateMipmaps(int texture, int target) {
     if (current == null) {
-      return;
+      return false;
     }
     RawResource resource = texture(texture);
     if (resource != null) {
@@ -385,7 +393,9 @@ public final class IrisRenderGraphCapture {
           new IrisTransferCommand.GenerateMipmaps(resource.handle(),
               target)));
       captureDiagnosticGeneratedMip(resource.handle(), texture, target);
+      return true;
     }
+    return false;
   }
 
   private void captureDiagnosticGeneratedMip(ResourceHandle handle,
@@ -410,12 +420,12 @@ public final class IrisRenderGraphCapture {
             current.diagnosticReplayTargets.put(handle, frame));
   }
 
-  public synchronized void clearNamedFramebufferFloat(int framebuffer,
+  public synchronized boolean clearNamedFramebufferFloat(int framebuffer,
       int buffer, int drawBuffer, float[] values) {
     Objects.requireNonNull(values, "values");
     ResourceHandle target = state.framebufferHandle(framebuffer).orElse(null);
     if (target == null) {
-      return;
+      return false;
     }
     IrisClearCommand command;
     if (buffer == IrisClearCommand.GL_COLOR && values.length >= 4) {
@@ -424,17 +434,17 @@ public final class IrisRenderGraphCapture {
     } else if (buffer == IrisClearCommand.GL_DEPTH && values.length >= 1) {
       command = IrisClearCommand.depthFloat(target, values[0]);
     } else {
-      return;
+      return false;
     }
-    clearFramebuffer(framebuffer, command);
+    return clearFramebuffer(framebuffer, command);
   }
 
-  public synchronized void clearNamedFramebufferSignedInt(int framebuffer,
+  public synchronized boolean clearNamedFramebufferSignedInt(int framebuffer,
       int buffer, int drawBuffer, int[] values) {
     Objects.requireNonNull(values, "values");
     ResourceHandle target = state.framebufferHandle(framebuffer).orElse(null);
     if (target == null) {
-      return;
+      return false;
     }
     IrisClearCommand command;
     if (buffer == IrisClearCommand.GL_COLOR && values.length >= 4) {
@@ -443,44 +453,46 @@ public final class IrisRenderGraphCapture {
     } else if (buffer == IrisClearCommand.GL_STENCIL && values.length >= 1) {
       command = IrisClearCommand.stencil(target, values[0]);
     } else {
-      return;
+      return false;
     }
-    clearFramebuffer(framebuffer, command);
+    return clearFramebuffer(framebuffer, command);
   }
 
-  public synchronized void clearNamedFramebufferUnsignedInt(int framebuffer,
+  public synchronized boolean clearNamedFramebufferUnsignedInt(int framebuffer,
       int buffer, int drawBuffer, int[] values) {
     Objects.requireNonNull(values, "values");
     ResourceHandle target = state.framebufferHandle(framebuffer).orElse(null);
     if (target == null || buffer != IrisClearCommand.GL_COLOR
         || values.length < 4) {
-      return;
+      return false;
     }
-    clearFramebuffer(framebuffer, IrisClearCommand.colorUnsignedInt(target,
+    return clearFramebuffer(framebuffer, IrisClearCommand.colorUnsignedInt(target,
         drawBuffer, java.util.Arrays.copyOf(values, 4)));
   }
 
-  public synchronized void clearColorTexture(int texture, float red,
+  public synchronized boolean clearColorTexture(int texture, float red,
       float green, float blue, float alpha, Optional<IrisClearCommand.Rect>
           region) {
     RawResource resource = texture(texture);
     if (current == null || resource == null) {
-      return;
+      return false;
     }
     IrisClearCommand command = IrisClearCommand.colorFloat(resource.handle(),
         0, red, green, blue, alpha, region);
     add(new RawClear(phase, command, List.of(resource)));
+    return true;
   }
 
-  public synchronized void clearDepthTexture(int texture, double depth,
+  public synchronized boolean clearDepthTexture(int texture, double depth,
       Optional<IrisClearCommand.Rect> region) {
     RawResource resource = texture(texture);
     if (current == null || resource == null) {
-      return;
+      return false;
     }
     IrisClearCommand command = IrisClearCommand.depth(resource.handle(),
         depth, region);
     add(new RawClear(phase, command, List.of(resource)));
+    return true;
   }
 
   /** Tracks the value consumed by the next legacy {@code glClear}. */
@@ -503,10 +515,11 @@ public final class IrisRenderGraphCapture {
    * texture attachments. An unresolved target invalidates only a full replay,
    * never normal OpenGL rendering.
    */
-  public synchronized void legacyClearBoundFramebuffer(int mask) {
+  public synchronized boolean legacyClearBoundFramebuffer(int mask) {
     if (current == null) {
-      return;
+      return false;
     }
+    boolean captured = false;
     IrisGlStateSnapshot snapshot = state.snapshotDraw(0x0004);
     boolean complete = true;
     if ((mask & GL_COLOR_BUFFER_BIT) != 0) {
@@ -536,20 +549,26 @@ public final class IrisRenderGraphCapture {
         add(new RawClear(phase, IrisClearCommand.colorFloat(handle, 0,
             legacyClearRed, legacyClearGreen, legacyClearBlue,
             legacyClearAlpha, Optional.empty()), List.of(resource)));
+        captured = true;
       }
       complete &= colorObserved;
     }
     if ((mask & GL_DEPTH_BUFFER_BIT) != 0) {
-      complete &= legacyAttachmentClear(snapshot.depthAttachment(),
+      boolean depthCaptured = legacyAttachmentClear(snapshot.depthAttachment(),
           true, false);
+      complete &= depthCaptured;
+      captured |= depthCaptured;
     }
     if ((mask & GL_STENCIL_BUFFER_BIT) != 0) {
-      complete &= legacyAttachmentClear(snapshot.stencilAttachment(),
-          false, true);
+      boolean stencilCaptured = legacyAttachmentClear(
+          snapshot.stencilAttachment(), false, true);
+      complete &= stencilCaptured;
+      captured |= stencilCaptured;
     }
     if (!complete && current.fullReplay) {
       current.fullReplayComplete = false;
     }
+    return captured;
   }
 
   private boolean legacyAttachmentClear(
@@ -571,10 +590,10 @@ public final class IrisRenderGraphCapture {
     return depth || stencil;
   }
 
-  private void clearFramebuffer(int framebuffer,
+  private boolean clearFramebuffer(int framebuffer,
       IrisClearCommand command) {
     if (current == null) {
-      return;
+      return false;
     }
     List<RawResource> writes = framebufferTexturesForClear(framebuffer,
         command.buffer(), command.drawBuffer());
@@ -584,7 +603,9 @@ public final class IrisRenderGraphCapture {
     }
     if (!writes.isEmpty()) {
       add(new RawClear(phase, command, writes));
+      return true;
     }
+    return false;
   }
 
   public synchronized void endFrame() {
