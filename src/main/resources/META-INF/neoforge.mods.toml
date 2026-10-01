@@ -11,6 +11,7 @@ displayName="Complemetal"
 authors="daniiarkg, pebbles_boon"
 description='''Apple Silicon Metal renderer for Iris shaders with a strict fail-open OpenGL fallback.'''
 logoFile="assets/complemetal/icon.png"
+clientSideOnly=true
 
 [[dependencies.complemetal]]
 modId="minecraft"
