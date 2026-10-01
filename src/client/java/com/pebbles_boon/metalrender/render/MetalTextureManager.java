@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender.render;
 
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import com.pebbles_boon.metalrender.util.MetalLogger;
+import com.pebbles_boon.metalrender.sodium.mixins.accessor.AccessorLightTexture;
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.client.Minecraft;
