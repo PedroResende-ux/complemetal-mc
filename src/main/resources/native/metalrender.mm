@@ -5046,6 +5046,7 @@ struct IrisMetal4GraphFrameOperation {
   uint32_t secondResource = 0;
   uint32_t aspect = 0;
   uint32_t valueKind = 0;
+  uint32_t mipLevel = 0;
   std::vector<uint64_t> rawValues;
   bool hasRegion = false;
   int32_t x = 0;
@@ -5421,6 +5422,7 @@ static bool parse_iris_metal4_graph_frame(
   }
   for (auto &operation : result.operations) {
     operation.rawValues.clear();
+    operation.mipLevel = 0;
     operation.pipelineKey.clear();
     operation.replayPacket.clear();
     operation.borrowedReplayPacket = nullptr;
@@ -5441,6 +5443,10 @@ static bool parse_iris_metal4_graph_frame(
       uint32_t valueCount = 0;
       if (!reader.u32(operation.firstResource) ||
           resourceIds.find(operation.firstResource) == resourceIds.end() ||
+          (schema < kIrisMetal4GraphFrameSchema
+              ? (operation.mipLevel = 0, true)
+              : reader.u32(operation.mipLevel) &&
+                  operation.mipLevel <= 15) ||
           !reader.u32(operation.aspect) || operation.aspect > 3 ||
           !reader.u32(operation.valueKind) || operation.valueKind > 3 ||
           !reader.u32(valueCount) || valueCount == 0 || valueCount > 4) {
@@ -6630,13 +6636,26 @@ static jlongArray run_iris_metal4_graph_frame(
             }
             MTL4RenderPassDescriptor *pass =
                 [[MTL4RenderPassDescriptor alloc] init];
+            if (operation.mipLevel >= target.mipmapLevelCount) {
+              status = 0;
+              reason = kIrisGraphReasonClearTextureMissing;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph clear mip level unavailable"
+                           userInfo:nil];
+            }
+            NSUInteger targetWidth = std::max((NSUInteger)1,
+                target.width >> operation.mipLevel);
+            NSUInteger targetHeight = std::max((NSUInteger)1,
+                target.height >> operation.mipLevel);
             pass.defaultRasterSampleCount = target.sampleCount;
-            pass.renderTargetWidth = target.width;
-            pass.renderTargetHeight = target.height;
+            pass.renderTargetWidth = targetWidth;
+            pass.renderTargetHeight = targetHeight;
             if (color) {
               MTLRenderPassColorAttachmentDescriptor *attachment =
                   pass.colorAttachments[0];
               attachment.texture = target;
+              attachment.level = operation.mipLevel;
               attachment.loadAction = MTLLoadActionClear;
               attachment.storeAction = MTLStoreActionStore;
               attachment.clearColor = MTLClearColorMake(
@@ -6651,6 +6670,7 @@ static jlongArray run_iris_metal4_graph_frame(
             }
             if (depth) {
               pass.depthAttachment.texture = target;
+              pass.depthAttachment.level = operation.mipLevel;
               pass.depthAttachment.loadAction = MTLLoadActionClear;
               pass.depthAttachment.storeAction = MTLStoreActionStore;
               pass.depthAttachment.clearDepth =
@@ -6659,6 +6679,7 @@ static jlongArray run_iris_metal4_graph_frame(
             }
             if (stencil) {
               pass.stencilAttachment.texture = target;
+              pass.stencilAttachment.level = operation.mipLevel;
               pass.stencilAttachment.loadAction = MTLLoadActionClear;
               pass.stencilAttachment.storeAction = MTLStoreActionStore;
               size_t index = operation.aspect == 3 ? 1 : 0;
