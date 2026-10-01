@@ -21,7 +21,8 @@
     "lwjgl.GL11CMixin",
     "lwjgl.GL15CMixin",
     "lwjgl.GL30CMixin",
-    "lwjgl.GL33CMixin"
+    "lwjgl.GL33CMixin",
+    "lwjgl.GL46CMixin"
   ],
   "injectors": {
     "defaultRequire": 1
