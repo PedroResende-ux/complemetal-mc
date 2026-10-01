@@ -218,7 +218,6 @@ public final class IrisPipelineStateCapture {
       return new PreparedDirectCapture(command, inputs);
     }
 
-    long indexRelative = minIndexOffset - indexSlice.offsetBytes();
     long indexLength = maxIndexEnd - minIndexOffset;
     Optional<IrisGlBufferMirror.BufferSnapshot> indexSnapshot =
         IrisGlBufferMirror.global().snapshot(
