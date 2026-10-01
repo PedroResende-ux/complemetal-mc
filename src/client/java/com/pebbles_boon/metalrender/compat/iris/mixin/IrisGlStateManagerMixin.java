@@ -49,7 +49,8 @@ public abstract class IrisGlStateManagerMixin {
   }
 
   @Inject(method = "_clear", at = @At("HEAD"), cancellable = true)
-  private static void metalrender$clear(int mask, CallbackInfo ci) {
+  private static void metalrender$clear(int mask, boolean checkError,
+      CallbackInfo ci) {
     IrisRenderGraphCapture.global().legacyClearBoundFramebuffer(mask);
     if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
@@ -197,6 +198,18 @@ public abstract class IrisGlStateManagerMixin {
     metalrender$state().depthMask(enabled);
   }
 
+  /** Minecraft 1.21.1 exposes blend enable as a global state. */
+  @Inject(method = "_enableBlend", at = @At("TAIL"), require = 0)
+  private static void metalrender$enableBlendGlobal(CallbackInfo ci) {
+    metalrender$state().capability(IrisGlStateTracker.GL_BLEND, true);
+  }
+
+  /** Minecraft 1.21.1 exposes blend disable as a global state. */
+  @Inject(method = "_disableBlend", at = @At("TAIL"), require = 0)
+  private static void metalrender$disableBlendGlobal(CallbackInfo ci) {
+    metalrender$state().capability(IrisGlStateTracker.GL_BLEND, false);
+  }
+
   @Inject(method = "_enableBlend", at = @At("TAIL"))
   private static void metalrender$enableBlend(int index, CallbackInfo ci) {
     if (index == 0) {
@@ -224,6 +237,13 @@ public abstract class IrisGlStateManagerMixin {
       CallbackInfo ci) {
     metalrender$state().blendFuncSeparate(sourceRgb, destinationRgb,
         sourceAlpha, destinationAlpha);
+  }
+
+  /** Minecraft 1.21.1 stores one blend equation for both RGB and alpha. */
+  @Inject(method = "_blendEquation", at = @At("TAIL"), require = 0)
+  private static void metalrender$blendEquation(int equation,
+      CallbackInfo ci) {
+    metalrender$state().blendEquationSeparate(equation, equation);
   }
 
   @Inject(method = {"_blendEquationSeparate", "glBlendEquationSeparate"},
@@ -265,6 +285,13 @@ public abstract class IrisGlStateManagerMixin {
   private static void metalrender$polygonOffset(float factor, float units,
       CallbackInfo ci) {
     metalrender$state().polygonOffset(factor, units);
+  }
+
+  /** Minecraft 1.21.1 exposes a single four-boolean color mask. */
+  @Inject(method = "_colorMask(ZZZZ)V", at = @At("TAIL"), require = 0)
+  private static void metalrender$colorMaskGlobal(boolean red, boolean green,
+      boolean blue, boolean alpha, CallbackInfo ci) {
+    metalrender$state().colorMask(red, green, blue, alpha);
   }
 
   @Inject(method = "_colorMask(I)V", at = @At("TAIL"))
