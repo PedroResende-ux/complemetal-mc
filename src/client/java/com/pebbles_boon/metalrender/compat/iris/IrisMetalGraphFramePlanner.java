@@ -772,9 +772,6 @@ public final class IrisMetalGraphFramePlanner {
       }
       if (candidates.size() == 1) {
         int resourceId = candidates.getFirst();
-        if (targets.contains(resourceId)) {
-          throw unsupported("graph-frame-render-feedback-unimplemented");
-        }
         Resource resource = plan.graph().resources().get(resourceId);
         IrisGlTextureMirror.TextureSnapshot captured = pipeline.pending()
             .replayTextures().textures().get(glName);
