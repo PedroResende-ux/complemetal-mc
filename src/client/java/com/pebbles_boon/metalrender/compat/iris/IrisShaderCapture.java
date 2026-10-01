@@ -2,6 +2,7 @@ package com.pebbles_boon.metalrender.compat.iris;
 
 import com.mojang.blaze3d.vertex.VertexFormat;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -14,6 +15,14 @@ public final class IrisShaderCapture {
 
   private static final IrisShaderCaptureQueue QUEUE =
       IrisShaderCaptureQueue.createDefault();
+
+  /**
+   * Sodium builds all terrain programs before Iris publishes the final
+   * FormatAnalyzer-derived ChunkVertexType. Keep linked terrain programs out
+   * of the identity queue until that format is authoritative.
+   */
+  private static final ConcurrentHashMap<Integer, DeferredSodiumProgram>
+      DEFERRED_SODIUM_PROGRAMS = new ConcurrentHashMap<>();
   private static final AtomicLong CAPTURE_FAILURES = new AtomicLong();
   private static final int CAPTURE_FAILURE_REASON_CAPACITY = 32;
   private static final ConcurrentSkipListSet<String> CAPTURE_FAILURE_REASONS =
@@ -38,6 +47,69 @@ public final class IrisShaderCapture {
     }
     captureGraphicsLink(QUEUE, name, vertex, geometry, tessControl,
         tessEvaluation, fragment);
+  }
+
+  public static void deferLinkedSodiumGraphicsProgram(int glProgram,
+      String name, String vertex, String geometry, String tessControl,
+      String tessEvaluation, String fragment, boolean fallback) {
+    if (!isEnabled()) {
+      return;
+    }
+    if (glProgram <= 0 || name == null || name.isBlank()) {
+      return;
+    }
+    try {
+      DEFERRED_SODIUM_PROGRAMS.put(glProgram, new DeferredSodiumProgram(
+          glProgram, name, vertex, geometry, tessControl, tessEvaluation,
+          fragment, fallback));
+    } catch (RuntimeException error) {
+      recordCaptureFailure(error);
+    }
+  }
+
+  /**
+   * Must run on the GL/render thread after SodiumPrograms has established
+   * WorldRenderingSettings.INSTANCE's final vertex format.
+   */
+  public static void finalizeDeferredSodiumPrograms() {
+    if (!isEnabled() || DEFERRED_SODIUM_PROGRAMS.isEmpty()) {
+      return;
+    }
+    net.irisshaders.iris.shaderpack.materialmap.WorldRenderingSettings
+        settings =
+        net.irisshaders.iris.shaderpack.materialmap.WorldRenderingSettings
+            .INSTANCE;
+    net.caffeinemc.mods.sodium.client.render.chunk.vertex.format.ChunkVertexType
+        vertexType = settings.getVertexFormat();
+    if (vertexType == null) {
+      return;
+    }
+
+    for (DeferredSodiumProgram pending : DEFERRED_SODIUM_PROGRAMS.values()) {
+      if (!DEFERRED_SODIUM_PROGRAMS.remove(pending.glProgram(), pending)) {
+        continue;
+      }
+      try {
+        IrisFinalShaderProgram program =
+            IrisFinalShaderProgram.fromGraphicsLink(
+                pending.name(), pending.vertex(), pending.geometry(),
+                pending.tessControl(), pending.tessEvaluation(),
+                pending.fragment());
+        IrisVertexLayoutCapture.Layout layout =
+            IrisVertexLayoutCapture.captureLinkedSodium(
+                pending.glProgram(), vertexType);
+        layout = IrisVertexLayoutCapture.resolveShaderInputFormats(
+            pending.vertex(), layout);
+        program = program.withVertexShaderInputs(layout.shaderInputs());
+        enqueueRegistered(program, pending.glProgram(),
+            new IrisProgramIdentityRegistry.ProgramDescriptor(
+                IrisPipelineState.PassKind.LINKED_GRAPHICS,
+                pending.name(), pending.fallback(), layout.buffers(),
+                layout.attributes()));
+      } catch (RuntimeException error) {
+        recordCaptureFailure(error);
+      }
+    }
   }
 
   public static void captureLinkedGraphicsProgram(int glProgram, String name,
@@ -133,6 +205,7 @@ public final class IrisShaderCapture {
   }
 
   public static void deleteProgram(int glProgram) {
+    DEFERRED_SODIUM_PROGRAMS.remove(glProgram);
     IrisPipelineStateCapture.global().deleteProgram(glProgram);
     IrisProgramIdentityRegistry.global().delete(glProgram);
   }
@@ -151,6 +224,12 @@ public final class IrisShaderCapture {
       registry.delete(glProgram);
       IrisPipelineStateCapture.global().deleteProgram(glProgram);
     }
+  }
+
+  private record DeferredSodiumProgram(
+      int glProgram, String name, String vertex, String geometry,
+      String tessControl, String tessEvaluation, String fragment,
+      boolean fallback) {
   }
 
   static void captureGraphicsLink(IrisShaderCaptureQueue queue, String name,
