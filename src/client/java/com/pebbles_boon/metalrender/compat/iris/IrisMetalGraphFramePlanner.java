@@ -229,7 +229,8 @@ public final class IrisMetalGraphFramePlanner {
         Map<Integer, Integer> externalBuffers = inputBuffers.register(
             resolved.requiredBufferImages());
         Map<Integer, Integer> externalTextures = inputTextures.register(
-            resolved.requiredTextures(), overrides.keySet());
+            resolved.requiredTextures(), graphTextureInputExclusions(
+                overrides, initialBootstraps));
         appendInitialTextureBootstraps(operations, initialBootstraps,
             externalTextures);
         initialBootstraps.keySet().forEach(resourceId -> {
@@ -280,7 +281,8 @@ public final class IrisMetalGraphFramePlanner {
       Map<Integer, Integer> externalBuffers = inputBuffers.register(
           resolved.requiredBufferImages());
       Map<Integer, Integer> externalTextures = inputTextures.register(
-          resolved.requiredTextures(), overrides.keySet());
+          resolved.requiredTextures(), graphTextureInputExclusions(
+              overrides, initialBootstraps));
       appendInitialTextureBootstraps(operations, initialBootstraps,
           externalTextures);
       initialBootstraps.keySet().forEach(resourceId -> {
@@ -1025,6 +1027,16 @@ public final class IrisMetalGraphFramePlanner {
       }
     }
     return Map.copyOf(result);
+  }
+
+  private static Set<Integer> graphTextureInputExclusions(
+      Map<Integer, Integer> overrides,
+      Map<Integer, IrisGlTextureMirror.TextureSnapshot> bootstraps) {
+    HashSet<Integer> exclusions = new HashSet<>(overrides.keySet());
+    for (IrisGlTextureMirror.TextureSnapshot snapshot : bootstraps.values()) {
+      exclusions.remove(snapshot.texture());
+    }
+    return Set.copyOf(exclusions);
   }
 
   private static void appendInitialTextureBootstraps(
