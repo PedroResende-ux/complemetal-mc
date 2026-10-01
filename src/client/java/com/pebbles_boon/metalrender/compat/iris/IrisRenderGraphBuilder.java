@@ -11,6 +11,7 @@ import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraph.ResourceUse;
 import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture.RawBarrier;
 import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture.RawClear;
 import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture.RawDraw;
+import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture.RawDispatch;
 import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture.RawEvent;
 import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture.RawResource;
 import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture.RawTransfer;
@@ -48,7 +49,15 @@ public final class IrisRenderGraphBuilder {
     for (RawEvent event : frame.events()) {
       ResolvedNode resolved;
       if (event instanceof RawDraw draw) {
-        BuildNodeResult result = draw(draw, resources);
+        BuildNodeResult result = pipeline(draw.pending(), draw.phase(),
+            draw.reads(), draw.writes(), resources);
+        if (result instanceof UnsupportedNode unsupported) {
+          return new Unsupported(unsupported.reason());
+        }
+        resolved = ((CompleteNode) result).node();
+      } else if (event instanceof RawDispatch dispatch) {
+        BuildNodeResult result = pipeline(dispatch.pending(), dispatch.phase(),
+            dispatch.reads(), dispatch.writes(), resources);
         if (result instanceof UnsupportedNode unsupported) {
           return new Unsupported(unsupported.reason());
         }
@@ -81,6 +90,9 @@ public final class IrisRenderGraphBuilder {
       if (event instanceof RawDraw draw) {
         executionSteps.add(new IrisRenderExecutionPlan.PipelineStep(sequence,
             nodeId, resolved.kind(), resolved.phase(), draw.pending()));
+      } else if (event instanceof RawDispatch dispatch) {
+        executionSteps.add(new IrisRenderExecutionPlan.PipelineStep(sequence,
+            nodeId, resolved.kind(), resolved.phase(), dispatch.pending()));
       } else if (event instanceof RawClear clear) {
         executionSteps.add(new IrisRenderExecutionPlan.ClearStep(sequence,
             nodeId, resolved.phase(), clear.command(), resolved.uses()));
@@ -112,9 +124,13 @@ public final class IrisRenderGraphBuilder {
             resourceBindings));
   }
 
-  private BuildNodeResult draw(RawDraw draw,
+  private BuildNodeResult pipeline(
+      IrisPipelineStateCapture.PendingState pending,
+      IrisRenderGraph.Phase phase,
+      List<RawResource> reads,
+      List<RawResource> writes,
       LinkedHashMap<ResourceHandle, MutableResource> resources) {
-    IrisProgramIdentityRegistry.ResolvedProgram program = draw.pending()
+    IrisProgramIdentityRegistry.ResolvedProgram program = pending
         .registration().resolved().orElse(null);
     if (program == null) {
       return new UnsupportedNode("graph-program-identity-unresolved");
@@ -128,22 +144,20 @@ public final class IrisRenderGraphBuilder {
           "graph-specialization-" + unsupported.reason());
     }
     IrisPipelineStateMapper.Result mapping = IrisPipelineStateMapper.map(
-        draw.pending().snapshot(), program,
-        ((IrisSpecializationStateReader.Complete) specialization)
-            .constants());
+        pending.snapshot(), program,
+        ((IrisSpecializationStateReader.Complete) specialization).constants());
     if (mapping instanceof IrisPipelineStateMapper.Unsupported unsupported) {
       return new UnsupportedNode("graph-pipeline-" + unsupported.reason());
     }
     IrisPipelineState state =
         ((IrisPipelineStateMapper.Complete) mapping).state();
-    List<ResourceUse> uses = uses(draw.reads(), draw.writes(), resources);
-    NodeKind kind = draw.pending().snapshot().operation()
+    NodeKind kind = pending.snapshot().operation()
         == IrisGlStateSnapshot.Operation.DISPATCH
         ? NodeKind.DISPATCH : NodeKind.DRAW;
-    return new CompleteNode(new ResolvedNode(kind, draw.phase(),
+    return new CompleteNode(new ResolvedNode(kind, phase,
         program.shaderKey().sha256(),
         IrisPipelineStateKey.from(program.shaderKey(), state).sha256(),
-        0, uses));
+        0, uses(reads, writes, resources)));
   }
 
   private static ResolvedNode transfer(RawTransfer transfer,
