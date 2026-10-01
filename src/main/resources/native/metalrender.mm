@@ -9814,6 +9814,15 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
           feedbackDescriptor.sampleCount = 1;
           feedbackDescriptor.mipmapLevelCount = texture.mipmapLevelCount;
           feedbackDescriptor.usage = MTLTextureUsageShaderRead;
+          MTLSizeAndAlign feedbackSize =
+              [g_device heapTextureSizeAndAlignWithDescriptor:
+                  feedbackDescriptor];
+          if (feedbackSize.size == 0 ||
+              feedbackSize.size > kIrisShadowReplayMaximumTextureBytes) {
+            outcome = 0;
+            reason = kIrisGraphReasonDrawFeedbackSnapshotUnsupported;
+            return nullptr;
+          }
           id<MTLTexture> snapshot =
               [g_device newTextureWithDescriptor:feedbackDescriptor];
           if (!snapshot) {
