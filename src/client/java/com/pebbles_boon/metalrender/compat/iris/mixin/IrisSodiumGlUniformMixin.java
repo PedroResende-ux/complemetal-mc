@@ -10,6 +10,7 @@ import net.caffeinemc.mods.sodium.client.gl.shader.uniform.GlUniformMatrix4f;
 import org.joml.Matrix4fc;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -25,7 +26,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
     GlUniformMatrix4f.class
 }, remap = false)
 public abstract class IrisSodiumGlUniformMixin<T> {
-  @Shadow protected int index;
+  @Shadow @Final protected int index;
 
   @Unique
   private IrisGlResourceBindingTracker metalrender$tracker() {
