@@ -391,6 +391,9 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_drawElements", at = @At("RETURN"))
   private static void metalrender$drawElementsComplete(int mode, int count,
       int type, long indices, CallbackInfo ci) {
+    if (IrisGlCommandEncoderMixin.metalrender$isHighLevelDrawCaptureActive()) {
+      return;
+    }
     IrisVisualParityCapture.global().endDrawInvocation();
   }
 
@@ -432,6 +435,9 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_drawArrays", at = @At("RETURN"))
   private static void metalrender$drawArraysComplete(int mode, int first,
       int count, CallbackInfo ci) {
+    if (IrisGlCommandEncoderMixin.metalrender$isHighLevelDrawCaptureActive()) {
+      return;
+    }
     IrisVisualParityCapture.global().endDrawInvocation();
   }
 }
