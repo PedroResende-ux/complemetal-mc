@@ -59,6 +59,21 @@ neoForge {
                 vmArg "-Dmetalrender.experimental.irisMetalPipeline=true"
                 vmArg "-Dmetalrender.experimental.irisMetalTranslation=true"
             }
+            if (project.hasProperty('irisGraph')) {
+                vmArg "-Dmetalrender.experimental.irisMetalPipeline=true"
+                vmArg "-Dmetalrender.experimental.irisMetalTranslation=true"
+                vmArg "-Dmetalrender.experimental.irisMetalLibraryValidation=true"
+                vmArg "-Dmetalrender.experimental.irisMetalPipelineCompilation=true"
+                vmArg "-Dmetalrender.experimental.irisMetalShadowReplay=true"
+                vmArg "-Dmetalrender.experimental.irisMetalVisualParity=true"
+                vmArg "-Dmetalrender.experimental.irisMetalFinalCutover=false"
+                vmArg "-Dmetalrender.experimental.irisMetalGraphResources=true"
+                vmArg "-Dmetalrender.experimental.irisMetalGraphExecution=true"
+                vmArg "-Dmetalrender.experimental.irisMetalGraphOwnership=false"
+            }
+            if (project.hasProperty('irisGraphOwnership')) {
+                vmArg "-Dmetalrender.experimental.irisMetalGraphOwnership=true"
+            }
             vmArg "-Xmx8g"
             vmArg "-Xms2g"
             vmArg "-XX:+AlwaysPreTouch"
