@@ -114,10 +114,20 @@ public final class IrisRenderGraphCapture {
 
   public synchronized void draw(
       IrisPipelineStateCapture.PendingState pending) {
+    recordPipelineEvent(pending, true);
+  }
+
+  public synchronized void dispatch(
+      IrisPipelineStateCapture.PendingState pending) {
+    recordPipelineEvent(pending, false);
+  }
+
+  private void recordPipelineEvent(
+      IrisPipelineStateCapture.PendingState pending, boolean graphics) {
     if (current == null) {
       return;
     }
-    if (current.fullReplay) {
+    if (graphics && current.fullReplay) {
       String resourceAbortReason = fullReplayResourceAbortReason(
           pending.replayBuffers(), pending.replayTextures(),
           pending.replaySamplers());
@@ -126,9 +136,6 @@ public final class IrisRenderGraphCapture {
         current.preferFullReplayAbortReason(resourceAbortReason);
       }
       try {
-        // Buffer and texture capture tables are frame-local and immutable.
-        // Repeated draws reuse their entries, so charge the actual retained
-        // set instead of adding the same payload once per draw.
         current.fullReplayBytes = retainedFullReplayBytes(
             current.fullReplayBuffers, current.fullReplayTextures);
         if (current.fullReplayBytes > MAX_FULL_REPLAY_CAPTURE_BYTES) {
@@ -170,8 +177,6 @@ public final class IrisRenderGraphCapture {
         if (texture <= 0) {
           return;
         }
-        // GL_READ_ONLY = 0x88B8, GL_WRITE_ONLY = 0x88B9,
-        // GL_READ_WRITE = 0x88BA.
         if (binding.access() == 0x88B9) {
           addTexture(writes, texture);
         } else if (binding.access() == 0x88BA) {
@@ -183,14 +188,19 @@ public final class IrisRenderGraphCapture {
       });
     }
     IrisGlStateSnapshot snapshot = pending.snapshot();
-    if (snapshot.operation() == IrisGlStateSnapshot.Operation.DRAW) {
+    if (graphics && snapshot.operation()
+        == IrisGlStateSnapshot.Operation.DRAW) {
       for (IrisGlStateSnapshot.ColorTarget target : snapshot.colorTargets()) {
         addAttachment(writes, target.attachment());
       }
       addAttachment(writes, snapshot.depthAttachment());
       addAttachment(writes, snapshot.stencilAttachment());
     }
-    add(new RawDraw(phase, pending, distinct(reads), distinct(writes)));
+    if (graphics) {
+      add(new RawDraw(phase, pending, distinct(reads), distinct(writes)));
+    } else {
+      add(new RawDispatch(phase, pending, distinct(reads), distinct(writes)));
+    }
   }
 
   public synchronized void memoryBarrier(int bits) {
@@ -1005,8 +1015,8 @@ public final class IrisRenderGraphCapture {
     }
   }
 
-  public sealed interface RawEvent permits RawDraw, RawClear, RawBarrier,
-      RawTransfer {
+  public sealed interface RawEvent permits RawDraw, RawDispatch, RawClear,
+      RawBarrier, RawTransfer {
     Phase phase();
   }
 
@@ -1029,6 +1039,22 @@ public final class IrisRenderGraphCapture {
     public RawDraw {
       Objects.requireNonNull(phase, "phase");
       Objects.requireNonNull(pending, "pending");
+      reads = List.copyOf(reads);
+      writes = List.copyOf(writes);
+    }
+  }
+
+  public record RawDispatch(Phase phase,
+                           IrisPipelineStateCapture.PendingState pending,
+                           List<RawResource> reads,
+                           List<RawResource> writes) implements RawEvent {
+    public RawDispatch {
+      Objects.requireNonNull(phase, "phase");
+      Objects.requireNonNull(pending, "pending");
+      if (pending.snapshot().operation()
+          != IrisGlStateSnapshot.Operation.DISPATCH) {
+        throw new IllegalArgumentException("dispatch event has non-dispatch state");
+      }
       reads = List.copyOf(reads);
       writes = List.copyOf(writes);
     }
