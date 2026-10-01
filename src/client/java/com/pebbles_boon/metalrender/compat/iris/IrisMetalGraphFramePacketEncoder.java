@@ -109,6 +109,7 @@ public final class IrisMetalGraphFramePacketEncoder {
     if (operation instanceof Clear clear) {
       out.putInt(1);
       out.putInt(clear.resourceId());
+      out.putInt(clear.mipLevel());
       out.putInt(clear.aspect().ordinal());
       out.putInt(clear.valueKind().ordinal());
       out.putInt(clear.rawValues().size());
@@ -216,7 +217,7 @@ public final class IrisMetalGraphFramePacketEncoder {
     size = addSize(size, 4L);
     for (Operation operation : frame.operations()) {
       if (operation instanceof Clear clear) {
-        size = addSize(size, 21L + clear.rawValues().size() * 8L
+        size = addSize(size, 25L + clear.rawValues().size() * 8L
             + (clear.region().isPresent() ? 16L : 0L));
       } else if (operation instanceof Barrier
           || operation instanceof GenerateMipmaps) {
@@ -538,14 +539,21 @@ public final class IrisMetalGraphFramePacketEncoder {
     List<Integer> resourceIds();
   }
 
-  public record Clear(int resourceId, Aspect aspect,
+  public record Clear(int resourceId, int mipLevel, Aspect aspect,
                       IrisClearCommand.ValueKind valueKind,
                       List<Long> rawValues,
                       Optional<IrisClearCommand.Rect> region)
       implements Operation {
+    public Clear(int resourceId, Aspect aspect,
+                 IrisClearCommand.ValueKind valueKind,
+                 List<Long> rawValues,
+                 Optional<IrisClearCommand.Rect> region) {
+      this(resourceId, 0, aspect, valueKind, rawValues, region);
+    }
+
     public Clear {
-      if (resourceId < 0) {
-        throw new IllegalArgumentException("negative clear resource");
+      if (resourceId < 0 || mipLevel < 0) {
+        throw new IllegalArgumentException("invalid clear resource");
       }
       Objects.requireNonNull(aspect, "aspect");
       Objects.requireNonNull(valueKind, "valueKind");
