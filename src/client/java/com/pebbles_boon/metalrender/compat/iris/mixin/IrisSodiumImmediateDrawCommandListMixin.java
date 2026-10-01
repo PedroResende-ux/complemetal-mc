@@ -33,7 +33,7 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
       return;
     }
 
-    int count = batch.size;
+    int count = batch.size();
     if (count <= 0
         || count > com.pebbles_boon.metalrender.compat.iris
             .IrisExecutionCommand.MAX_MULTI_DRAW_COUNT) {
