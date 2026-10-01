@@ -5013,6 +5013,7 @@ constexpr jlong kIrisGraphReasonDrawExternalBufferIndexMismatch = 53;
 constexpr jlong kIrisGraphReasonDrawExternalBufferMissing = 54;
 constexpr jlong kIrisGraphReasonDrawExternalBufferLengthMismatch = 55;
 constexpr jlong kIrisGraphReasonDrawExternalTextureIndexMismatch = 56;
+constexpr jlong kIrisGraphReasonDrawFeedbackSnapshotUnsupported = 57;
 constexpr jlong kIrisGraphReasonDrawExternalTextureMissing = 57;
 constexpr jlong kIrisGraphReasonDrawExternalTextureMetadataMismatch = 58;
 
@@ -9367,10 +9368,16 @@ static int iris_shadow_prepare_arguments(
 
 namespace {
 
+struct IrisMetal4GraphFeedbackCopy {
+  id<MTLTexture> source = nil;
+  id<MTLTexture> snapshot = nil;
+};
+
 struct IrisMetal4GraphPreparedDraw {
   IrisShadowReplayPacket packet;
   IrisMetal4PipelineEntry pipeline;
   IrisShadowRuntimeResources resources;
+  std::vector<IrisMetal4GraphFeedbackCopy> feedbackCopies;
   std::vector<uint32_t> colorTargetMips;
   uint32_t depthTargetMip = 0;
   uint32_t stencilTargetMip = 0;
@@ -9772,6 +9779,49 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
           outcome = 0;
           reason = kIrisGraphReasonDrawTextureOverrideMismatch;
           return nullptr;
+        }
+        bool feedbackTarget = false;
+        if (operation.colorTargets.size() > 0) {
+          feedbackTarget = std::any_of(operation.colorTargets.begin(),
+              operation.colorTargets.end(), [&](const auto &target) {
+                return target.second == override->second;
+              });
+        }
+        feedbackTarget = feedbackTarget
+            || (operation.depthResource >= 0 &&
+                (uint32_t)operation.depthResource == override->second)
+            || (operation.stencilResource >= 0 &&
+                (uint32_t)operation.stencilResource == override->second);
+        if (feedbackTarget) {
+          if (texture.sampleCount != 1 ||
+              texture.textureType != MTLTextureType2D ||
+              texture.mipmapLevelCount == 0 ||
+              texture.width == 0 || texture.height == 0) {
+            outcome = 0;
+            reason = kIrisGraphReasonDrawFeedbackSnapshotUnsupported;
+            return nullptr;
+          }
+          MTLTextureDescriptor *feedbackDescriptor =
+              [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                  texture.pixelFormat width:texture.width height:texture.height
+                  mipmapped:texture.mipmapLevelCount > 1];
+          feedbackDescriptor.storageMode = MTLStorageModePrivate;
+          feedbackDescriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
+          feedbackDescriptor.sampleCount = 1;
+          feedbackDescriptor.mipmapLevelCount = texture.mipmapLevelCount;
+          feedbackDescriptor.usage = MTLTextureUsageShaderRead;
+          id<MTLTexture> snapshot =
+              [g_device newTextureWithDescriptor:feedbackDescriptor];
+          if (!snapshot) {
+            outcome = 0;
+            reason = kIrisGraphReasonDrawFeedbackSnapshotUnsupported;
+            return nullptr;
+          }
+          prepared->feedbackCopies.push_back({texture, snapshot});
+          prepared->resources.sampledTextures.push_back(snapshot);
+          prepared->resources.sampledByName.emplace(captured.glName, snapshot);
+          overrideUses++;
+          continue;
         }
         id<MTLTexture> retainedTexture = [texture retain];
         prepared->resources.sampledTextures.push_back(retainedTexture);
