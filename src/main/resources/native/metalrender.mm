@@ -5414,8 +5414,11 @@ static bool parse_iris_metal4_graph_frame(
     operation.borrowedReplayPacket = nullptr;
     operation.replayPacketLength = 0;
     operation.colorTargets.clear();
+    operation.colorTargetMips.clear();
     operation.depthResource = -1;
+    operation.depthMipLevel = 0;
     operation.stencilResource = -1;
+    operation.stencilMipLevel = 0;
     operation.textureOverrides.clear();
     operation.resources.clear();
     if (!reader.u32(operation.kind) || operation.kind < 1 ||
