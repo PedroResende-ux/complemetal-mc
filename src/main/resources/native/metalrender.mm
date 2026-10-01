@@ -9632,7 +9632,8 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
         return nullptr;
       }
       if (operation.stencilResource == operation.depthResource) {
-        if (entry.stencilFormat != entry.depthFormat) {
+        if (entry.stencilFormat != entry.depthFormat ||
+            operation.stencilMipLevel != operation.depthMipLevel) {
           outcome = 0;
           reason = kIrisGraphReasonDrawDepthStencilAliasMismatch;
           return nullptr;
