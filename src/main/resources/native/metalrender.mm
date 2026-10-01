@@ -4960,7 +4960,8 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nResetIrisMetal4Gra
 }
 
 constexpr uint32_t kIrisMetal4GraphFrameMagic = 0x4d474639;
-constexpr uint32_t kIrisMetal4GraphFrameSchema = 4;
+constexpr uint32_t kIrisMetal4GraphFrameSchema = 5;
+constexpr uint32_t kIrisMetal4GraphFrameLegacySchema = 4;
 constexpr jsize kIrisMetal4GraphFrameMaximumPacketBytes =
     384 * 1024 * 1024;
 constexpr jlong kIrisGraphReasonDrawPipelineUnavailable = 8;
@@ -5061,8 +5062,11 @@ struct IrisMetal4GraphFrameOperation {
   const uint8_t *borrowedReplayPacket = nullptr;
   uint32_t replayPacketLength = 0;
   std::vector<std::pair<uint32_t, uint32_t>> colorTargets;
+  std::vector<uint32_t> colorTargetMips;
   int32_t depthResource = -1;
+  uint32_t depthMipLevel = 0;
   int32_t stencilResource = -1;
+  uint32_t stencilMipLevel = 0;
   std::unordered_map<uint32_t, uint32_t> textureOverrides;
   uint32_t groupsX = 0;
   uint32_t groupsY = 0;
@@ -5283,7 +5287,9 @@ static bool parse_iris_metal4_graph_frame(
   uint32_t schema = 0;
   uint32_t count = 0;
   if (!reader.u32(magic) || magic != kIrisMetal4GraphFrameMagic ||
-      !reader.u32(schema) || schema != kIrisMetal4GraphFrameSchema ||
+      !reader.u32(schema) ||
+      (schema != kIrisMetal4GraphFrameSchema &&
+       schema != kIrisMetal4GraphFrameLegacySchema) ||
       !reader.u64(result.contextGeneration) ||
       result.contextGeneration == 0 ||
       !iris_graph_read_i32(reader, result.readbackResourceId) ||
@@ -5515,7 +5521,12 @@ static bool parse_iris_metal4_graph_frame(
       for (auto &target : operation.colorTargets) {
         if (!reader.u32(target.first) || target.first >= 8 ||
             occupiedSlots[target.first] || !reader.u32(target.second) ||
-            resourceIds.find(target.second) == resourceIds.end()) {
+            resourceIds.find(target.second) == resourceIds.end() ||
+            (schema >= kIrisMetal4GraphFrameSchema &&
+             (!reader.u32(operation.colorTargetMips[
+                  &target - operation.colorTargets.data()])
+              || operation.colorTargetMips[
+                  &target - operation.colorTargets.data()] > 15))) {
           return false;
         }
         occupiedSlots[target.first] = true;
@@ -5525,11 +5536,19 @@ static bool parse_iris_metal4_graph_frame(
           (operation.depthResource >= 0 &&
            resourceIds.find((uint32_t)operation.depthResource) ==
                resourceIds.end()) ||
+          (schema < kIrisMetal4GraphFrameSchema
+              ? (operation.depthMipLevel = 0, true)
+              : reader.u32(operation.depthMipLevel) &&
+                  operation.depthMipLevel <= 15) ||
           !iris_graph_read_i32(reader, operation.stencilResource) ||
           operation.stencilResource < -1 ||
           (operation.stencilResource >= 0 &&
            resourceIds.find((uint32_t)operation.stencilResource) ==
                resourceIds.end()) ||
+          (schema < kIrisMetal4GraphFrameSchema
+              ? (operation.stencilMipLevel = 0, true)
+              : reader.u32(operation.stencilMipLevel) &&
+                  operation.stencilMipLevel <= 15) ||
           (operation.colorTargets.empty() &&
            operation.depthResource < 0 && operation.stencilResource < 0) ||
           !reader.u32(overrideCount) || overrideCount > 256) {
@@ -5624,7 +5643,12 @@ static bool parse_iris_metal4_graph_frame(
       for (auto &target : operation.colorTargets) {
         if (!reader.u32(target.first) || target.first >= 8 ||
             occupiedSlots[target.first] || !reader.u32(target.second) ||
-            resourceIds.find(target.second) == resourceIds.end()) {
+            resourceIds.find(target.second) == resourceIds.end() ||
+            (schema >= kIrisMetal4GraphFrameSchema &&
+             (!reader.u32(operation.colorTargetMips[
+                  &target - operation.colorTargets.data()])
+              || operation.colorTargetMips[
+                  &target - operation.colorTargets.data()] > 15))) {
           return false;
         }
         occupiedSlots[target.first] = true;
