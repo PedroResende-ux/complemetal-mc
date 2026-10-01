@@ -28,12 +28,17 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
   public static boolean metalrender$isHighLevelDrawActive() {
     return METALRENDER_DRAW_ACTIVE.get() != null;
   }
+
   @Inject(method = "multiDrawElementsBaseVertex", at = @At("HEAD"),
       require = 0, remap = false, cancellable = true)
   private void metalrender$multiDraw(MultiDrawBatch batch,
       GlIndexType indexType, CallbackInfo ci) {
     int primitiveMode = IrisSodiumGlStateBridge.primitiveMode();
     if (primitiveMode < 0 || batch == null || indexType == null) {
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-sodium-multidraw-input-invalid")) {
+        ci.cancel();
+      }
       return;
     }
 
@@ -41,6 +46,10 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
     if (count <= 0
         || count > com.pebbles_boon.metalrender.compat.iris
             .IrisExecutionCommand.MAX_MULTI_DRAW_COUNT) {
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-sodium-multidraw-count-invalid")) {
+        ci.cancel();
+      }
       return;
     }
 
@@ -64,8 +73,13 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
             MemoryUtil.memGetInt(batch.pBaseVertex + (long) draw * 4L);
 
         if (offset < 0 || elementCount < 0) {
-          IrisVisualParityCapture.global().endDrawInvocation();
-          METALRENDER_DRAW_ACTIVE.remove();
+          if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+              "graph-ownership-sodium-multidraw-entry-invalid")) {
+            metalrender$finishDraw();
+            ci.cancel();
+          } else {
+            metalrender$finishDraw();
+          }
           return;
         }
 
@@ -86,22 +100,22 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
       if (pending.isPresent()
           && IrisTranslationCoordinator.tryFullGraphCutover(
               pending.orElseThrow())) {
-        IrisVisualParityCapture.global().endDrawInvocation();
-        METALRENDER_DRAW_ACTIVE.remove();
+        metalrender$finishDraw();
         ci.cancel();
       } else if (pending.isEmpty()
           && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
               "graph-ownership-sodium-multidraw-unresolved")) {
-        IrisVisualParityCapture.global().endDrawInvocation();
-        METALRENDER_DRAW_ACTIVE.remove();
+        metalrender$finishDraw();
         ci.cancel();
       }
     } catch (RuntimeException error) {
-      // Preserve Sodium's GL path. The next graph validation stage will report
-      // an incomplete capture instead of replacing an unproven terrain draw.
-      if (METALRENDER_DRAW_ACTIVE.get() != null) {
-        METALRENDER_DRAW_ACTIVE.remove();
-        IrisVisualParityCapture.global().endDrawInvocation();
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-sodium-multidraw-capture-failed")) {
+        metalrender$finishDraw();
+        ci.cancel();
+      } else {
+        // Preserve Sodium's normal GL path when graph ownership is not active.
+        metalrender$finishDraw();
       }
     }
   }
@@ -116,6 +130,10 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
       require = 0, remap = false)
   private void metalrender$multiDrawComplete(MultiDrawBatch batch,
       GlIndexType indexType, CallbackInfo ci) {
+    metalrender$finishDraw();
+  }
+
+  private static void metalrender$finishDraw() {
     if (METALRENDER_DRAW_ACTIVE.get() != null) {
       METALRENDER_DRAW_ACTIVE.remove();
       IrisVisualParityCapture.global().endDrawInvocation();
