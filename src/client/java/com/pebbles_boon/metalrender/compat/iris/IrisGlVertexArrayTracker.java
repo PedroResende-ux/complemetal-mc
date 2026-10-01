@@ -48,6 +48,19 @@ public final class IrisGlVertexArrayTracker {
     trimArrays();
   }
 
+  public synchronized void deleteVertexArray(int vertexArray) {
+    if (vertexArray <= 0) {
+      return;
+    }
+    arrays.remove(vertexArray);
+    if (currentVertexArray == vertexArray) {
+      currentVertexArray = 0;
+      arrays.computeIfAbsent(0, ignored -> new VertexArray());
+    }
+    mojangVertexBuffers = null;
+    mojangVertexBufferFailure = "";
+  }
+
   /** Records modern vertex-buffer bindings applied by Mojang's VAO cache. */
   public synchronized void bindMojangVertexBuffers(
       List<MojangVertexBuffer> buffers) {
