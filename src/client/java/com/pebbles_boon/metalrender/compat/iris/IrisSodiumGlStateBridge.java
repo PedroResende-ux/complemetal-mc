@@ -117,9 +117,7 @@ public final class IrisSodiumGlStateBridge {
   public static void synchronizeForDraw() {
     try {
       int program = GL20C.glGetInteger(GL20C.GL_CURRENT_PROGRAM);
-      if (program > 0) {
-        IrisPipelineStateCapture.global().useProgram(program);
-      }
+      IrisPipelineStateCapture.global().useProgram(program);
 
       int vao = GL30C.glGetInteger(GL30C.GL_VERTEX_ARRAY_BINDING);
       bindVertexArray(vao);
