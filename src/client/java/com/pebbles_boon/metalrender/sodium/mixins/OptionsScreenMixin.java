@@ -19,7 +19,7 @@ public abstract class OptionsScreenMixin extends Screen {
   @Inject(method = "init", at = @At("TAIL"), require = 1)
   private void metalrender$addSettingsButton(CallbackInfo ci) {
     addRenderableWidget(Button.builder(Component.literal("Complemetal"),
-            button -> minecraft.gui.setScreen(
+            button -> minecraft.setScreen(
                 new MetalRenderSettingsScreen(this)))
         .bounds(width - 108, 8, 100, 20)
         .build());
