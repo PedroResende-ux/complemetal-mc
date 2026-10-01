@@ -3485,6 +3485,17 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     if (command instanceof IrisExecutionCommand.MultiDrawIndexed indexed) {
       return indexed.indexElementBytes() != 1;
     }
+    if (command instanceof IrisExecutionCommand.IndirectDraw indirect) {
+      if (indirect.primitiveMode() == IrisPrimitiveExpansion.GL_LINE_LOOP
+          || indirect.primitiveMode() == IrisPrimitiveExpansion.GL_TRIANGLE_FAN
+          || indirect.indexElementBytes() == 1) {
+        return false;
+      }
+      return indirect.indexElementBytes() == 0
+          ? indirect.drawCount() == 1
+          : indirect.indexElementBytes() == 2
+              || indirect.indexElementBytes() == 4;
+    }
     if (command instanceof IrisExecutionCommand.Dispatch dispatch) {
       return dispatch.groupsX() > 0 && dispatch.groupsY() > 0
           && dispatch.groupsZ() > 0
