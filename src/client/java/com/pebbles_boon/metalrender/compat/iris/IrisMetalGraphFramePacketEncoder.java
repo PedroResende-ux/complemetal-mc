@@ -226,7 +226,7 @@ public final class IrisMetalGraphFramePacketEncoder {
             + draw.colorTargets().size() * 8L
             + draw.textureOverrides().size() * 8L);
       } else if (operation instanceof Compute compute) {
-        size = addSize(size, 24L + asciiLength(
+        size = addSize(size, 28L + asciiLength(
             compute.pipelineKeySha256()) + compute.replayPacket.length
             + compute.resources().size() * 4L);
       } else {
