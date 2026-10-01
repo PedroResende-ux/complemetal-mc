@@ -98,6 +98,17 @@ public final class IrisSodiumGlStateBridge {
     }
   }
 
+  public static void refreshAllMappings() {
+    if (!IrisGlBufferMirror.isEnabled()) {
+      return;
+    }
+    for (Integer buffer : MAPPINGS.keySet()) {
+      if (buffer != null && buffer > 0) {
+        refresh(buffer);
+      }
+    }
+  }
+
   private static void refresh(int buffer, MappingRange range) {
     ByteBuffer bytes = range.mapping().getMemoryBuffer();
     if (bytes == null || range.offset() > Integer.MAX_VALUE
