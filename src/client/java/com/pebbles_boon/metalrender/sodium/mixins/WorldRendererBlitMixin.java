@@ -159,7 +159,7 @@ public abstract class WorldRendererBlitMixin {
       Camera camera,
       GameRenderer gameRenderer,
       LightTexture lightTexture,
-      Matrix4f frustumMatrix,
+      Matrix4f positionMatrix,
       Matrix4f projectionMatrix,
       CallbackInfo ci) {
     if (!metalrender$frameActive || metalrender$frameEnded) {
