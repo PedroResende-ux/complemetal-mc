@@ -6461,17 +6461,26 @@ static jlongArray run_iris_metal4_graph_frame(
           if (clear.kind != 1 || draw.kind != 5)
             return false;
           if (clear.aspect == 0) {
-            return std::any_of(draw.colorTargets.begin(),
-                draw.colorTargets.end(), [&](const auto &target) {
-                  return target.second == clear.firstResource;
-                });
+            for (size_t index = 0; index < draw.colorTargets.size();
+                 index++) {
+              const auto &target = draw.colorTargets[index];
+              uint32_t targetMip = index < draw.colorTargetMips.size()
+                  ? draw.colorTargetMips[index] : 0;
+              if (target.second == clear.firstResource &&
+                  targetMip == clear.mipLevel) {
+                return true;
+              }
+            }
+            return false;
           }
           bool depth = (clear.aspect == 1 || clear.aspect == 3) &&
               draw.depthResource >= 0 &&
-              (uint32_t)draw.depthResource == clear.firstResource;
+              (uint32_t)draw.depthResource == clear.firstResource &&
+              draw.depthMipLevel == clear.mipLevel;
           bool stencil = (clear.aspect == 2 || clear.aspect == 3) &&
               draw.stencilResource >= 0 &&
-              (uint32_t)draw.stencilResource == clear.firstResource;
+              (uint32_t)draw.stencilResource == clear.firstResource &&
+              draw.stencilMipLevel == clear.mipLevel;
           return clear.aspect == 3 ? depth && stencil : depth || stencil;
         };
         for (size_t operationIndex = 0;
