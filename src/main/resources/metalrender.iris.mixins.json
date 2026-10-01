@@ -8,7 +8,8 @@
   "client": [
     "Iris1211RenderingPipelineMixin",
     "IrisProgramBuilderMixin",
-    "IrisProgramBuilderAccessor"
+    "IrisProgramBuilderAccessor",
+    "Iris1211SodiumProgramsMixin"
   ],
   "injectors": {
     "defaultRequire": 0
