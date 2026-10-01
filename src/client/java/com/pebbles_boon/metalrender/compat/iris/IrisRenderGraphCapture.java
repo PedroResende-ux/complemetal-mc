@@ -863,11 +863,11 @@ public final class IrisRenderGraphCapture {
       }
       return false;
     }
-    if (!(event instanceof RawDraw) && event.equals(current.lastSignature)) {
+    if (event instanceof RawBarrier && event.equals(current.lastSignature)) {
       return true;
     }
     current.events.add(event);
-    current.lastSignature = event instanceof RawDraw ? null : event;
+    current.lastSignature = event instanceof RawBarrier ? event : null;
     current.phases.add(event.phase());
     return true;
   }
