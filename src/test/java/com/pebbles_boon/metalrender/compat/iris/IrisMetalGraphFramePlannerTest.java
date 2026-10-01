@@ -71,6 +71,17 @@ final class IrisMetalGraphFramePlannerTest {
   }
 
   @Test
+  void requiresInitialSnapshotForReflectedStorageImageTexture() {
+    ResourceHandle texture = new ResourceHandle(ResourceKind.TEXTURE,
+        724, 3, 9);
+
+    assertTrue(IrisMetalGraphFramePlanner.initialTextureSnapshotRequired(
+        texture, Set.of(), Set.of(724)));
+    assertFalse(IrisMetalGraphFramePlanner.initialTextureSnapshotRequired(
+        texture, Set.of(713), Set.of(713)));
+  }
+
+  @Test
   void plansExactFinalClearIntoPersistentMetalAttachment() {
     ResourceHandle texture = new ResourceHandle(ResourceKind.TEXTURE,
         31, 4, 9);
