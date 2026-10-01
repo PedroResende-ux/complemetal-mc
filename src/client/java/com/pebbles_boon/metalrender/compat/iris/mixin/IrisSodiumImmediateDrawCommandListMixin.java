@@ -91,6 +91,12 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
     }
   }
 
+  @Inject(method = "endTessellating", at = @At("RETURN"), require = 0,
+      remap = false)
+  private void metalrender$endTessellating(CallbackInfo ci) {
+    IrisSodiumGlStateBridge.endTessellation();
+  }
+
   @Inject(method = "multiDrawElementsBaseVertex", at = @At("RETURN"),
       require = 0, remap = false)
   private void metalrender$multiDrawComplete(MultiDrawBatch batch,
