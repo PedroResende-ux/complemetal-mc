@@ -35,7 +35,7 @@ public abstract class WorldRendererBlitMixin {
   @Unique
   private boolean metalrender$frameEnded;
 
-  @Inject(method = "renderLevel", at = @At("HEAD"), require = 1)
+  @Inject(method = "renderLevel", at = @At("HEAD"), require = 0)
   private void metalrender$beginWorldFrame(
       DeltaTracker deltaTracker,
       boolean renderBlockOutline,
@@ -88,7 +88,7 @@ public abstract class WorldRendererBlitMixin {
           target = "Lnet/minecraft/client/renderer/LevelRenderer;renderSectionLayer(Lnet/minecraft/client/renderer/RenderType;DDDLorg/joml/Matrix4f;Lorg/joml/Matrix4f;)V",
           ordinal = 2,
           shift = At.Shift.AFTER),
-      require = 1)
+      require = 0)
   private void metalrender$presentBeforeEntities(
       DeltaTracker deltaTracker,
       boolean renderBlockOutline,
@@ -152,7 +152,7 @@ public abstract class WorldRendererBlitMixin {
     }
   }
 
-  @Inject(method = "renderLevel", at = @At("RETURN"), require = 1)
+  @Inject(method = "renderLevel", at = @At("RETURN"), require = 0)
   private void metalrender$finishWorldFrameFallback(
       DeltaTracker deltaTracker,
       boolean renderBlockOutline,
