@@ -18,7 +18,6 @@
     "SodiumRenderSectionManagerMixin",
     "accessor.WindowAccessor",
     "accessor.AccessorLightTexture",
-    "accessor.ParticleManagerAccessor"
   ],
   "injectors": {
     "defaultRequire": 1
