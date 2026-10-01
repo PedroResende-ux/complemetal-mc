@@ -274,17 +274,22 @@ final class IrisRenderGraphCaptureTest {
     capture.phase(IrisRenderGraph.Phase.COMPOSITE);
     capture.clearNamedFramebufferFloat(8, IrisClearCommand.GL_COLOR, 0,
         new float[] {0.25F, 0.5F, 0.75F, 1.0F});
+    capture.clearNamedFramebufferFloat(8, IrisClearCommand.GL_COLOR, 0,
+        new float[] {0.25F, 0.5F, 0.75F, 1.0F});
     capture.copyTexture(80, GL_TEXTURE_2D, 0, 4, 5, 6, 7, 8, 9,
         IrisGlStateTracker.GL_COLOR_ATTACHMENT0);
     capture.endFrame();
 
     List<IrisRenderGraphCapture.RawEvent> events = capture.poll()
         .orElseThrow().events();
-    assertEquals(2, events.size());
+    assertEquals(3, events.size());
     IrisRenderGraphCapture.RawClear clear =
         (IrisRenderGraphCapture.RawClear) events.get(0);
     assertEquals(8, clear.command().target().name());
     assertEquals(4, clear.command().rawValues().size());
+    IrisRenderGraphCapture.RawClear repeatedClear =
+        (IrisRenderGraphCapture.RawClear) events.get(1);
+    assertEquals(8, repeatedClear.command().target().name());
     IrisRenderGraphCapture.RawTransfer transfer =
         (IrisRenderGraphCapture.RawTransfer) events.get(1);
     IrisTransferCommand.CopyTexSubImage2D copy =
