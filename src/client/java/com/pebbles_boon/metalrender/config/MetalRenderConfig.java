@@ -48,23 +48,19 @@ public final class MetalRenderConfig {
   private static volatile boolean debugPinkBlockTintEnabled = false;
 
   private static java.nio.file.Path configFile() {
-    return net.fabricmc.loader.api.FabricLoader.getInstance()
-        .getConfigDir().resolve("complemetal.json");
+    return net.neoforged.fml.loading.FMLPaths.CONFIGDIR.get().resolve("complemetal.json");
   }
 
   private static java.nio.file.Path legacyConfigFile() {
-    return net.fabricmc.loader.api.FabricLoader.getInstance()
-        .getConfigDir().resolve("metalrender.json");
+    return net.neoforged.fml.loading.FMLPaths.CONFIGDIR.get().resolve("metalrender.json");
   }
 
   private static java.nio.file.Path deepDebugFlagFile() {
-    return net.fabricmc.loader.api.FabricLoader.getInstance()
-        .getConfigDir().resolve("complemetal-debug-next-run.flag");
+    return net.neoforged.fml.loading.FMLPaths.CONFIGDIR.get().resolve("complemetal-debug-next-run.flag");
   }
 
   private static java.nio.file.Path legacyDeepDebugFlagFile() {
-    return net.fabricmc.loader.api.FabricLoader.getInstance()
-        .getConfigDir().resolve("metalrender-debug-next-run.flag");
+    return net.neoforged.fml.loading.FMLPaths.CONFIGDIR.get().resolve("metalrender-debug-next-run.flag");
   }
 
   private static void activateOneRunDeepDebugIfRequested() {
