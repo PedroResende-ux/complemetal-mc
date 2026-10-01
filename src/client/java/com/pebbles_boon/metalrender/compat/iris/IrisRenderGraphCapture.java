@@ -160,14 +160,28 @@ public final class IrisRenderGraphCapture {
       }
     }
     ArrayList<RawResource> reads = new ArrayList<>();
+    ArrayList<RawResource> writes = new ArrayList<>();
     IrisGlResourceBindingSnapshot bindings = pending.resourceBindings();
     if (bindings != null) {
       bindings.textureUnits().values().forEach(binding ->
           addTexture(reads, binding.texture()));
-      bindings.imageUnits().values().forEach(binding ->
-          addTexture(reads, binding.texture()));
+      bindings.imageUnits().values().forEach(binding -> {
+        int texture = binding.texture();
+        if (texture <= 0) {
+          return;
+        }
+        // GL_READ_ONLY = 0x88B8, GL_WRITE_ONLY = 0x88B9,
+        // GL_READ_WRITE = 0x88BA.
+        if (binding.access() == 0x88B9) {
+          addTexture(writes, texture);
+        } else if (binding.access() == 0x88BA) {
+          addTexture(reads, texture);
+          addTexture(writes, texture);
+        } else {
+          addTexture(reads, texture);
+        }
+      });
     }
-    ArrayList<RawResource> writes = new ArrayList<>();
     IrisGlStateSnapshot snapshot = pending.snapshot();
     if (snapshot.operation() == IrisGlStateSnapshot.Operation.DRAW) {
       for (IrisGlStateSnapshot.ColorTarget target : snapshot.colorTargets()) {
