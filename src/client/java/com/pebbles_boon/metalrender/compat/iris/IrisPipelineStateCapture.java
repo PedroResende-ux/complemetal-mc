@@ -432,7 +432,11 @@ public final class IrisPipelineStateCapture {
         && !IrisTranslationCoordinator.fullGraphOwnershipCaptureActive()) {
       IrisVisualParityCapture.global().associate(pending, phase);
     }
-    IrisRenderGraphCapture.global().draw(pending);
+    if (command instanceof IrisExecutionCommand.Draw) {
+      IrisRenderGraphCapture.global().draw(pending);
+    } else {
+      IrisRenderGraphCapture.global().dispatch(pending);
+    }
     offer(pending);
     return pending;
   }
