@@ -1,6 +1,11 @@
 package com.pebbles_boon.metalrender.sodium.mixins.lwjgl;
 
 import com.pebbles_boon.metalrender.backend.GLIntercept;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror;
+import com.pebbles_boon.metalrender.compat.iris.IrisPipelineStateCapture;
+import com.pebbles_boon.metalrender.compat.iris.IrisExecutionCommand;
+import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
+import com.pebbles_boon.metalrender.compat.iris.IrisVisualParityCapture;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.injection.At;
@@ -19,6 +24,25 @@ public class GL11CMixin {
         com.pebbles_boon.metalrender.config.MetalRenderConfig
             .swapTranslucent()) {
       GLIntercept.onDrawElements(mode, count, type, indicesOffset, null);
+    }
+    @Inject(method = "glDrawArrays", at = @At("HEAD"), remap = false)
+  private static void metalrender$onDrawArrays(int mode, int first, int count,
+      CallbackInfo ci) {
+    if (count <= 0) return;
+    IrisVisualParityCapture.global().beginDrawInvocation();
+    try {
+      var pending = IrisPipelineStateCapture.global().captureDrawDirect(
+          new IrisExecutionCommand.DrawArrays(mode, first, count, 1, 0,
+              IrisExecutionCommand.Source.DIRECT_GL));
+      if (pending.isPresent()
+          && (IrisTranslationCoordinator.tryFullGraphCutover(
+              pending.orElseThrow())
+              || IrisTranslationCoordinator.tryFinalCutover(
+                  pending.orElseThrow()))) {
+        IrisVisualParityCapture.global().endDrawInvocation();
+      }
+    } catch (RuntimeException ignored) {
+      // Preserve the original GL call; replay remains fail-closed.
     }
   }
 }
