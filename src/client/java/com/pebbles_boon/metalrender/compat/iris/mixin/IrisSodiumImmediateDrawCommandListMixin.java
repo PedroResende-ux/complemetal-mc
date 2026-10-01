@@ -42,6 +42,7 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
 
     IrisVisualParityCapture.global().beginDrawInvocation();
     METALRENDER_DRAW_ACTIVE.set(Boolean.TRUE);
+    IrisSodiumGlStateBridge.synchronizeForDraw();
     IrisSodiumGlStateBridge.refreshAllMappings();
 
     long[] offsets = new long[count];
