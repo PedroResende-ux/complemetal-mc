@@ -529,6 +529,8 @@ public final class IrisMetalGraphFramePlanner {
             || destinationResource.sampleCount() != 1
             || sourceResource.mipLevels() != 1
             || destinationResource.mipLevels() != 1
+            || sourceResource.depthOrLayers() != 1
+            || destinationResource.depthOrLayers() != 1
             || blit.sourceX0() != 0 || blit.sourceY0() != 0
             || blit.destinationX0() != 0 || blit.destinationY0() != 0
             || sourceWidth != sourceResource.width()
