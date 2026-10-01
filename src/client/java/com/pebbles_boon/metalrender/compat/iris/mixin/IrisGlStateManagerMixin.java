@@ -107,14 +107,18 @@ public abstract class IrisGlStateManagerMixin {
       at = @At("RETURN"))
   private static void metalrender$bufferData(int target, ByteBuffer bytes,
       int usage, CallbackInfo ci) {
-    if (!IrisGlBufferMirror.isEnabled() || bytes == null) {
-      return;
-    }
-    int buffer = metalrender$vertices().boundBuffer(target);
-    int length = bytes.remaining();
-    if (buffer > 0 && length > 0
-        && IrisGlBufferMirror.global().allocate(buffer, length)) {
-      IrisGlBufferMirror.global().write(buffer, length, 0, length, bytes);
+    try {
+      if (!IrisGlBufferMirror.isEnabled() || bytes == null) {
+        return;
+      }
+      int buffer = metalrender$vertices().boundBuffer(target);
+      int length = bytes.remaining();
+      if (buffer > 0 && length > 0
+          && IrisGlBufferMirror.global().allocate(buffer, length)) {
+        IrisGlBufferMirror.global().write(buffer, length, 0, length, bytes);
+      }
+    } finally {
+      metalrender$exitBufferDataScope();
     }
   }
 
