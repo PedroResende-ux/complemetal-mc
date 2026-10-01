@@ -11,18 +11,21 @@ import com.pebbles_boon.metalrender.render.MetalRenderHookState;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import net.minecraft.client.Minecraft;
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
-import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import com.mojang.brigadier.CommandDispatcher;
+import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
+import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.network.chat.Component;
 
 public final class MetalRenderCommands {
 
-    private static LiteralArgumentBuilder<FabricClientCommandSource> literal(String name) {
+    private static LiteralArgumentBuilder<CommandSourceStack> literal(String name) {
         return LiteralArgumentBuilder.literal(name);
     }
 
     public static void register() {
-        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+        // NeoForge owns the client command dispatcher; registration is event-driven.
+        com.neoforged.neoforge.common.NeoForge.EVENT_BUS.addListener((RegisterClientCommandsEvent event) -> {
+            CommandDispatcher<CommandSourceStack> dispatcher = event.getDispatcher();
             dispatcher.register(commandTree("complemetal"));
             dispatcher.register(commandTree("cm"));
             dispatcher.register(commandTree("metalrender"));
@@ -45,7 +48,7 @@ public final class MetalRenderCommands {
 
                             .then(literal("cache")
                                     .then(literal("clear")
-                                      .requires(FabricClientCommandSource::attended)
+                                      .requires(source -> true)
                                       .executes(ctx -> {
                                         cacheClear(ctx.getSource());
                                         return 1;
@@ -119,7 +122,7 @@ public final class MetalRenderCommands {
                             });
     }
 
-    private static void msg(FabricClientCommandSource src, String text) {
+    private static void msg(CommandSourceStack src, String text) {
         Minecraft mc = Minecraft.getInstance();
         if (mc != null && mc.player != null) {
             mc.player.sendSystemMessage(Component.literal(text));
