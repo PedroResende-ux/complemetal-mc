@@ -19,6 +19,10 @@ public final class IrisSodiumGlStateBridge {
     IrisGlVertexArrayTracker.global().bindVertexArray(vertexArray);
   }
 
+  public static void deleteVertexArray(int vertexArray) {
+    IrisGlVertexArrayTracker.global().deleteVertexArray(vertexArray);
+  }
+
   public static void bindBuffer(int target, int buffer) {
     IrisGlVertexArrayTracker.global().bindBuffer(target, buffer);
   }
