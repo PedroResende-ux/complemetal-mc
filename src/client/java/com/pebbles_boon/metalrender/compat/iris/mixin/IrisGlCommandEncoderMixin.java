@@ -35,6 +35,56 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /** Captures draws that Mojang's command encoder submits directly to LWJGL. */
 @Mixin(targets = "com.mojang.blaze3d.opengl.GlCommandEncoder")
 public abstract class IrisGlCommandEncoderMixin {
+  private static final ThreadLocal<Integer> METALRENDER_DRAW_CAPTURE_SCOPE =
+      ThreadLocal.withInitial(() -> 0);
+  private static final ThreadLocal<Boolean> DRAW_FROM_BUFFERS_SCOPE =
+      new ThreadLocal<>();
+  private static final ThreadLocal<Boolean> DRAW_FROM_BUFFERS_NESTED =
+      new ThreadLocal<>();
+  private static final ThreadLocal<Boolean> EXECUTE_DRAWS_SCOPE =
+      new ThreadLocal<>();
+  private static final ThreadLocal<Boolean> EXECUTE_DRAW_INDIRECT_SCOPE =
+      new ThreadLocal<>();
+
+  static boolean metalrender$isHighLevelDrawCaptureActive() {
+    return METALRENDER_DRAW_CAPTURE_SCOPE.get() > 0;
+  }
+
+  private static void metalrender$enterDrawCaptureScope() {
+    METALRENDER_DRAW_CAPTURE_SCOPE.set(
+        METALRENDER_DRAW_CAPTURE_SCOPE.get() + 1);
+  }
+
+  private static void metalrender$exitDrawCaptureScope() {
+    int depth = METALRENDER_DRAW_CAPTURE_SCOPE.get();
+    if (depth <= 1) {
+      METALRENDER_DRAW_CAPTURE_SCOPE.remove();
+    } else {
+      METALRENDER_DRAW_CAPTURE_SCOPE.set(depth - 1);
+    }
+  }
+
+  private static void metalrender$discardDrawFromBuffersScope() {
+    if (Boolean.TRUE.equals(DRAW_FROM_BUFFERS_SCOPE.get())) {
+      metalrender$exitDrawCaptureScope();
+      DRAW_FROM_BUFFERS_SCOPE.remove();
+    }
+  }
+
+  private static void metalrender$discardExecuteDrawsScope() {
+    if (Boolean.TRUE.equals(EXECUTE_DRAWS_SCOPE.get())) {
+      metalrender$exitDrawCaptureScope();
+      EXECUTE_DRAWS_SCOPE.remove();
+    }
+  }
+
+  private static void metalrender$discardExecuteDrawIndirectScope() {
+    if (Boolean.TRUE.equals(EXECUTE_DRAW_INDIRECT_SCOPE.get())) {
+      metalrender$exitDrawCaptureScope();
+      EXECUTE_DRAW_INDIRECT_SCOPE.remove();
+    }
+  }
+
   @Inject(method = "clearColorTexture", at = @At("HEAD"), require = 0,
       cancellable = true)
   private void metalrender$clearColorTexture(GpuTexture destination,
@@ -232,6 +282,10 @@ public abstract class IrisGlCommandEncoderMixin {
       int baseVertex, int firstIndex, int indexCount, IndexType indexType,
       GlRenderPipeline pipeline, int instanceCount, int baseInstance,
       CallbackInfo ci) {
+    if (metalrender$isHighLevelDrawCaptureActive()) {
+      DRAW_FROM_BUFFERS_NESTED.set(Boolean.TRUE);
+      return;
+    }
     IrisVisualParityCapture.global().beginDrawInvocation();
     int primitiveMode = GlConst.toGl(
         pipeline.info().getPrimitiveTopology());
@@ -241,13 +295,17 @@ public abstract class IrisGlCommandEncoderMixin {
               firstIndex, indexCount, indexType == null ? 0 : indexType.bytes,
               instanceCount, baseInstance),
           metalrender$vertexInputs(pass));
-      if (pending.isPresent()
-          && (IrisTranslationCoordinator.tryFullGraphCutover(
-              pending.orElseThrow())
-              || IrisTranslationCoordinator.tryFinalCutover(
-                  pending.orElseThrow()))) {
-        IrisVisualParityCapture.global().endDrawInvocation();
-        ci.cancel();
+      if (pending.isPresent()) {
+        metalrender$enterDrawCaptureScope();
+        DRAW_FROM_BUFFERS_SCOPE.set(Boolean.TRUE);
+        if (IrisTranslationCoordinator.tryFullGraphCutover(
+                pending.orElseThrow())
+            || IrisTranslationCoordinator.tryFinalCutover(
+                pending.orElseThrow())) {
+          metalrender$discardDrawFromBuffersScope();
+          IrisVisualParityCapture.global().endDrawInvocation();
+          ci.cancel();
+        }
       } else if (pending.isEmpty()
           && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
               "graph-ownership-mojang-draw-unresolved")) {
@@ -264,6 +322,11 @@ public abstract class IrisGlCommandEncoderMixin {
       int baseVertex, int firstIndex, int indexCount, IndexType indexType,
       GlRenderPipeline pipeline, int instanceCount, int baseInstance,
       CallbackInfo ci) {
+    if (DRAW_FROM_BUFFERS_NESTED.get() != null) {
+      DRAW_FROM_BUFFERS_NESTED.remove();
+      return;
+    }
+    metalrender$discardDrawFromBuffersScope();
     IrisVisualParityCapture.global().endDrawInvocation();
   }
 
@@ -278,6 +341,7 @@ public abstract class IrisGlCommandEncoderMixin {
     if (indexType == null) {
       if (metalrender$captureMultiDrawArrays(pass, primitiveMode, counts,
           baseVertices, drawCount)) {
+        metalrender$discardExecuteDrawsScope();
         IrisVisualParityCapture.global().endDrawInvocation();
         ci.cancel();
       }
@@ -313,11 +377,15 @@ public abstract class IrisGlCommandEncoderMixin {
               indexType.bytes, offsets, elementCounts, bases,
               IrisExecutionCommand.Source.MOJANG_COMMAND_ENCODER),
               metalrender$vertexInputs(pass));
-      if (pending.isPresent()
-          && IrisTranslationCoordinator.tryFullGraphCutover(
-              pending.orElseThrow())) {
-        IrisVisualParityCapture.global().endDrawInvocation();
-        ci.cancel();
+      if (pending.isPresent()) {
+        metalrender$enterDrawCaptureScope();
+        EXECUTE_DRAWS_SCOPE.set(Boolean.TRUE);
+        if (IrisTranslationCoordinator.tryFullGraphCutover(
+                pending.orElseThrow())) {
+          metalrender$discardExecuteDrawsScope();
+          IrisVisualParityCapture.global().endDrawInvocation();
+          ci.cancel();
+        }
       } else if (pending.isEmpty()
           && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
               "graph-ownership-multi-draw-unresolved")) {
@@ -338,6 +406,7 @@ public abstract class IrisGlCommandEncoderMixin {
   private void metalrender$executeDrawsComplete(@Coerce Object pass,
       IndexType indexType, PointerBuffer indices, IntBuffer counts,
       IntBuffer baseVertices, int drawCount, CallbackInfo ci) {
+    metalrender$discardExecuteDrawsScope();
     IrisVisualParityCapture.global().endDrawInvocation();
   }
 
@@ -355,11 +424,15 @@ public abstract class IrisGlCommandEncoderMixin {
               indexType == null ? 0 : indexType.bytes,
               indirectBuffer.handle(), offset, drawCount),
               metalrender$vertexInputs(pass));
-      if (pending.isPresent()
-          && IrisTranslationCoordinator.tryFullGraphCutover(
-              pending.orElseThrow())) {
-        IrisVisualParityCapture.global().endDrawInvocation();
-        ci.cancel();
+      if (pending.isPresent()) {
+        metalrender$enterDrawCaptureScope();
+        EXECUTE_DRAW_INDIRECT_SCOPE.set(Boolean.TRUE);
+        if (IrisTranslationCoordinator.tryFullGraphCutover(
+                pending.orElseThrow())) {
+          metalrender$discardExecuteDrawIndirectScope();
+          IrisVisualParityCapture.global().endDrawInvocation();
+          ci.cancel();
+        }
       } else if (pending.isEmpty()
           && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
               "graph-ownership-indirect-draw-unresolved")) {
@@ -380,6 +453,7 @@ public abstract class IrisGlCommandEncoderMixin {
   private void metalrender$executeDrawIndirectComplete(@Coerce Object pass,
       IndexType indexType, GlBuffer indirectBuffer, long offset,
       int drawCount, CallbackInfo ci) {
+    metalrender$discardExecuteDrawIndirectScope();
     IrisVisualParityCapture.global().endDrawInvocation();
   }
 
@@ -408,6 +482,7 @@ public abstract class IrisGlCommandEncoderMixin {
     }
     IrisVertexInputBindings inputs = metalrender$vertexInputs(pass);
     boolean suppress = false;
+    boolean allCaptured = true;
     for (int draw = 0; draw < drawCount; draw++) {
       var pending = IrisPipelineStateCapture.global().captureDraw(
           new IrisExecutionCommand.DrawArrays(primitiveMode,
@@ -418,9 +493,14 @@ public abstract class IrisGlCommandEncoderMixin {
         suppress |= IrisTranslationCoordinator.tryFullGraphCutover(
             pending.orElseThrow());
       } else {
+        allCaptured = false;
         suppress |= IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
             "graph-ownership-multi-draw-arrays-unresolved");
       }
+    }
+    if (allCaptured) {
+      metalrender$enterDrawCaptureScope();
+      EXECUTE_DRAWS_SCOPE.set(Boolean.TRUE);
     }
     return suppress;
   }
