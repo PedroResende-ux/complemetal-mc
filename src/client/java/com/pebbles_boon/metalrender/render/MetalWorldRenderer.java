@@ -749,7 +749,7 @@ public class MetalWorldRenderer {
         camera.position().z);
     if (NativeBridge.isLibLoaded()) {
       NativeBridge.nSetRenderDistance(
-          Minecraft.getInstance().options.getEffectiveRenderDistance() * 16);
+          Minecraft.getInstance().options.renderDistance().get() * 16);
     }
     if (texturesReady) {
       long blockAtlas = textureManager.getBlockAtlasTexture();
