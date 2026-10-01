@@ -179,21 +179,6 @@ public final class IrisGlVertexArrayTracker {
     }
   }
 
-  private static IrisVertexInputBindings.BufferSlice indexBuffer(
-      VertexArray vertexArray) {
-    if (vertexArray.elementBuffer <= 0) {
-      return null;
-    }
-    IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
-    long size = mirror.size(vertexArray.elementBuffer);
-    long generation = mirror.generation(vertexArray.elementBuffer);
-    if (size <= 0 || generation <= 0) {
-      return null;
-    }
-    return new IrisVertexInputBindings.BufferSlice(0,
-        vertexArray.elementBuffer, 0, size, generation);
-  }
-
   private VertexArray current() {
     VertexArray vertexArray = arrays.computeIfAbsent(currentVertexArray,
         ignored -> new VertexArray());
