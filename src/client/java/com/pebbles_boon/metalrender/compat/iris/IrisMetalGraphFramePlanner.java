@@ -260,7 +260,8 @@ public final class IrisMetalGraphFramePlanner {
       for (Integer target : targets.allTargets().stream().sorted().toList()) {
         if (initialized.add(target)) {
           operations.add(bootstrapClearOperation(
-              plan.graph().resources().get(target), target));
+              plan.graph().resources().get(target), target,
+              targets.targetMipLevel(target)));
           written.add(target);
         }
       }
@@ -414,31 +415,32 @@ public final class IrisMetalGraphFramePlanner {
   }
 
   private static IrisMetalGraphFramePacketEncoder.Clear
-      bootstrapClearOperation(Resource resource, int resourceId) {
+      bootstrapClearOperation(Resource resource, int resourceId,
+          int mipLevel) {
     String format = resource.format();
     if (depthFormat(format) && stencilFormat(format)) {
-      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId,
+      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId, mipLevel,
           IrisMetalGraphFramePacketEncoder.Aspect.DEPTH_STENCIL,
           IrisClearCommand.ValueKind.FLOAT32,
           List.of(Integer.toUnsignedLong(Float.floatToRawIntBits(1.0F)),
               0L), Optional.empty());
     }
     if (depthFormat(format)) {
-      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId,
+      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId, mipLevel,
           IrisMetalGraphFramePacketEncoder.Aspect.DEPTH,
           IrisClearCommand.ValueKind.FLOAT32,
           List.of(Integer.toUnsignedLong(Float.floatToRawIntBits(1.0F))),
           Optional.empty());
     }
     if (stencilFormat(format)) {
-      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId,
+      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId, mipLevel,
           IrisMetalGraphFramePacketEncoder.Aspect.STENCIL,
           IrisClearCommand.ValueKind.SINT32, List.of(0L), Optional.empty());
     }
     if (!colorFormat(format)) {
       throw unsupported("graph-frame-bootstrap-format-unsupported");
     }
-    return new IrisMetalGraphFramePacketEncoder.Clear(resourceId,
+    return new IrisMetalGraphFramePacketEncoder.Clear(resourceId, mipLevel,
         IrisMetalGraphFramePacketEncoder.Aspect.COLOR,
         IrisClearCommand.ValueKind.FLOAT32,
         List.of(0L, 0L, 0L, 0L), Optional.empty());
@@ -1386,6 +1388,34 @@ public final class IrisMetalGraphFramePlanner {
     private DrawTargets {
       colors = List.copyOf(colors);
       allTargets = Set.copyOf(allTargets);
+    }
+
+    private int targetMipLevel(int resourceId) {
+      int result = -1;
+      for (IrisMetalGraphFramePacketEncoder.ColorTarget target : colors) {
+        if (target.resourceId() == resourceId) {
+          if (result >= 0 && result != target.mipLevel()) {
+            throw unsupported("graph-frame-attachment-mip-ambiguous");
+          }
+          result = target.mipLevel();
+        }
+      }
+      if (depthResourceId == resourceId) {
+        if (result >= 0 && result != depthMipLevel) {
+          throw unsupported("graph-frame-attachment-mip-ambiguous");
+        }
+        result = depthMipLevel;
+      }
+      if (stencilResourceId == resourceId) {
+        if (result >= 0 && result != stencilMipLevel) {
+          throw unsupported("graph-frame-attachment-mip-ambiguous");
+        }
+        result = stencilMipLevel;
+      }
+      if (result < 0) {
+        throw unsupported("graph-frame-attachment-mip-unavailable");
+      }
+      return result;
     }
   }
 
