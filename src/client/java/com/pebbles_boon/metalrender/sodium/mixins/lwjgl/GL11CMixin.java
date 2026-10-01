@@ -25,11 +25,16 @@ public class GL11CMixin {
             .swapTranslucent()) {
       GLIntercept.onDrawElements(mode, count, type, indicesOffset, null);
     }
-    @Inject(method = "glDrawArrays", at = @At("HEAD"), remap = false)
+    private static final ThreadLocal<Boolean> METALRENDER_DRAW_ACTIVE =
+      new ThreadLocal<>();
+
+  @Inject(method = "glDrawArrays", at = @At("HEAD"), remap = false,
+      cancellable = true)
   private static void metalrender$onDrawArrays(int mode, int first, int count,
       CallbackInfo ci) {
     if (count <= 0) return;
     IrisVisualParityCapture.global().beginDrawInvocation();
+    METALRENDER_DRAW_ACTIVE.set(Boolean.TRUE);
     try {
       var pending = IrisPipelineStateCapture.global().captureDrawDirect(
           new IrisExecutionCommand.DrawArrays(mode, first, count, 1, 0,
@@ -39,10 +44,23 @@ public class GL11CMixin {
               pending.orElseThrow())
               || IrisTranslationCoordinator.tryFinalCutover(
                   pending.orElseThrow()))) {
+        METALRENDER_DRAW_ACTIVE.remove();
         IrisVisualParityCapture.global().endDrawInvocation();
+        ci.cancel();
       }
     } catch (RuntimeException ignored) {
-      // Preserve the original GL call; replay remains fail-closed.
+      METALRENDER_DRAW_ACTIVE.remove();
+      IrisVisualParityCapture.global().endDrawInvocation();
+    }
+  }
+
+  @Inject(method = "glDrawArrays", at = @At("RETURN"), remap = false,
+      require = 0)
+  private static void metalrender$onDrawArraysComplete(int mode, int first,
+      int count, CallbackInfo ci) {
+    if (METALRENDER_DRAW_ACTIVE.get() != null) {
+      METALRENDER_DRAW_ACTIVE.remove();
+      IrisVisualParityCapture.global().endDrawInvocation();
     }
   }
 }
