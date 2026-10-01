@@ -305,6 +305,11 @@ public abstract class IrisRenderSystemMixin {
       int level, int internalFormat, int width, int height, int depth,
       int border, int format, int type, ByteBuffer pixels,
       CallbackInfo ci) {
+    // The mirror models layered textures. Keep genuine GL_TEXTURE_3D storage
+    // fail-closed; GL_TEXTURE_2D_ARRAY and cube-map arrays remain layer-safe.
+    if (target == 0x806F) { // GL_TEXTURE_3D
+      return;
+    }
     if (texture <= 0 || level < 0 || width <= 0 || height <= 0
         || depth <= 0) {
       return;
