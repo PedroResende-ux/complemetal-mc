@@ -3,6 +3,8 @@ package com.pebbles_boon.metalrender.compat.iris;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -125,7 +127,7 @@ public final class IrisMetalShadowReplayPacketEncoder {
       out.writeInt(targetWidth);
       out.writeInt(targetHeight);
       putDynamic(out, dynamic, compute);
-      putCommand(out, command);
+      putCommand(out, command, buffers);
       BufferPacketLayout bufferPacket = bufferPacketLayout(buffers,
           arguments);
       putBuffers(out, buffers, vertexLayout, bufferPacket,
@@ -169,7 +171,8 @@ public final class IrisMetalShadowReplayPacketEncoder {
   }
 
   private static void putCommand(DataOutputStream out,
-      IrisExecutionCommand command) throws IOException {
+      IrisExecutionCommand command,
+      IrisShadowReplayBufferSnapshot buffers) throws IOException {
     if (command instanceof IrisExecutionCommand.DrawArrays draw) {
       out.writeInt(1);
       out.writeInt(draw.primitiveMode());
@@ -221,7 +224,107 @@ public final class IrisMetalShadowReplayPacketEncoder {
       }
       return;
     }
+    if (command instanceof IrisExecutionCommand.IndirectDraw indirect) {
+      putIndirectCommand(out, indirect, buffers);
+      return;
+    }
     throw new IllegalArgumentException("unsupported shadow draw command");
+  }
+
+  /**
+   * Lowers GL indirect draw arguments into the direct/multi-draw packet ABI.
+   * The replay protocol intentionally has no indirect-buffer execution path,
+   * so the conversion happens from the immutable draw-time CPU snapshot.
+   *
+   * <p>Indexed indirect commands map naturally to MultiDrawIndexed. Array
+   * indirect is representable only for a single command because the packet ABI
+   * has no MultiDrawArrays form.  The native replay ABI also has one common
+   * instance/baseInstance pair for MultiDrawIndexed, so indexed indirect is
+   * accepted only for the ordinary instanceCount=1, baseInstance=0 case.</p>
+   */
+  private static void putIndirectCommand(DataOutputStream out,
+      IrisExecutionCommand.IndirectDraw draw,
+      IrisShadowReplayBufferSnapshot buffers) throws IOException {
+    IrisShadowReplayBufferSnapshot.BufferRef reference = buffers.indirectArguments()
+        .orElseThrow(() -> new IllegalArgumentException(
+            "indirect draw arguments snapshot unavailable"));
+    int imageId = reference.imageId();
+    if (imageId < 0 || imageId >= buffers.images().size()) {
+      throw new IllegalArgumentException("indirect draw arguments image invalid");
+    }
+    IrisShadowReplayBufferSnapshot.BufferImage image = buffers.images().get(imageId);
+    int elementBytes = draw.indexElementBytes();
+    int commandBytes = elementBytes == 0 ? 16 : 20;
+    long requiredBytes = Math.multiplyExact((long) draw.drawCount(),
+        commandBytes);
+    if (image.byteLength() < requiredBytes || image.ownedBytes().length <
+        requiredBytes) {
+      throw new IllegalArgumentException(
+          "indirect draw arguments snapshot truncated");
+    }
+    ByteBuffer data = ByteBuffer.wrap(image.ownedBytes())
+        .order(ByteOrder.LITTLE_ENDIAN);
+
+    if (elementBytes == 0) {
+      if (draw.drawCount() != 1) {
+        throw new IllegalArgumentException(
+            "multi-draw-array indirect lowering unavailable");
+      }
+      int vertexCount = readUnsignedIntAsInt(data, "indirect vertex count");
+      int instanceCount = readUnsignedIntAsInt(data, "indirect instance count");
+      int firstVertex = readUnsignedIntAsInt(data, "indirect first vertex");
+      int baseInstance = readUnsignedIntAsInt(data, "indirect base instance");
+      out.writeInt(1);
+      out.writeInt(draw.primitiveMode());
+      out.writeInt(firstVertex);
+      out.writeInt(vertexCount);
+      out.writeInt(instanceCount);
+      out.writeInt(baseInstance);
+      return;
+    }
+
+    if (elementBytes != 2 && elementBytes != 4) {
+      throw new IllegalArgumentException(
+          "uint8 indices need expansion for indirect draw");
+    }
+
+    long[] offsets = new long[draw.drawCount()];
+    int[] counts = new int[draw.drawCount()];
+    int[] bases = new int[draw.drawCount()];
+    for (int index = 0; index < draw.drawCount(); index++) {
+      int count = readUnsignedIntAsInt(data, "indirect index count");
+      int instanceCount =
+          readUnsignedIntAsInt(data, "indirect instance count");
+      long firstIndex = Integer.toUnsignedLong(data.getInt());
+      int baseVertex = data.getInt();
+      int baseInstance =
+          readUnsignedIntAsInt(data, "indirect base instance");
+      if (instanceCount != 1 || baseInstance != 0) {
+        throw new IllegalArgumentException(
+            "indirect indexed draw needs instanceCount=1 and baseInstance=0");
+      }
+      offsets[index] = Math.multiplyExact(firstIndex, (long) elementBytes);
+      counts[index] = count;
+      bases[index] = baseVertex;
+    }
+
+    out.writeInt(3);
+    out.writeInt(draw.primitiveMode());
+    out.writeInt(elementBytes);
+    out.writeInt(offsets.length);
+    for (int index = 0; index < offsets.length; index++) {
+      out.writeLong(offsets[index]);
+      out.writeInt(counts[index]);
+      out.writeInt(bases[index]);
+    }
+  }
+
+  private static int readUnsignedIntAsInt(ByteBuffer data, String label) {
+    long value = Integer.toUnsignedLong(data.getInt());
+    if (value > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException(label + " exceeds signed packet range");
+    }
+    return (int) value;
   }
 
   private static void putBuffers(DataOutputStream out,
