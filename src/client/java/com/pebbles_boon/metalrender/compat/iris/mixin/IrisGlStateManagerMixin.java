@@ -535,6 +535,63 @@ public abstract class IrisGlStateManagerMixin {
   }
 
   
+  @Inject(method = "_drawArrays", at = @At("HEAD"), cancellable = true,
+      require = 0)
+  private static void metalrender$drawArrays(int mode, int first, int count,
+      CallbackInfo ci) {
+    if (IrisSodiumImmediateDrawCommandListMixin
+        .metalrender$isHighLevelDrawActive()) {
+      return;
+    }
+    METALRENDER_MOJANG_DRAW_SCOPE.set(Boolean.TRUE);
+    IrisVisualParityCapture.global().beginDrawInvocation();
+    if (first < 0 || count < 0) {
+      metalrender$capture().draw(mode);
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-direct-array-invalid")) {
+        metalrender$finishMojangDraw();
+        ci.cancel();
+      }
+      return;
+    }
+    try {
+      var pending = metalrender$capture().captureDrawDirect(
+          new IrisExecutionCommand.DrawArrays(
+              mode, first, count, 1, 0,
+              IrisExecutionCommand.Source.DIRECT_GL));
+      if (pending.isPresent()
+          && (IrisTranslationCoordinator.tryFullGraphCutover(
+              pending.orElseThrow())
+              || IrisTranslationCoordinator.tryFinalCutover(
+                  pending.orElseThrow()))) {
+        metalrender$finishMojangDraw();
+        ci.cancel();
+      } else if (pending.isEmpty()
+          && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+              "graph-ownership-direct-array-unresolved")) {
+        metalrender$finishMojangDraw();
+        ci.cancel();
+      }
+    } catch (IllegalArgumentException error) {
+      metalrender$capture().draw(mode);
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-direct-array-capture-invalid")) {
+        metalrender$finishMojangDraw();
+        ci.cancel();
+      }
+    }
+  }
+
+  @Inject(method = "_drawArrays", at = @At("RETURN"), require = 0)
+  private static void metalrender$drawArraysComplete(int mode, int first,
+      int count, CallbackInfo ci) {
+    if (IrisSodiumImmediateDrawCommandListMixin
+        .metalrender$isHighLevelDrawActive()) {
+      return;
+    }
+    metalrender$finishMojangDraw();
+  }
+
   @Inject(method = "_drawElements", at = @At("RETURN"))
   private static void metalrender$drawElementsComplete(int mode, int count,
       int type, long indices, CallbackInfo ci) {
