@@ -119,7 +119,7 @@ public final class IrisRenderGraphCapture {
    * discarded this builder.
    */
   public synchronized boolean hasActiveFrame() {
-    return current != null;
+    return current != null && !current.overflowed;
   }
 
   public synchronized void draw(
