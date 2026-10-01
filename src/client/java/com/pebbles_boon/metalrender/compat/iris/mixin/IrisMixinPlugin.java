@@ -15,6 +15,9 @@ import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
  * default or an explicit startup override enables the Metal path.
  */
 public final class IrisMixinPlugin implements IMixinConfigPlugin {
+  private static final String SUPPORTED_IRIS_VERSION =
+      "1.8.12+1.21.1-neoforge";
+
   @Override
   public void onLoad(String mixinPackage) {
   }
@@ -32,12 +35,15 @@ public final class IrisMixinPlugin implements IMixinConfigPlugin {
         return false;
       }
 
-      // The 1.21.1 ABI accessor is observational and must be present whenever
-      // Iris 1.8.x is installed. The experimental capture/translation Mixins
-      // remain separately gated so merely installing Iris cannot suppress its
-      // normal renderer.
+      // This mixin shadows private fields whose layout was verified against
+      // Iris 1.8.12 for Minecraft 1.21.1. Do not apply it to another Iris
+      // build: a harmless-looking class-layout change can hard-crash startup.
       if (mixinClassName.endsWith("Iris1211RenderingPipelineMixin")) {
-        return true;
+        return SUPPORTED_IRIS_VERSION.equals(
+            ModList.get().getModContainerById("iris")
+                .map(container ->
+                    container.getModInfo().getVersion().toString())
+                .orElse(""));
       }
 
       return IrisShaderCapture.isEnabled()
