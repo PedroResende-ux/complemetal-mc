@@ -29,7 +29,7 @@ import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
-import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -1051,15 +1051,15 @@ public class CustomChunkMesher {
     }
     boolean lava = fluid == net.minecraft.world.level.material.Fluids.LAVA ||
         fluid == net.minecraft.world.level.material.Fluids.FLOWING_LAVA;
-    Identifier id;
+    ResourceLocation id;
     if (lava) {
       id = flowing
-          ? Identifier.fromNamespaceAndPath("minecraft", "block/lava_flow")
-          : Identifier.fromNamespaceAndPath("minecraft", "block/lava_still");
+          ? ResourceLocation.fromNamespaceAndPath("minecraft", "block/lava_flow")
+          : ResourceLocation.fromNamespaceAndPath("minecraft", "block/lava_still");
     } else {
       id = flowing
-          ? Identifier.fromNamespaceAndPath("minecraft", "block/water_flow")
-          : Identifier.fromNamespaceAndPath("minecraft", "block/water_still");
+          ? ResourceLocation.fromNamespaceAndPath("minecraft", "block/water_flow")
+          : ResourceLocation.fromNamespaceAndPath("minecraft", "block/water_still");
     }
     return atlas.getSprite(id);
   }
