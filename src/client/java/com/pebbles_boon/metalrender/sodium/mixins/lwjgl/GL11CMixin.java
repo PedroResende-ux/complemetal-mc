@@ -77,7 +77,13 @@ public class GL11CMixin {
         ci.cancel();
       }
     } catch (RuntimeException error) {
-      metalrender$finishDraw();
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-lwjgl-indexed-capture-failed")) {
+        metalrender$finishDraw();
+        ci.cancel();
+      } else {
+        metalrender$finishDraw();
+      }
     }
   }
 
@@ -94,12 +100,23 @@ public class GL11CMixin {
       cancellable = true)
   private static void metalrender$onDrawArrays(int mode, int first, int count,
       CallbackInfo ci) {
-    if (!IrisShaderCapture.isEnabled() || count <= 0) {
+    if (IrisGlStateManagerMixin.metalrender$isMojangDrawActive()
+        || !IrisShaderCapture.isEnabled() || count <= 0) {
       return;
     }
 
     IrisVisualParityCapture.global().beginDrawInvocation();
     METALRENDER_DRAW_ACTIVE.set(Boolean.TRUE);
+    if (first < 0) {
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-lwjgl-array-first-negative")) {
+        metalrender$finishDraw();
+        ci.cancel();
+      } else {
+        metalrender$finishDraw();
+      }
+      return;
+    }
     try {
       var pending = IrisPipelineStateCapture.global().captureDrawDirect(
           new IrisExecutionCommand.DrawArrays(mode, first, count, 1, 0,
@@ -118,7 +135,13 @@ public class GL11CMixin {
         ci.cancel();
       }
     } catch (RuntimeException error) {
-      metalrender$finishDraw();
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-lwjgl-arrays-capture-failed")) {
+        metalrender$finishDraw();
+        ci.cancel();
+      } else {
+        metalrender$finishDraw();
+      }
     }
   }
 
