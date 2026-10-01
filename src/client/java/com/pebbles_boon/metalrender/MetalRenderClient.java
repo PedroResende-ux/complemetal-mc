@@ -21,14 +21,16 @@ import com.pebbles_boon.metalrender.sodium.backend.MeshShaderBackend;
 import com.pebbles_boon.metalrender.sodium.backend.SodiumMetalInterface;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import java.nio.file.Path;
-import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.fabricmc.loader.api.FabricLoader;
+import net.neoforged.fml.ModList;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.client.event.lifecycle.ClientStoppingEvent;
+import net.neoforged.neoforge.common.NeoForge;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
 
-public class MetalRenderClient implements ClientModInitializer {
+@Mod("complemetal")
+public class MetalRenderClient {
   private static final int FPS_PRIORITY_SIMULATION_DISTANCE = 5;
   private static final SimulationDistanceOverride SIMULATION_DISTANCE_OVERRIDE =
       new SimulationDistanceOverride(FPS_PRIORITY_SIMULATION_DISTANCE);
@@ -61,14 +63,19 @@ public class MetalRenderClient implements ClientModInitializer {
   private static int displayTargetPollTicks;
   private static int lastConfiguredTargetFrameRate = -1;
 
-  @Override
-  public void onInitializeClient() {
+  public MetalRenderClient() {
+    instance = this;
+    NeoForge.EVENT_BUS.addListener(this::onClientTick);
+    NeoForge.EVENT_BUS.addListener(this::onClientStopping);
+    initializeClient();
+  }
+
+  private void initializeClient() {
     if (StartupBlocker.shouldBlockStartup()) {
       return;
     }
-    instance = this;
     terminalShutdown = false;
-    MetalLogger.info("metalrender ready");
+    MetalLogger.info("metalrender ready (NeoForge 1.21.1)");
     startIrisTranslationIfEnabled();
     config = MetalRenderConfig.load();
     cfgWasOn = config != null && config.enableMetalRendering;
@@ -81,29 +88,31 @@ public class MetalRenderClient implements ClientModInitializer {
     if (!config.enableMetalRendering) {
       MetalLogger.info("metalrender off");
     }
+  }
 
-    ClientTickEvents.START_CLIENT_TICK.register(client -> {
-      var mc = Minecraft.getInstance();
-      if (!debugEntryStatusSet && mc != null) {
-        MetalDebugEntry.show(mc);
-        debugEntryStatusSet = true;
-      }
-      if (cfgSyncPending) {
-        cfgSyncPending = false;
-        syncCfg(mc);
-      }
-      pollDisplayLifecycle(mc);
-      applyDeferredRuntimeChanges(mc);
-      requestDisplayTargetRefreshIfNeeded();
-      applyFpsPriorityMode(mc);
+  private void onClientTick(ClientTickEvent.Post event) {
+    Minecraft mc = Minecraft.getInstance();
+    if (!debugEntryStatusSet && mc != null) {
+      MetalDebugEntry.show(mc);
+      debugEntryStatusSet = true;
+    }
+    if (cfgSyncPending) {
+      cfgSyncPending = false;
       syncCfg(mc);
-      if (config != null && config.enableMetalRendering && renderer == null &&
-          mc != null && initState == InitState.NOT_TRIED) {
-        initMetal(mc);
-      }
-    });
-    ClientLifecycleEvents.CLIENT_STOPPING.register(
-        client -> shutdownForClientExit());
+    }
+    pollDisplayLifecycle(mc);
+    applyDeferredRuntimeChanges(mc);
+    requestDisplayTargetRefreshIfNeeded();
+    applyFpsPriorityMode(mc);
+    syncCfg(mc);
+    if (config != null && config.enableMetalRendering && renderer == null &&
+        mc != null && initState == InitState.NOT_TRIED) {
+      initMetal(mc);
+    }
+  }
+
+  private void onClientStopping(ClientStoppingEvent event) {
+    shutdownForClientExit();
   }
 
   public static void requestDeferredApply(boolean requestCfgSync,
@@ -419,7 +428,7 @@ public class MetalRenderClient implements ClientModInitializer {
   }
 
   public static boolean isSodiumLoaded() {
-    return FabricLoader.getInstance().isModLoaded("sodium");
+    return ModList.get().isLoaded("sodium");
   }
 
   public static InitState getInitState() {
@@ -724,7 +733,7 @@ public class MetalRenderClient implements ClientModInitializer {
       String configuredRoot = System.getProperty(
           "metalrender.experimental.irisMetalCacheRoot");
       Path cacheRoot = configuredRoot == null || configuredRoot.isBlank()
-          ? FabricLoader.getInstance().getGameDir()
+          ? Minecraft.getInstance().gameDirectory.toPath()
               .resolve(".cache").resolve("metalrender")
           : Path.of(configuredRoot);
       if (IrisTranslationCoordinator.startIfEnabled(cacheRoot)) {
