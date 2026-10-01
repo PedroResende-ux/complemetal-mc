@@ -343,6 +343,35 @@ public final class IrisPipelineStateCapture {
     dispatch(new IrisExecutionCommand.UnknownDispatch());
   }
 
+  public IrisExecutionCommand.Dispatch captureIndirectDispatchCommand(
+      long offsetBytes) {
+    if (offsetBytes < 0) {
+      throw new IllegalArgumentException(
+          "negative indirect dispatch offset");
+    }
+    int buffer = org.lwjgl.opengl.GL43C.glGetInteger(
+        org.lwjgl.opengl.GL43C.GL_DISPATCH_INDIRECT_BUFFER);
+    if (buffer <= 0) {
+      throw new IllegalArgumentException(
+          "compute indirect buffer unavailable");
+    }
+    IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
+    long generation = mirror.generation(buffer);
+    if (generation <= 0 || offsetBytes > Integer.MAX_VALUE - 12L) {
+      throw new IllegalArgumentException(
+          "compute indirect buffer snapshot unavailable");
+    }
+    var snapshot = mirror.snapshot(buffer, generation, offsetBytes, 12)
+        .orElseThrow(() -> new IllegalArgumentException(
+            "compute indirect buffer snapshot unavailable"));
+    java.nio.ByteBuffer bytes = java.nio.ByteBuffer.wrap(snapshot.bytes())
+        .order(java.nio.ByteOrder.nativeOrder());
+    int groupsX = bytes.getInt();
+    int groupsY = bytes.getInt();
+    int groupsZ = bytes.getInt();
+    return captureDispatchCommand(groupsX, groupsY, groupsZ);
+  }
+
   public IrisExecutionCommand.Dispatch captureDispatchCommand(
       int groupsX, int groupsY, int groupsZ) {
     int program = currentGlProgram;
