@@ -15,7 +15,7 @@ import java.util.Optional;
 /** Strict bounded ABI for one batched MTL4 graph command buffer. */
 public final class IrisMetalGraphFramePacketEncoder {
   public static final int MAGIC = 0x4d474639; // MGF9
-  public static final int SCHEMA = 4;
+  public static final int SCHEMA = 5;
   public static final int MAX_PACKET_BYTES =
       IrisMetalShadowReplayPacketEncoder.MAX_PACKET_BYTES;
   public static final int NO_READBACK = -1;
@@ -175,9 +175,12 @@ public final class IrisMetalGraphFramePacketEncoder {
       for (ColorTarget target : draw.colorTargets()) {
         out.putInt(target.slot());
         out.putInt(target.resourceId());
+        out.putInt(target.mipLevel());
       }
       out.putInt(draw.depthResourceId());
+      out.putInt(draw.depthMipLevel());
       out.putInt(draw.stencilResourceId());
+      out.putInt(draw.stencilMipLevel());
       out.putInt(draw.textureOverrides().size());
       for (Map.Entry<Integer, Integer> entry
           : draw.textureOverrides().entrySet()) {
@@ -223,7 +226,8 @@ public final class IrisMetalGraphFramePacketEncoder {
       } else if (operation instanceof Draw draw) {
         size = addSize(size, 28L + asciiLength(
             draw.pipelineKeySha256()) + draw.replayPacket.length
-            + draw.colorTargets().size() * 8L
+            + draw.colorTargets().size() * 12L
+            + 8L + 8L
             + draw.textureOverrides().size() * 8L);
       } else if (operation instanceof Compute compute) {
         size = addSize(size, 28L + asciiLength(
@@ -613,9 +617,18 @@ public final class IrisMetalGraphFramePacketEncoder {
 
   public record Draw(String pipelineKeySha256, byte[] replayPacket,
                      List<ColorTarget> colorTargets,
-                     int depthResourceId, int stencilResourceId,
+                     int depthResourceId, int depthMipLevel,
+                     int stencilResourceId, int stencilMipLevel,
                      Map<Integer, Integer> textureOverrides)
       implements Operation {
+    public Draw(String pipelineKeySha256, byte[] replayPacket,
+                List<ColorTarget> colorTargets,
+                int depthResourceId, int stencilResourceId,
+                Map<Integer, Integer> textureOverrides) {
+      this(pipelineKeySha256, replayPacket, colorTargets,
+          depthResourceId, 0, stencilResourceId, 0, textureOverrides);
+    }
+
     public Draw {
       IrisRenderGraph.requireSha(pipelineKeySha256, "pipelineKeySha256");
       replayPacket = Objects.requireNonNull(replayPacket, "replayPacket")
@@ -636,7 +649,10 @@ public final class IrisMetalGraphFramePacketEncoder {
       }
       colorTargets = List.copyOf(colors);
       if (colorTargets.size() > IrisPipelineState.MAX_COLOR_ATTACHMENTS
-          || depthResourceId < -1 || stencilResourceId < -1) {
+          || depthResourceId < -1 || stencilResourceId < -1
+          || depthMipLevel < 0 || stencilMipLevel < 0
+          || (depthResourceId < 0 && depthMipLevel != 0)
+          || (stencilResourceId < 0 && stencilMipLevel != 0)) {
         throw new IllegalArgumentException("invalid draw graph targets");
       }
       java.util.TreeMap<Integer, Integer> overrides =
@@ -714,10 +730,14 @@ public final class IrisMetalGraphFramePacketEncoder {
     }
   }
 
-  public record ColorTarget(int slot, int resourceId) {
+  public record ColorTarget(int slot, int resourceId, int mipLevel) {
+    public ColorTarget(int slot, int resourceId) {
+      this(slot, resourceId, 0);
+    }
+
     public ColorTarget {
       if (slot < 0 || slot >= IrisPipelineState.MAX_COLOR_ATTACHMENTS
-          || resourceId < 0) {
+          || resourceId < 0 || mipLevel < 0) {
         throw new IllegalArgumentException("invalid graph color target");
       }
     }
