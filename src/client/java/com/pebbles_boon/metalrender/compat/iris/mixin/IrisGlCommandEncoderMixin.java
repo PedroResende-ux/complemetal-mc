@@ -3,7 +3,7 @@ package com.pebbles_boon.metalrender.compat.iris.mixin;
 import com.mojang.blaze3d.IndexType;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.opengl.GlBuffer;
-import com.mojang.blaze3d.opengl.GlConst;
+import com.mojang.blaze3d.platform.GlConst;
 import com.mojang.blaze3d.opengl.GlRenderPipeline;
 import com.mojang.blaze3d.opengl.GlTexture;
 import com.mojang.blaze3d.textures.GpuTexture;
@@ -292,7 +292,7 @@ public abstract class IrisGlCommandEncoderMixin {
       var pending = IrisPipelineStateCapture.global().captureDraw(
           IrisMojangDrawCommand.fromBuffers(primitiveMode, baseVertex,
               firstIndex, indexCount, indexType == null ? 0 : indexType.bytes,
-              instanceCount, baseInstance),
+              instanceCount, 0),
           metalrender$vertexInputs(pass));
       if (pending.isPresent()) {
         metalrender$enterDrawCaptureScope();
