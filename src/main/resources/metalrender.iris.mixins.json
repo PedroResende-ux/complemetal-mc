@@ -7,7 +7,8 @@
   "mixins": [],
   "client": [
     "Iris1211RenderingPipelineMixin",
-    "IrisProgramBuilderMixin"
+    "IrisProgramBuilderMixin",
+    "IrisProgramBuilderAccessor"
   ],
   "injectors": {
     "defaultRequire": 0
