@@ -198,6 +198,9 @@ public final class IrisMetalShadowReplayPacketEncoder {
       out.writeInt(dispatch.groupsX());
       out.writeInt(dispatch.groupsY());
       out.writeInt(dispatch.groupsZ());
+      out.writeInt(dispatch.localSizeX());
+      out.writeInt(dispatch.localSizeY());
+      out.writeInt(dispatch.localSizeZ());
       return;
     }
     if (command instanceof IrisExecutionCommand.MultiDrawIndexed draw) {
