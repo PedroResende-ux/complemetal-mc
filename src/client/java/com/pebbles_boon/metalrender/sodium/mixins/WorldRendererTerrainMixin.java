@@ -27,7 +27,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(value = DefaultChunkRenderer.class, remap = false)
 public abstract class WorldRendererTerrainMixin {
   @Inject(method = "render", at = @At("HEAD"),
-      cancellable = true, require = 1)
+      cancellable = true, require = 0)
   private void metalrender$replaceSodiumTerrain(
       ChunkRenderMatrices matrices,
       CommandList commandList,
