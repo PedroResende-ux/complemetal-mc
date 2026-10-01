@@ -107,11 +107,14 @@ public final class IrisMetalShadowReplayPacketEncoder {
         || targetHeight <= 0 || targetHeight > MAX_TARGET_EXTENT) {
       throw new IllegalArgumentException("invalid shadow replay target");
     }
+    boolean compute = vertexLayout.state().pass().kind()
+        == IrisPipelineState.PassKind.COMPUTE;
+    IrisGlStateSnapshot.Operation operation = compute
+        ? IrisGlStateSnapshot.Operation.DISPATCH
+        : IrisGlStateSnapshot.Operation.DRAW;
     if (!buffers.drawComplete() || !textures.captureEnabled()
-        || !arguments.complete()
-        || !dynamic.completeFor(IrisGlStateSnapshot.Operation.DRAW)
-        || vertexLayout.state().pass().kind()
-            == IrisPipelineState.PassKind.COMPUTE) {
+        || !arguments.complete() || !dynamic.completeFor(operation)
+        || compute && !(command instanceof IrisExecutionCommand.Dispatch)) {
       throw new IllegalArgumentException("incomplete shadow replay packet");
     }
     try {
@@ -121,7 +124,7 @@ public final class IrisMetalShadowReplayPacketEncoder {
       out.writeInt(SCHEMA);
       out.writeInt(targetWidth);
       out.writeInt(targetHeight);
-      putDynamic(out, dynamic);
+      putDynamic(out, dynamic, compute);
       putCommand(out, command);
       BufferPacketLayout bufferPacket = bufferPacketLayout(buffers,
           arguments);
@@ -143,7 +146,13 @@ public final class IrisMetalShadowReplayPacketEncoder {
   }
 
   private static void putDynamic(DataOutputStream out,
-      IrisDynamicDrawState dynamic) throws IOException {
+      IrisDynamicDrawState dynamic, boolean compute) throws IOException {
+    if (compute) {
+      putRect(out, new IrisDynamicDrawState.Rect(0, 0, 1, 1));
+      out.writeBoolean(false);
+      putRect(out, new IrisDynamicDrawState.Rect(0, 0, 0, 0));
+      return;
+    }
     putRect(out, dynamic.viewport().value());
     boolean scissor = dynamic.scissorEnabled().value();
     out.writeBoolean(scissor);
@@ -182,6 +191,13 @@ public final class IrisMetalShadowReplayPacketEncoder {
       out.writeInt(draw.baseVertex());
       out.writeInt(draw.instanceCount());
       out.writeInt(draw.baseInstance());
+      return;
+    }
+    if (command instanceof IrisExecutionCommand.Dispatch dispatch) {
+      out.writeInt(4);
+      out.writeInt(dispatch.groupsX());
+      out.writeInt(dispatch.groupsY());
+      out.writeInt(dispatch.groupsZ());
       return;
     }
     if (command instanceof IrisExecutionCommand.MultiDrawIndexed draw) {
