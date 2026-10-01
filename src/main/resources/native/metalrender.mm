@@ -9349,37 +9349,57 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
       return nullptr;
     }
 
+    bool computePacket = packet.draw.kind == 4;
     {
       std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
       auto found = g_irisMetal4Pipelines.find(operation.pipelineKey);
-      if (found == g_irisMetal4Pipelines.end() || !found->second.render) {
+      if (found == g_irisMetal4Pipelines.end() ||
+          (computePacket ? !found->second.compute : !found->second.render)) {
         outcome = 0;
         reason = kIrisGraphReasonDrawPipelineUnavailable;
         return nullptr;
       }
       prepared->pipeline = found->second;
-      [prepared->pipeline.render retain];
-      if (prepared->pipeline.vertexFunction)
-        [prepared->pipeline.vertexFunction retain];
-      if (prepared->pipeline.fragmentFunction)
-        [prepared->pipeline.fragmentFunction retain];
-      if (prepared->pipeline.depthStencil)
-        [prepared->pipeline.depthStencil retain];
+      if (computePacket) {
+        [prepared->pipeline.compute retain];
+        if (prepared->pipeline.computeFunction)
+          [prepared->pipeline.computeFunction retain];
+      } else {
+        [prepared->pipeline.render retain];
+        if (prepared->pipeline.vertexFunction)
+          [prepared->pipeline.vertexFunction retain];
+        if (prepared->pipeline.fragmentFunction)
+          [prepared->pipeline.fragmentFunction retain];
+        if (prepared->pipeline.depthStencil)
+          [prepared->pipeline.depthStencil retain];
+      }
       prepared->pipelineRetained = true;
     }
 
     IrisMetal4PipelineEntry &entry = prepared->pipeline;
     IrisShadowReplayPacket &packet = prepared->packet;
     prepared->encodedObjects.reserve(1);
-    uint32_t packetTopology = packet.draw.primitiveMode <= 5
-        ? packet.draw.primitiveMode : UINT32_MAX;
-    if (!iris_metal_primitive_type(entry.topology,
-                                   prepared->primitiveType) ||
-        packetTopology != iris_metal_effective_packet_topology(
-            entry.topology) || entry.rasterSampleCount == 0 ||
-        (entry.colorFormats.empty() &&
-         entry.depthFormat == MTLPixelFormatInvalid &&
-         entry.stencilFormat == MTLPixelFormatInvalid)) {
+    if (!computePacket) {
+      uint32_t packetTopology = packet.draw.primitiveMode <= 5
+          ? packet.draw.primitiveMode : UINT32_MAX;
+      if (!iris_metal_primitive_type(entry.topology,
+                                     prepared->primitiveType) ||
+          packetTopology != iris_metal_effective_packet_topology(
+              entry.topology) || entry.rasterSampleCount == 0 ||
+          (entry.colorFormats.empty() &&
+           entry.depthFormat == MTLPixelFormatInvalid &&
+           entry.stencilFormat == MTLPixelFormatInvalid)) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawPipelineStateMismatch;
+        return nullptr;
+      }
+    } else if (packet.draw.groupsX == 0 || packet.draw.groupsY == 0 ||
+               packet.draw.groupsZ == 0 ||
+               packet.draw.localSizeX == 0 ||
+               packet.draw.localSizeY == 0 ||
+               packet.draw.localSizeZ == 0 ||
+               (uint64_t)packet.draw.localSizeX *
+                   packet.draw.localSizeY * packet.draw.localSizeZ > 1024ULL) {
       outcome = 0;
       reason = kIrisGraphReasonDrawPipelineStateMismatch;
       return nullptr;
@@ -9689,8 +9709,20 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
     }
 
     for (const auto &stage : packet.stages) {
-      int result = iris_shadow_prepare_arguments(stage,
-          stage.stage == 0 ? entry.vertexFunction : entry.fragmentFunction,
+      id<MTLFunction> argumentFunction = nil;
+      if (stage.stage == 0) {
+        argumentFunction = entry.vertexFunction;
+      } else if (stage.stage == 4) {
+        argumentFunction = entry.fragmentFunction;
+      } else if (stage.stage == 5) {
+        argumentFunction = entry.computeFunction;
+      }
+      if (!argumentFunction) {
+        outcome = 0;
+        reason = kIrisGraphReasonDrawArgumentBindingUnsupported;
+        return nullptr;
+      }
+      int result = iris_shadow_prepare_arguments(stage, argumentFunction,
           prepared->resources, frameArena);
       if (result <= 0) {
         outcome = result;
@@ -9708,17 +9740,19 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
           (id<MTLAllocation>)buffer);
     }
 
-    if (!packet.vertexBuffers.empty() &&
+    if (!computePacket && !packet.vertexBuffers.empty() &&
         !prepared->resources.vertexTable) {
       prepared->resources.vertexTable =
           g_irisMetal4ArgumentTableFactory.make();
       if (!prepared->resources.vertexTable)
         return nullptr;
     }
-    for (const auto &binding : packet.vertexBuffers) {
-      [(id<MTL4ArgumentTable>)prepared->resources.vertexTable
-          setAddress:prepared->resources.buffers[binding.second].gpuAddress
-             atIndex:binding.first];
+    if (!computePacket) {
+      for (const auto &binding : packet.vertexBuffers) {
+        [(id<MTL4ArgumentTable>)prepared->resources.vertexTable
+            setAddress:prepared->resources.buffers[binding.second].gpuAddress
+               atIndex:binding.first];
+      }
     }
 
     outcome = 1;
