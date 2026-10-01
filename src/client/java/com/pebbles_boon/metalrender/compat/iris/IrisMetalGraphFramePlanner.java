@@ -550,7 +550,7 @@ public final class IrisMetalGraphFramePlanner {
     return List.copyOf(operations);
   }
 
-  private static boolean hasRepeatedFormat(
+  static boolean hasRepeatedFormat(
       IrisRenderExecutionPlan plan, List<Integer> resourceIds) {
     HashSet<String> formats = new HashSet<>();
     for (Integer resourceId : resourceIds) {
