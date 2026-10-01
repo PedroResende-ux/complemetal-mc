@@ -6793,12 +6793,64 @@ static jlongArray run_iris_metal4_graph_frame(
                            userInfo:nil];
             }
             if (source.sampleCount != 1 || destination.sampleCount != 1) {
-              status = 0;
-              reason = kIrisGraphReasonCopyMultisampleUnsupported;
-              @throw [NSException
-                  exceptionWithName:@"MetalRenderGraphUnsupported"
-                             reason:@"graph texture copy multisample unsupported"
-                           userInfo:nil];
+              bool fullSurfaceResolve =
+                  source.sampleCount > 1 && destination.sampleCount == 1
+                  && operation.sourceLevel == 0
+                  && operation.destinationLevel == 0
+                  && operation.x == 0 && operation.y == 0
+                  && operation.destinationX == 0
+                  && operation.destinationY == 0
+                  && operation.width == (int32_t)sourceWidth
+                  && operation.height == (int32_t)sourceHeight
+                  && operation.width == (int32_t)destinationWidth
+                  && operation.height == (int32_t)destinationHeight
+                  && source.mipmapLevelCount == 1
+                  && destination.mipmapLevelCount == 1;
+              if (!fullSurfaceResolve) {
+                status = 0;
+                reason = kIrisGraphReasonCopyMultisampleUnsupported;
+                @throw [NSException
+                    exceptionWithName:@"MetalRenderGraphUnsupported"
+                               reason:@"graph texture copy multisample unsupported"
+                             userInfo:nil];
+              }
+              MTLRenderPassDescriptor *pass =
+                  [[MTLRenderPassDescriptor alloc] init];
+              MTLRenderPassColorAttachmentDescriptor *attachment =
+                  pass.colorAttachments[0];
+              attachment.texture = source;
+              attachment.level = operation.sourceLevel;
+              attachment.loadAction = MTLLoadActionLoad;
+              attachment.storeAction =
+                  MTLStoreActionStoreAndMultisampleResolve;
+              attachment.resolveTexture = destination;
+              attachment.resolveLevel = operation.destinationLevel;
+              pass.defaultRasterSampleCount = source.sampleCount;
+              pass.renderTargetWidth = sourceWidth;
+              pass.renderTargetHeight = sourceHeight;
+              id<MTL4RenderCommandEncoder> encoder =
+                  [commandBuffer renderCommandEncoderWithDescriptor:pass];
+              encodedObjects.push_back(pass);
+              if (!encoder)
+                @throw [NSException
+                    exceptionWithName:@"MetalRenderGraphSetup"
+                               reason:@"resolve encoder unavailable"
+                             userInfo:nil];
+              bool applyBarrier = readNeedsBarrier(
+                  operation.firstResource) || writeNeedsBarrier(
+                      operation.secondResource);
+              if (applyBarrier) {
+                [encoder barrierAfterQueueStages:graphStages
+                                    beforeStages:graphStages
+                               visibilityOptions:MTL4VisibilityOptionDevice];
+                profileBarrierCalls++;
+                consumeBarrier();
+              }
+              [encoder endEncoding];
+              pendingReads.insert(operation.firstResource);
+              pendingWrites.insert(operation.secondResource);
+              transfers++;
+              continue;
             }
             if (operation.sourceLevel >= source.mipmapLevelCount ||
                 operation.destinationLevel >=
