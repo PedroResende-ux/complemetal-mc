@@ -63,7 +63,8 @@ final class IrisMetalGraphFramePacketEncoderTest {
     assertEquals(-1, buffer.getInt());
     assertEquals(-1, buffer.getInt());
     assertEquals(2, buffer.getInt());
-    buffer.position(buffer.position() + 24);
+    assertEquals(0, buffer.getInt());
+    assertEquals(0, buffer.getInt());
     assertEquals(1, buffer.getInt());
     assertEquals(6, buffer.getInt());
   }
