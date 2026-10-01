@@ -14,7 +14,7 @@ import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 
 public class MetalTextureManager {
-  private static final net.minecraft.resources.Identifier BLOCKS_ATLAS_ID = TextureAtlas.LOCATION_BLOCKS;
+  private static final net.minecraft.resources.ResourceLocation BLOCKS_ATLAS_ID = TextureAtlas.LOCATION_BLOCKS;
   private final long deviceHandle;
   private long blockAtlasTexture;
   private long lightmapTexture;
