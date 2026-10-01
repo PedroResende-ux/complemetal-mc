@@ -17,7 +17,7 @@
     "WorldRendererTerrainMixin",
     "SodiumRenderSectionManagerMixin",
     "accessor.WindowAccessor",
-    "accessor.AccessorLightTexture",
+    "accessor.AccessorLightTexture"
   ],
   "injectors": {
     "defaultRequire": 1
