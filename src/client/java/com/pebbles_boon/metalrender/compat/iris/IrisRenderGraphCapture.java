@@ -580,7 +580,7 @@ public final class IrisRenderGraphCapture {
     if (!complete && current.fullReplay) {
       current.fullReplayComplete = false;
     }
-    return captured;
+    return captured && complete;
   }
 
   private boolean legacyAttachmentClear(
