@@ -470,6 +470,10 @@ public abstract class IrisGlStateManagerMixin {
     }
   }
 
+  private static void metalrender$finishMojangDraw() {
+    metalrender$finishMojangDraw();
+  }
+
   @Inject(method = "_drawElements", at = @At("HEAD"), cancellable = true)
   private static void metalrender$drawElements(int mode, int count, int type,
       long indices, CallbackInfo ci) {
@@ -485,7 +489,7 @@ public abstract class IrisGlStateManagerMixin {
       metalrender$capture().draw(mode);
       if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
           "graph-ownership-direct-index-type-unsupported")) {
-        IrisVisualParityCapture.global().endDrawInvocation();
+        metalrender$finishMojangDraw();
         ci.cancel();
       }
       return;
@@ -500,7 +504,7 @@ public abstract class IrisGlStateManagerMixin {
               pending.orElseThrow())
               || IrisTranslationCoordinator.tryFinalCutover(
                   pending.orElseThrow()))) {
-        IrisVisualParityCapture.global().endDrawInvocation();
+        metalrender$finishMojangDraw();
         ci.cancel();
       } else if (pending.isEmpty()
           && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
