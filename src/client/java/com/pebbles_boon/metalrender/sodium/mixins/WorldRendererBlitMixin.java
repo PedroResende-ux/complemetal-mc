@@ -37,8 +37,8 @@ public abstract class WorldRendererBlitMixin {
       Camera camera,
       GameRenderer gameRenderer,
       LightTexture lightTexture,
+      Matrix4f frustumMatrix,
       Matrix4f projectionMatrix,
-      Matrix4f positionMatrix,
       CallbackInfo ci) {
     MetalRenderHookState.beginFrameAttempt();
     metalrender$frameActive = false;
@@ -59,11 +59,11 @@ public abstract class WorldRendererBlitMixin {
 
     try {
       float tickDelta = deltaTracker.getGameTimeDeltaPartialTick(true);
-      CapturedMatrices.capture(projectionMatrix, positionMatrix,
+      CapturedMatrices.capture(projectionMatrix, frustumMatrix,
           camera.position().x, camera.position().y, camera.position().z);
 
       worldRenderer.beginFrame(camera, tickDelta,
-          projectionMatrix, positionMatrix);
+          projectionMatrix, frustumMatrix);
 
       if (renderer.frameCtx() == 0) {
         MetalRenderHookState.failOpen("begin-frame-context", null);
