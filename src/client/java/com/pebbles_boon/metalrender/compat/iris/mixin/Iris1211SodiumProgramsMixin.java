@@ -13,12 +13,12 @@ import net.irisshaders.iris.pipeline.transform.PatchShaderType;
 import net.irisshaders.iris.shaderpack.programs.ProgramSet;
 import net.irisshaders.iris.shaderpack.programs.ProgramSource;
 import net.irisshaders.iris.uniforms.custom.CustomUniforms;
-import net.irisshaders.iris.vertices.IrisVertexFormats;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
  * Captures the exact shaderpack GLSL Iris feeds into Sodium 0.6.13 after
@@ -92,7 +92,7 @@ public abstract class Iris1211SodiumProgramsMixin {
     }
 
     try {
-      IrisShaderCapture.captureLinkedGraphicsProgram(
+      IrisShaderCapture.deferLinkedSodiumGraphicsProgram(
           glObject.handle(),
           "iris-sodium:" + name,
           vertex,
@@ -100,12 +100,18 @@ public abstract class Iris1211SodiumProgramsMixin {
           tessControl,
           tessEvaluation,
           fragment,
-          IrisVertexFormats.TERRAIN,
           false);
     } catch (Throwable ignored) {
       // The capture boundary is explicitly fail-open. Iris/Sodium keeps the
       // linked OpenGL program even when Complemetal cannot mirror it.
     }
+  }
+
+  @Inject(method = "getProgram", at = @At("HEAD"), require = 0)
+  private void complemetal$finalizeSodiumTerrainFormat(
+      net.caffeinemc.mods.sodium.client.render.chunk.terrain.TerrainRenderPass pass,
+      CallbackInfoReturnable<?> callback) {
+    IrisShaderCapture.finalizeDeferredSodiumPrograms();
   }
 
   private record PendingSources(String passName,
