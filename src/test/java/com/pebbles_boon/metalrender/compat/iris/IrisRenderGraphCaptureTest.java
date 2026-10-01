@@ -29,6 +29,19 @@ final class IrisRenderGraphCaptureTest {
   }
 
   @Test
+  void activeFrameTracksWhetherGraphOperationsCanBeSuppressed() {
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(
+        new IrisGlStateTracker());
+    assertFalse(capture.hasActiveFrame());
+
+    capture.beginFrame();
+    assertTrue(capture.hasActiveFrame());
+
+    capture.endFrame();
+    assertFalse(capture.hasActiveFrame());
+  }
+
+  @Test
   void fullReplayReservationBypassesRegularFrameSamplingInterval() {
     AtomicLong now = new AtomicLong(1_000_000_000L);
     AtomicBoolean fullReplay = new AtomicBoolean();
