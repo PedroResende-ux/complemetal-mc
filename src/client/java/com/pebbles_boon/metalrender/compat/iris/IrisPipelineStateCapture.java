@@ -343,7 +343,7 @@ public final class IrisPipelineStateCapture {
     dispatch(new IrisExecutionCommand.UnknownDispatch());
   }
 
-  private IrisExecutionCommand.Dispatch captureDispatchCommand(
+  public IrisExecutionCommand.Dispatch captureDispatchCommand(
       int groupsX, int groupsY, int groupsZ) {
     int program = currentGlProgram;
     if (program <= 0) {
