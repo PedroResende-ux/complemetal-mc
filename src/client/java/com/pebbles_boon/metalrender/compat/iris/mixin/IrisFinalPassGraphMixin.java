@@ -71,10 +71,12 @@ public abstract class IrisFinalPassGraphMixin {
         IrisGlResourceBindingTracker.global().activeTextureBinding(target);
     boolean suppress;
     if (destination != null && destination.texture() > 0) {
-      IrisRenderGraphCapture.global().copyTexture(destination.texture(),
-          target, level, destinationX, destinationY, sourceX, sourceY,
-          width, height, GL11C.glGetInteger(GL11C.GL_READ_BUFFER));
-      suppress = IrisTranslationCoordinator.suppressFullGraphOperation();
+      boolean captured = IrisRenderGraphCapture.global().copyTexture(
+          destination.texture(), target, level, destinationX, destinationY,
+          sourceX, sourceY, width, height,
+          GL11C.glGetInteger(GL11C.GL_READ_BUFFER));
+      suppress = captured
+          && IrisTranslationCoordinator.suppressFullGraphOperation();
     } else {
       suppress = IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
           "graph-ownership-temporal-copy-destination-unavailable");
