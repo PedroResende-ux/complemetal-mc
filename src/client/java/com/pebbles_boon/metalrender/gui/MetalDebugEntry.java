@@ -10,7 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import net.fabricmc.loader.api.FabricLoader;
+import net.neoforged.fml.ModList;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.debug.DebugScreenDisplayer;
@@ -170,9 +170,8 @@ public final class MetalDebugEntry implements DebugScreenEntry {
   }
 
   private static String dispVer() {
-    var v = FabricLoader.getInstance()
-        .getModContainer("complemetal")
-        .map(c -> c.getMetadata().getVersion().getFriendlyString())
+    var v = ModList.get().getModContainerById("complemetal")
+        .map(c -> c.getModInfo().getVersion().toString())
         .orElse("unknown");
     return !v.isEmpty() && (v.charAt(0) == 'v' || v.charAt(0) == 'V')
         ? v.substring(1)
