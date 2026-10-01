@@ -1,8 +1,5 @@
 package com.pebbles_boon.metalrender.render;
 
-import com.mojang.blaze3d.systems.CommandEncoder;
-import com.mojang.blaze3d.systems.RenderPass;
-import com.mojang.blaze3d.systems.RenderSystem;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.backend.MetalRenderer;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
@@ -855,34 +852,12 @@ public class MetalWorldRenderer {
     normalizePlane(out, 20);
   }
 
+  /**
+   * Minecraft 1.21.1 does not expose the newer camera attribute-probe API used
+   * by the 26.2 implementation. Keep a neutral sky factor until a native 1.21.1
+   * light/sky capture path is added.
+   */
   private static float resolveSkyLightFactor(Camera camera, float tickDelta) {
-    if (camera == null || skyLightLookupFailed) {
-      return 1.0f;
-    }
-    Object attributeProbe = camera.attributeProbe();
-    if (attributeProbe == null) {
-      return 1.0f;
-    }
-    try {
-      java.lang.reflect.Field factorField = skyLightFactorField;
-      java.lang.reflect.Method getValueMethod = skyLightProbeGetValueMethod;
-      if (factorField == null || getValueMethod == null) {
-        Class<?> attributesClass = Class.forName(
-            "net.minecraft.world.attribute.EnvironmentAttributes");
-        factorField = attributesClass.getField("SKY_LIGHT_FACTOR");
-        getValueMethod = attributeProbe.getClass().getMethod(
-            "getValue", factorField.getType(), float.class);
-        skyLightFactorField = factorField;
-        skyLightProbeGetValueMethod = getValueMethod;
-      }
-      Object value = getValueMethod.invoke(attributeProbe,
-          factorField.get(null), tickDelta);
-      if (value instanceof Number number) {
-        return number.floatValue();
-      }
-    } catch (ReflectiveOperationException | RuntimeException ignored) {
-      skyLightLookupFailed = true;
-    }
     return 1.0f;
   }
 
@@ -1791,21 +1766,16 @@ public class MetalWorldRenderer {
       return false;
     }
     MetalRenderer renderer = MetalRenderClient.getRenderer();
-    if (renderer == null || !renderer.isAvailable())
+    if (renderer == null || !renderer.isAvailable()) {
       return false;
-    long handle = renderer.getHandle();
-    if (handle == 0)
-      return false;
-    Minecraft mc = Minecraft.getInstance();
-    if (mc != null && mc.gameRenderer.mainRenderTarget() != null) {
-      CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
-      try (RenderPass pass = encoder.createRenderPass(
-          () -> "metalrender_terrain_blit",
-          mc.gameRenderer.mainRenderTarget().getColorTextureView(),
-          java.util.Optional.empty())) {
-        return ioSurfaceBlitter.blit(handle);
-      }
     }
+    long handle = renderer.getHandle();
+    if (handle == 0) {
+      return false;
+    }
+    // 1.21.1 does not expose the 26.2 RenderPass/CommandEncoder API used by
+    // the upstream branch. The IOSurface blitter already contains the native
+    // texture-to-window path and is loader/version independent.
     return ioSurfaceBlitter.blit(handle);
   }
 
