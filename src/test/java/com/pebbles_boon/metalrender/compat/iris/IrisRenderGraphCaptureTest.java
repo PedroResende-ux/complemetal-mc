@@ -337,6 +337,32 @@ final class IrisRenderGraphCaptureTest {
   }
 
   @Test
+  void partialLegacyClearIsNotEligibleForOpenGlSuppression() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerFramebuffer(9);
+    tracker.defineTexture(90, "rgba8-unorm", 1, 32, 16, 1, 1);
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(9,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 90, 0));
+    assertTrue(tracker.drawBuffersForFramebuffer(9,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0));
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_DRAW_FRAMEBUFFER, 9);
+
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(
+        tracker, () -> 1_000_000_000L, () -> false);
+    capture.beginFrame();
+    capture.legacyClearColor(0.0F, 0.0F, 0.0F, 1.0F);
+
+    assertFalse(capture.legacyClearBoundFramebuffer(
+        GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
+    capture.endFrame();
+
+    IrisRenderGraphCapture.PendingFrame frame =
+        capture.poll().orElseThrow();
+    assertEquals(1, frame.events().size());
+  }
+
+  @Test
   void routesDepthTextureCopyFromDepthAttachmentInsteadOfReadColor() {
     IrisGlStateTracker tracker = new IrisGlStateTracker();
     tracker.initializeOpenGlDefaults();
