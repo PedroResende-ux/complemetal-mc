@@ -194,7 +194,7 @@ public final class IrisMetalGraphFramePlanner {
       }
       TargetExtent extent = compute
           ? new TargetExtent(1, 1)
-          : targetExtent(plan, pipeline, tokensById);
+          : targetExtent(plan, pipeline, tokensById, idsByHandle);
       DrawResult resolvedResult = drawResolver.resolve(pipeline,
           extent.width(), extent.height());
       if (resolvedResult instanceof UnsupportedDraw blocked) {
@@ -560,21 +560,44 @@ public final class IrisMetalGraphFramePlanner {
 
   private static TargetExtent targetExtent(IrisRenderExecutionPlan plan,
       IrisRenderExecutionPlan.PipelineStep pipeline,
-      Map<Integer, Long> tokensById) {
+      Map<Integer, Long> tokensById,
+      Map<ResourceHandle, Integer> idsByHandle) {
     int width = 0;
     int height = 0;
     int samples = 0;
-    for (ResourceUse use : plan.graph().nodes().get(pipeline.nodeId())
-        .resources()) {
-      if (!use.access().writes() || !tokensById.containsKey(use.resourceId())) {
+    IrisGlStateSnapshot snapshot = pipeline.pending().snapshot();
+    HashSet<ResourceHandle> attachments = new HashSet<>();
+    for (IrisGlStateSnapshot.ColorTarget target : snapshot.colorTargets()) {
+      if (!target.drawBuffer().isKnown()
+          || target.drawBuffer().value() == IrisGlStateTracker.GL_NONE
+          || !target.attachment().isKnown()
+          || target.attachment().value().isEmpty()) {
         continue;
       }
-      Resource resource = plan.graph().resources().get(use.resourceId());
+      attachments.add(target.attachment().value().orElseThrow().texture());
+    }
+    if (snapshot.depthAttachment().isKnown()) {
+      snapshot.depthAttachment().value().ifPresent(
+          attachment -> attachments.add(attachment.texture()));
+    }
+    if (snapshot.stencilAttachment().isKnown()) {
+      snapshot.stencilAttachment().value().ifPresent(
+          attachment -> attachments.add(attachment.texture()));
+    }
+    for (ResourceHandle handle : attachments) {
+      Integer resourceId = idsByHandle.get(handle);
+      if (resourceId == null || !tokensById.containsKey(resourceId)) {
+        continue;
+      }
+      Resource resource = plan.graph().resources().get(resourceId);
+      int mipLevel = attachmentMipLevel(snapshot, handle);
+      int attachmentWidth = Math.max(1, resource.width() >> mipLevel);
+      int attachmentHeight = Math.max(1, resource.height() >> mipLevel);
       if (width == 0) {
-        width = resource.width();
-        height = resource.height();
+        width = attachmentWidth;
+        height = attachmentHeight;
         samples = resource.sampleCount();
-      } else if (width != resource.width() || height != resource.height()
+      } else if (width != attachmentWidth || height != attachmentHeight
           || samples != resource.sampleCount()) {
         throw unsupported("graph-frame-render-target-extent-mismatch");
       }
@@ -583,6 +606,34 @@ public final class IrisMetalGraphFramePlanner {
       throw unsupported("graph-frame-render-target-unavailable");
     }
     return new TargetExtent(width, height);
+  }
+
+  private static int attachmentMipLevel(
+      IrisGlStateSnapshot snapshot, ResourceHandle handle) {
+    for (IrisGlStateSnapshot.ColorTarget target : snapshot.colorTargets()) {
+      if (!target.attachment().isKnown()
+          || target.attachment().value().isEmpty()) {
+        continue;
+      }
+      IrisGlStateSnapshot.TextureAttachment attachment =
+          target.attachment().value().orElseThrow();
+      if (attachment.texture().equals(handle)) {
+        return attachment.mipLevel();
+      }
+    }
+    if (snapshot.depthAttachment().isKnown()
+        && snapshot.depthAttachment().value().isPresent()
+        && snapshot.depthAttachment().value().orElseThrow().texture()
+            .equals(handle)) {
+      return snapshot.depthAttachment().value().orElseThrow().mipLevel();
+    }
+    if (snapshot.stencilAttachment().isKnown()
+        && snapshot.stencilAttachment().value().isPresent()
+        && snapshot.stencilAttachment().value().orElseThrow().texture()
+            .equals(handle)) {
+      return snapshot.stencilAttachment().value().orElseThrow().mipLevel();
+    }
+    throw unsupported("graph-frame-attachment-mip-unavailable");
   }
 
   private static DrawTargets drawTargets(IrisRenderExecutionPlan plan,
