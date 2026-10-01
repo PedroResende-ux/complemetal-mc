@@ -12,6 +12,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.Optional;
+import net.neoforged.fml.ModList;
 import java.util.Set;
 
 public final class NativeBridge {
@@ -298,37 +299,10 @@ public final class NativeBridge {
    */
   private static String fabricMetadataVersion() {
     try {
-      ClassLoader classLoader = NativeBridge.class.getClassLoader();
-      Class<?> loaderType = Class.forName(
-          "net.fabricmc.loader.api.FabricLoader", false, classLoader);
-      Object loader = loaderType.getMethod("getInstance").invoke(null);
-      java.lang.reflect.Method getModContainer = loaderType
-          .getMethod("getModContainer", String.class);
-      Object containerResult = getModContainer.invoke(loader, "complemetal");
-      Optional<?> container = containerResult instanceof Optional<?> optional
-          ? optional : Optional.empty();
-      if (container.isEmpty()) {
-        Object legacyResult = getModContainer.invoke(loader, "metalrender");
-        container = legacyResult instanceof Optional<?> optional
-            ? optional : Optional.empty();
-      }
-      if (container.isEmpty()) {
-        return null;
-      }
-      Class<?> containerType = Class.forName(
-          "net.fabricmc.loader.api.ModContainer", false, classLoader);
-      Object metadata = containerType.getMethod("getMetadata")
-          .invoke(container.orElseThrow());
-      Class<?> metadataType = Class.forName(
-          "net.fabricmc.loader.api.metadata.ModMetadata", false, classLoader);
-      Object semanticVersion = metadataType.getMethod("getVersion")
-          .invoke(metadata);
-      Class<?> versionType = Class.forName(
-          "net.fabricmc.loader.api.Version", false, classLoader);
-      Object friendly = versionType.getMethod("getFriendlyString")
-          .invoke(semanticVersion);
-      return friendly instanceof String value ? value : null;
-    } catch (ReflectiveOperationException | LinkageError ignored) {
+      return ModList.get().getModContainerById("complemetal")
+          .map(container -> container.getModInfo().getVersion().toString())
+          .orElse(null);
+    } catch (Throwable ignored) {
       return null;
     }
   }
