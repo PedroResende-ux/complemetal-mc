@@ -22,6 +22,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
     "net.caffeinemc.mods.sodium.client.gl.device.GLRenderDevice$ImmediateDrawCommandList",
     remap = false)
 public abstract class IrisSodiumImmediateDrawCommandListMixin {
+  private static final ThreadLocal<Boolean> METALRENDER_DRAW_ACTIVE =
+      new ThreadLocal<>();
   @Inject(method = "multiDrawElementsBaseVertex", at = @At("HEAD"),
       require = 0, remap = false, cancellable = true)
   private void metalrender$multiDraw(MultiDrawBatch batch,
@@ -39,6 +41,7 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
     }
 
     IrisVisualParityCapture.global().beginDrawInvocation();
+    METALRENDER_DRAW_ACTIVE.set(Boolean.TRUE);
     IrisSodiumGlStateBridge.refreshAllMappings();
 
     long[] offsets = new long[count];
@@ -57,6 +60,7 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
 
         if (offset < 0 || elementCount < 0) {
           IrisVisualParityCapture.global().endDrawInvocation();
+          METALRENDER_DRAW_ACTIVE.remove();
           return;
         }
 
@@ -78,6 +82,7 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
           && IrisTranslationCoordinator.tryFullGraphCutover(
               pending.orElseThrow())) {
         IrisVisualParityCapture.global().endDrawInvocation();
+        METALRENDER_DRAW_ACTIVE.remove();
         ci.cancel();
       } else if (pending.isEmpty()
           && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
@@ -101,6 +106,9 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
       require = 0, remap = false)
   private void metalrender$multiDrawComplete(MultiDrawBatch batch,
       GlIndexType indexType, CallbackInfo ci) {
-    IrisVisualParityCapture.global().endDrawInvocation();
+    if (METALRENDER_DRAW_ACTIVE.get() != null) {
+      METALRENDER_DRAW_ACTIVE.remove();
+      IrisVisualParityCapture.global().endDrawInvocation();
+    }
   }
 }
