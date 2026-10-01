@@ -5247,6 +5247,18 @@ static void iris_graph_prepared_draw_append_residency_allocations(
 static bool iris_graph_prepared_draw_can_share_pass(
     const IrisMetal4GraphPreparedDraw *first,
     const IrisMetal4GraphPreparedDraw *next) API_AVAILABLE(macos(26.0));
+static NSUInteger iris_graph_draw_color_target_mip(
+    const IrisMetal4GraphFrameOperation &operation, uint32_t slot)
+    API_AVAILABLE(macos(26.0)) {
+  for (size_t index = 0; index < operation.colorTargets.size(); index++) {
+    if (operation.colorTargets[index].first == slot &&
+        index < operation.colorTargetMips.size()) {
+      return operation.colorTargetMips[index];
+    }
+  }
+  return 0;
+}
+
 static int iris_graph_encode_prepared_draw_run(
     std::vector<IrisMetal4GraphPreparedDraw *> &draws,
     size_t begin, size_t end,
@@ -9939,6 +9951,11 @@ static bool iris_graph_prepared_draw_can_share_pass(
       first->resources.stencilTarget != next->resources.stencilTarget) {
     return false;
   }
+  if (first->colorTargetMips != next->colorTargetMips ||
+      first->depthTargetMip != next->depthTargetMip ||
+      first->stencilTargetMip != next->stencilTargetMip) {
+    return false;
+  }
   for (size_t slot = 0; slot < first->resources.colorTargets.size();
        slot++) {
     if (first->resources.colorTargets[slot] !=
@@ -10082,16 +10099,20 @@ static int iris_graph_encode_prepared_draw_run(
     MTLRenderPassColorAttachmentDescriptor *attachment =
         pass.colorAttachments[slot];
     attachment.texture = resources.colorTargets[slot];
+    attachment.level = iris_graph_draw_color_target_mip(
+        drawOperation, (uint32_t)slot);
     attachment.loadAction = MTLLoadActionLoad;
     attachment.storeAction = MTLStoreActionStore;
   }
   if (resources.depthTarget) {
     pass.depthAttachment.texture = resources.depthTarget;
+    pass.depthAttachment.level = drawOperation.depthMipLevel;
     pass.depthAttachment.loadAction = MTLLoadActionLoad;
     pass.depthAttachment.storeAction = MTLStoreActionStore;
   }
   if (resources.stencilTarget) {
     pass.stencilAttachment.texture = resources.stencilTarget;
+    pass.stencilAttachment.level = drawOperation.stencilMipLevel;
     pass.stencilAttachment.loadAction = MTLLoadActionLoad;
     pass.stencilAttachment.storeAction = MTLStoreActionStore;
   }
