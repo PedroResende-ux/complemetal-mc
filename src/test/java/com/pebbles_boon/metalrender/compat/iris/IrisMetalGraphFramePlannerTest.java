@@ -28,6 +28,29 @@ final class IrisMetalGraphFramePlannerTest {
   }
 
   @Test
+  void detectsRepeatedFormatsBeforeBlitAttachmentPairing() {
+    IrisRenderGraph.Resource first = new IrisRenderGraph.Resource(0,
+        IrisRenderGraph.ResourceKind.TEXTURE, "rgba8-unorm", 1,
+        16, 16, 1, 1);
+    IrisRenderGraph.Resource second = new IrisRenderGraph.Resource(1,
+        IrisRenderGraph.ResourceKind.TEXTURE, "rgba8-unorm", 1,
+        16, 16, 1, 1);
+    IrisRenderGraph.Resource distinct = new IrisRenderGraph.Resource(2,
+        IrisRenderGraph.ResourceKind.TEXTURE, "rgba16-float", 1,
+        16, 16, 1, 1);
+
+    IrisRenderExecutionPlan plan = plan(
+        new IrisExecutionCommand.DrawArrays(4, 0, 3, 1, 0,
+            IrisExecutionCommand.Source.DIRECT_GL),
+        List.of(first, second, distinct));
+
+    assertTrue(IrisMetalGraphFramePlanner.hasRepeatedFormat(plan,
+        List.of(0, 1)));
+    assertFalse(IrisMetalGraphFramePlanner.hasRepeatedFormat(plan,
+        List.of(0, 2)));
+  }
+
+  @Test
   void acceptsMatchingInitialTextureAcrossIndependentGenerationDomains() {
     IrisGlTextureMirror mirror = new IrisGlTextureMirror(4, 1_024, 1_024);
     assertTrue(mirror.define(31, "rgba8-unorm", 4, 2, 1, 1, 4));
