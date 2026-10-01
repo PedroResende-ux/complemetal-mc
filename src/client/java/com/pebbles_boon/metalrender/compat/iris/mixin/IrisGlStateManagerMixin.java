@@ -197,8 +197,7 @@ public abstract class IrisGlStateManagerMixin {
     metalrender$state().capability(IrisGlStateTracker.GL_BLEND, false);
   }
 
-  @Inject(method = "glBlendFuncSeparate", at = @At("TAIL"),
-      require = 0)
+  @Inject(method = "_blendFuncSeparate", at = @At("TAIL"))
   private static void metalrender$blendFuncSeparate(int sourceRgb,
       int destinationRgb, int sourceAlpha, int destinationAlpha,
       CallbackInfo ci) {
@@ -211,15 +210,6 @@ public abstract class IrisGlStateManagerMixin {
   private static void metalrender$blendEquation(int equation,
       CallbackInfo ci) {
     metalrender$state().blendEquationSeparate(equation, equation);
-  }
-
-  @Inject(method = "glBlendFuncSeparate", at = @At("TAIL"),
-      require = 0)
-  private static void metalrender$glBlendFuncSeparate(int sourceRgb,
-      int destinationRgb, int sourceAlpha, int destinationAlpha,
-      CallbackInfo ci) {
-    metalrender$state().blendFuncSeparate(sourceRgb, destinationRgb,
-        sourceAlpha, destinationAlpha);
   }
 
   @Inject(method = "_enableCull", at = @At("TAIL"))
