@@ -16,6 +16,7 @@
     "WorldRendererBlitMixin",
     "WorldRendererTerrainMixin",
     "accessor.WindowAccessor",
+    "accessor.AccessorLightTexture",
     "accessor.ParticleManagerAccessor"
   ],
   "injectors": {
