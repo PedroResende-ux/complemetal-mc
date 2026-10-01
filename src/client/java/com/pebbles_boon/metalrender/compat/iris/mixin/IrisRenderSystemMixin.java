@@ -605,7 +605,7 @@ public abstract class IrisRenderSystemMixin {
       CallbackInfo ci) {
     try {
       metalrender$capture().dispatch(
-          new IrisExecutionCommand.Dispatch(x, y, z));
+          metalrender$capture().captureDispatchCommand(x, y, z));
     } catch (IllegalArgumentException error) {
       metalrender$capture().dispatch();
     }
