@@ -29,6 +29,22 @@ final class IrisRenderGraphCaptureTest {
   }
 
   @Test
+  void unsupportedBufferClearInvalidatesFullReplayWithoutDroppingOpenGlPath() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(
+        tracker);
+    capture.beginFrame();
+    capture.markUnsupportedFullReplayOperation(
+        "graph-frame-buffer-clear-unimplemented");
+    assertTrue(capture.hasActiveFrame());
+    capture.endFrame();
+    IrisRenderGraphCapture.PendingFrame frame = capture.poll().orElseThrow();
+    assertFalse(frame.fullReplayCaptured());
+    assertEquals("graph-frame-buffer-clear-unimplemented",
+        frame.fullReplayAbortReason());
+  }
+
+  @Test
   void activeFrameTracksWhetherGraphOperationsCanBeSuppressed() {
     IrisRenderGraphCapture capture = new IrisRenderGraphCapture(
         new IrisGlStateTracker());
