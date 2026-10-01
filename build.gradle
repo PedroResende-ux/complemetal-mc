@@ -55,6 +55,10 @@ neoForge {
             systemProperty 'neoforge.enabledGameTestNamespaces', 'complemetal'
             vmArg "-Djava.library.path=" + projectDir + "/src/main/resources"
             vmArg "--enable-native-access=ALL-UNNAMED"
+            if (project.hasProperty('irisCapture')) {
+                vmArg "-Dmetalrender.experimental.irisMetalPipeline=true"
+                vmArg "-Dmetalrender.experimental.irisMetalTranslation=true"
+            }
             vmArg "-Xmx8g"
             vmArg "-Xms2g"
             vmArg "-XX:+AlwaysPreTouch"
