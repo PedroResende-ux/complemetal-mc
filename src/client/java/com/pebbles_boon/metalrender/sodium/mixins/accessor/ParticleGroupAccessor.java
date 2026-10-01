@@ -1,13 +1,7 @@
 package com.pebbles_boon.metalrender.sodium.mixins.accessor;
 
-import java.util.Queue;
-import net.minecraft.client.particle.Particle;
-import net.minecraft.client.particle.ParticleGroup;
-import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.gen.Accessor;
-
-@Mixin(ParticleGroup.class)
+/**
+ * Placeholder while the 1.21.1 particle path is rebuilt.
+ */
 public interface ParticleGroupAccessor {
-  @Accessor("particles")
-  Queue<? extends Particle> metalrender$getParticles();
 }
