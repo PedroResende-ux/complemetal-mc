@@ -4,7 +4,7 @@ package com.pebbles_boon.metalrender.compat.iris;
  * Shader stages understood by the Iris-to-Metal translation cache.
  *
  * <p>The declaration order is the canonical order used for hashing and cache
- * manifests. Iris 26.2's graphics {@code ShaderCreator.link} currently passes
+ * manifests. Iris 1.8.12's graphics {@code ShaderCreator.link} currently passes
  * five stages; compute is retained in the model for Iris compute programs and
  * the complete Metal translation pipeline.</p>
  */
