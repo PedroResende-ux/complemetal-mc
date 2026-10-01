@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
@@ -60,7 +61,12 @@ final class IrisMetalGraphFramePacketEncoderTest {
 
     ByteBuffer buffer = ByteBuffer.wrap(
         IrisMetalGraphFramePacketEncoder.encode(frame));
-    buffer.position(12 + 4 + 4 * 12);
+    buffer.position(88);
+    assertEquals(5, buffer.getInt());
+    assertEquals(64, buffer.getInt());
+    buffer.position(buffer.position() + 64);
+    assertEquals(1, buffer.getInt());
+    assertEquals(7, buffer.get());
     assertEquals(1, buffer.getInt());
     assertEquals(0, buffer.getInt());
     assertEquals(3, buffer.getInt());
