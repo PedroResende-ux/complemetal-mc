@@ -2711,8 +2711,9 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       IrisPipelineStateCapture.PendingState pending) {
     Objects.requireNonNull(pending, "pending");
     OwnershipFrame frame = ownershipFrame;
-    if (frame == null || frame.contextGeneration
-        != pipelineStateCapture.tracker().contextGeneration()) {
+    if (frame == null || !renderGraphCapture.hasActiveFrame()
+        || frame.contextGeneration
+            != pipelineStateCapture.tracker().contextGeneration()) {
       return false;
     }
     IrisRenderGraph.Phase phase = IrisRenderGraphCapture.global()
@@ -2808,7 +2809,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
 
   private boolean suppressUnsupportedFullGraphDrawInternal(String reason) {
     OwnershipFrame frame = ownershipFrame;
-    if (frame == null) {
+    if (frame == null || !renderGraphCapture.hasActiveFrame()) {
       return false;
     }
     frame.degraded = true;
