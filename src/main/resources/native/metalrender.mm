@@ -6117,7 +6117,7 @@ static jlongArray run_iris_metal4_graph_frame(
         for (size_t operationIndex = 0;
              operationIndex < packet.operations.size(); operationIndex++) {
           const auto &operation = packet.operations[operationIndex];
-          if (operation.kind != 5)
+          if (operation.kind != 5 && operation.kind != 6)
             continue;
           int outcome = -1;
           jlong drawReason = 0;
@@ -6799,16 +6799,59 @@ static jlongArray run_iris_metal4_graph_frame(
             pendingWrites.insert(operation.firstResource);
             transfers++;
           } else if (operation.kind == 6) {
-            // Compute graph packets are structurally captured and validated
-            // on the Java side, but native compute dispatch remains gated
-            // separately until its workgroup ABI and resource-state encoder
-            // are fully established. Never reinterpret a dispatch as a draw.
-            status = 0;
-            reason = 5;
-            @throw [NSException
-                exceptionWithName:@"MetalRenderGraphUnsupported"
-                           reason:@"graph compute dispatch execution unavailable"
-                         userInfo:nil];
+            IrisMetal4GraphPreparedDraw *prepared =
+                preparedDraws[operationIndex];
+            if (!prepared || prepared->packet.draw.kind != 4 ||
+                !prepared->pipeline.compute ||
+                !prepared->resources.computeTable) {
+              status = 0;
+              reason = kIrisGraphReasonDrawPipelineUnavailable;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph compute pipeline unavailable"
+                           userInfo:nil];
+            }
+            bool applyBarrier = explicitBarrierPending;
+            if (!applyBarrier) {
+              for (uint32_t resourceId : operation.resources) {
+                if (readNeedsBarrier(resourceId) ||
+                    writeNeedsBarrier(resourceId)) {
+                  applyBarrier = true;
+                  break;
+                }
+              }
+            }
+            id<MTL4ComputeCommandEncoder> encoder =
+                [commandBuffer computeCommandEncoder];
+            if (!encoder)
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphSetup"
+                             reason:@"compute encoder unavailable"
+                           userInfo:nil];
+            if (applyBarrier) {
+              [encoder barrierAfterQueueStages:graphStages
+                                  beforeStages:MTLStageDispatch
+                             visibilityOptions:MTL4VisibilityOptionDevice];
+              profileBarrierCalls++;
+              consumeBarrier();
+            }
+            [encoder setComputePipelineState:prepared->pipeline.compute];
+            [encoder setArgumentTable:
+                (id<MTL4ArgumentTable>)prepared->resources.computeTable];
+            [encoder dispatchThreadgroups:
+                MTLSizeMake(prepared->packet.draw.groupsX,
+                            prepared->packet.draw.groupsY,
+                            prepared->packet.draw.groupsZ)
+                threadsPerThreadgroup:
+                MTLSizeMake(prepared->packet.draw.localSizeX,
+                            prepared->packet.draw.localSizeY,
+                            prepared->packet.draw.localSizeZ)];
+            [encoder endEncoding];
+            for (uint32_t resourceId : operation.resources) {
+              pendingReads.insert(resourceId);
+              pendingWrites.insert(resourceId);
+            }
+            profileDrawOperations++;
           } else {
             size_t runEnd = operationIndex + 1;
             while (runEnd < packet.operations.size() &&
@@ -9370,7 +9413,13 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
       return nullptr;
     }
 
-    bool computePacket = packet.draw.kind == 4;
+    IrisShadowReplayPacket &packet = prepared->packet;
+    bool computePacket = operation.kind == 6;
+    if (computePacket != (packet.draw.kind == 4)) {
+      outcome = 0;
+      reason = kIrisGraphReasonDrawPipelineStateMismatch;
+      return nullptr;
+    }
     {
       std::lock_guard<std::mutex> lock(g_irisMetal4PipelineCacheMutex);
       auto found = g_irisMetal4Pipelines.find(operation.pipelineKey);
@@ -9398,7 +9447,6 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
     }
 
     IrisMetal4PipelineEntry &entry = prepared->pipeline;
-    IrisShadowReplayPacket &packet = prepared->packet;
     prepared->encodedObjects.reserve(1);
     if (!computePacket) {
       uint32_t packetTopology = packet.draw.primitiveMode <= 5
@@ -10147,6 +10195,14 @@ static bool iris_graph_retire_submission(
       if (entry.fragmentFunction) {
         submission->submissionObjects.push_back(entry.fragmentFunction);
         entry.fragmentFunction = nil;
+      }
+      if (entry.compute) {
+        submission->submissionObjects.push_back(entry.compute);
+        entry.compute = nil;
+      }
+      if (entry.computeFunction) {
+        submission->submissionObjects.push_back(entry.computeFunction);
+        entry.computeFunction = nil;
       }
       if (entry.depthStencil) {
         submission->submissionObjects.push_back(entry.depthStencil);
