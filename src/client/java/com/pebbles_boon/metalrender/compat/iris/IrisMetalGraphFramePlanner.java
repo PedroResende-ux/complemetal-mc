@@ -214,17 +214,27 @@ public final class IrisMetalGraphFramePlanner {
             throw unsupported("graph-frame-compute-read-uninitialized");
           }
         }
+        Set<Integer> storageImageWriteTextures = pipeline.pending()
+            .resourceBindings().imageUnits().values().stream()
+            .filter(binding -> binding.texture() > 0
+                && binding.access() != 0x88B8)
+            .map(IrisGlResourceBindingSnapshot.ImageUnitBinding::texture)
+            .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        Map<Integer, Integer> overrides = textureOverrides(plan, pipeline,
+            tokensById, idsByTextureName, initialized, Set.of(),
+            resolved.sampledTextureNames(), storageImageWriteTextures);
         Map<Integer, Integer> externalBuffers = inputBuffers.register(
             resolved.requiredBufferImages());
         Map<Integer, Integer> externalTextures = inputTextures.register(
-            resolved.requiredTextures(), Set.of());
+            resolved.requiredTextures(), overrides.keySet());
         List<Integer> graphResources = nodeUses.stream()
             .filter(use -> tokensById.containsKey(use.resourceId()))
             .map(ResourceUse::resourceId)
             .distinct().sorted().toList();
         operations.add(new IrisMetalGraphFramePacketEncoder.Compute(
             resolved.pipelineKeySha256(),
-            resolved.replayPacket(Set.of(), externalBuffers, externalTextures),
+            resolved.replayPacket(overrides.keySet(), externalBuffers,
+                externalTextures),
             dispatch.groupsX(), dispatch.groupsY(), dispatch.groupsZ(),
             graphResources));
         for (ResourceUse use : nodeUses) {
