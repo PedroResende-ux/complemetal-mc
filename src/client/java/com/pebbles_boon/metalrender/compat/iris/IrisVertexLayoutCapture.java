@@ -1,6 +1,7 @@
 package com.pebbles_boon.metalrender.compat.iris;
 
 import com.mojang.blaze3d.vertex.VertexFormat;
+import net.caffeinemc.mods.sodium.client.gl.attribute.GlVertexAttributeBinding;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
