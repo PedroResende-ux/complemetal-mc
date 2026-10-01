@@ -5013,9 +5013,9 @@ constexpr jlong kIrisGraphReasonDrawExternalBufferIndexMismatch = 53;
 constexpr jlong kIrisGraphReasonDrawExternalBufferMissing = 54;
 constexpr jlong kIrisGraphReasonDrawExternalBufferLengthMismatch = 55;
 constexpr jlong kIrisGraphReasonDrawExternalTextureIndexMismatch = 56;
-constexpr jlong kIrisGraphReasonDrawFeedbackSnapshotUnsupported = 57;
 constexpr jlong kIrisGraphReasonDrawExternalTextureMissing = 57;
 constexpr jlong kIrisGraphReasonDrawExternalTextureMetadataMismatch = 58;
+constexpr jlong kIrisGraphReasonDrawFeedbackSnapshotUnsupported = 59;
 
 struct IrisMetal4GraphFrameResource {
   uint32_t resourceId = 0;
@@ -10115,7 +10115,7 @@ static int iris_graph_encode_feedback_copies(
     reason = kIrisGraphReasonDrawFeedbackSnapshotUnsupported;
     return -1;
   }
-  if (applyBarrier || !draws[begin]->feedbackCopies.empty()) {
+  if (applyBarrier) {
     [encoder barrierAfterQueueStages:graphStages
                         beforeStages:graphStages
                    visibilityOptions:MTL4VisibilityOptionDevice];
@@ -10370,7 +10370,7 @@ static int iris_graph_encode_prepared_draw_run(
     reason = 5;
     return -1;
   }
-  if (applyBarrier) {
+  if (applyBarrier || !draws[begin]->feedbackCopies.empty()) {
     [encoder barrierAfterQueueStages:graphStages
                         beforeStages:graphStages
                    visibilityOptions:MTL4VisibilityOptionDevice];
