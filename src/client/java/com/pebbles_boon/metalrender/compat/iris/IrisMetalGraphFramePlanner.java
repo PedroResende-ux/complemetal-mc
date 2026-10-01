@@ -569,7 +569,8 @@ public final class IrisMetalGraphFramePlanner {
     int height = 0;
     int samples = 0;
     IrisGlStateSnapshot snapshot = pipeline.pending().snapshot();
-    HashSet<ResourceHandle> attachments = new HashSet<>();
+    ArrayList<IrisGlStateSnapshot.TextureAttachment> attachments =
+        new ArrayList<>();
     for (IrisGlStateSnapshot.ColorTarget target : snapshot.colorTargets()) {
       if (!target.drawBuffer().isKnown()
           || target.drawBuffer().value() == IrisGlStateTracker.GL_NONE
@@ -577,25 +578,27 @@ public final class IrisMetalGraphFramePlanner {
           || target.attachment().value().isEmpty()) {
         continue;
       }
-      attachments.add(target.attachment().value().orElseThrow().texture());
+      attachments.add(target.attachment().value().orElseThrow());
     }
     if (snapshot.depthAttachment().isKnown()) {
-      snapshot.depthAttachment().value().ifPresent(
-          attachment -> attachments.add(attachment.texture()));
+      snapshot.depthAttachment().value().ifPresent(attachments::add);
     }
     if (snapshot.stencilAttachment().isKnown()) {
-      snapshot.stencilAttachment().value().ifPresent(
-          attachment -> attachments.add(attachment.texture()));
+      snapshot.stencilAttachment().value().ifPresent(attachments::add);
     }
-    for (ResourceHandle handle : attachments) {
-      Integer resourceId = idsByHandle.get(handle);
+    for (IrisGlStateSnapshot.TextureAttachment attachment : attachments) {
+      Integer resourceId = idsByHandle.get(attachment.texture());
       if (resourceId == null || !tokensById.containsKey(resourceId)) {
         continue;
       }
       Resource resource = plan.graph().resources().get(resourceId);
-      int mipLevel = attachmentMipLevel(snapshot, handle);
-      int attachmentWidth = Math.max(1, resource.width() >> mipLevel);
-      int attachmentHeight = Math.max(1, resource.height() >> mipLevel);
+      if (attachment.mipLevel() >= resource.mipLevels()) {
+        throw unsupported("graph-frame-attachment-mip-unavailable");
+      }
+      int attachmentWidth = Math.max(1,
+          resource.width() >> attachment.mipLevel());
+      int attachmentHeight = Math.max(1,
+          resource.height() >> attachment.mipLevel());
       if (width == 0) {
         width = attachmentWidth;
         height = attachmentHeight;
