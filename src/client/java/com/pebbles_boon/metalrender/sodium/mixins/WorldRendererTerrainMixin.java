@@ -67,12 +67,6 @@ public abstract class WorldRendererTerrainMixin {
       return;
     }
 
-    // Only replace the pass after Metal has encoded usable terrain. This
-    // prevents an empty/partially-built Metal frame from creating holes.
-    if (MetalRenderClient.getChunkMesher() == null) {
-      return;
-    }
-
     ci.cancel();
   }
 }
