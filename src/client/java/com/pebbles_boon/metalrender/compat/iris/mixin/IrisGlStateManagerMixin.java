@@ -34,9 +34,29 @@ import org.lwjgl.system.MemoryUtil;
 public abstract class IrisGlStateManagerMixin {
   private static final ThreadLocal<Boolean> METALRENDER_MOJANG_DRAW_SCOPE =
       new ThreadLocal<>();
+  private static final ThreadLocal<Integer> METALRENDER_MOJANG_BUFFER_DATA_SCOPE =
+      ThreadLocal.withInitial(() -> 0);
 
   public static boolean metalrender$isMojangDrawActive() {
     return METALRENDER_MOJANG_DRAW_SCOPE.get() != null;
+  }
+
+  public static boolean metalrender$isMojangBufferDataActive() {
+    return METALRENDER_MOJANG_BUFFER_DATA_SCOPE.get() > 0;
+  }
+
+  private static void metalrender$enterBufferDataScope() {
+    METALRENDER_MOJANG_BUFFER_DATA_SCOPE.set(
+        METALRENDER_MOJANG_BUFFER_DATA_SCOPE.get() + 1);
+  }
+
+  private static void metalrender$exitBufferDataScope() {
+    int depth = METALRENDER_MOJANG_BUFFER_DATA_SCOPE.get() - 1;
+    if (depth <= 0) {
+      METALRENDER_MOJANG_BUFFER_DATA_SCOPE.remove();
+    } else {
+      METALRENDER_MOJANG_BUFFER_DATA_SCOPE.set(depth);
+    }
   }
 
   private static IrisPipelineStateCapture metalrender$capture() {
@@ -81,6 +101,13 @@ public abstract class IrisGlStateManagerMixin {
   }
 
   @Inject(method = "_glBufferData(ILjava/nio/ByteBuffer;I)V",
+      at = @At("HEAD"))
+  private static void metalrender$bufferDataEnter(int target,
+      ByteBuffer bytes, int usage, CallbackInfo ci) {
+    metalrender$enterBufferDataScope();
+  }
+
+  @Inject(method = "_glBufferData(ILjava/nio/ByteBuffer;I)V",
       at = @At("RETURN"))
   private static void metalrender$bufferData(int target, ByteBuffer bytes,
       int usage, CallbackInfo ci) {
@@ -95,6 +122,19 @@ public abstract class IrisGlStateManagerMixin {
     }
   }
 
+  @Inject(method = "_glBufferData(ILjava/nio/ByteBuffer;I)V",
+      at = @At("RETURN"))
+  private static void metalrender$bufferDataExit(int target,
+      ByteBuffer bytes, int usage, CallbackInfo ci) {
+    metalrender$exitBufferDataScope();
+  }
+
+  @Inject(method = "_glBufferData(IJI)V", at = @At("HEAD"))
+  private static void metalrender$bufferDataSizeEnter(int target, long size,
+      int usage, CallbackInfo ci) {
+    metalrender$enterBufferDataScope();
+  }
+
   @Inject(method = "_glBufferData(IJI)V", at = @At("RETURN"))
   private static void metalrender$bufferDataSize(int target, long size,
       int usage, CallbackInfo ci) {
@@ -102,6 +142,7 @@ public abstract class IrisGlStateManagerMixin {
       IrisGlBufferMirror.global().allocate(
           metalrender$vertices().boundBuffer(target), size);
     }
+    metalrender$exitBufferDataScope();
   }
 
   @Inject(method = "_glDeleteBuffers", at = @At("TAIL"))
