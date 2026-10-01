@@ -696,7 +696,9 @@ public final class IrisMetalGraphFramePacketEncoder {
         throw new IllegalArgumentException("invalid compute dispatch groups");
       }
       resources = resources == null ? List.of() : List.copyOf(resources);
-      if (resources.stream().anyMatch(id -> id == null || id < 0)) {
+      if (resources.size() > IrisRenderGraph.MAX_RESOURCES
+          || resources.stream().anyMatch(id -> id == null || id < 0)
+          || resources.stream().distinct().count() != resources.size()) {
         throw new IllegalArgumentException("invalid compute graph resources");
       }
     }
