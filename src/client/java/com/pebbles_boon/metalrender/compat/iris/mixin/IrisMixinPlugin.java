@@ -5,7 +5,7 @@ import com.pebbles_boon.metalrender.compat.iris.IrisMetalFeatureFlags;
 import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import java.util.List;
 import java.util.Set;
-import net.fabricmc.loader.api.FabricLoader;
+import net.neoforged.fml.ModList;
 import org.objectweb.asm.tree.ClassNode;
 import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
 import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
@@ -31,7 +31,7 @@ public final class IrisMixinPlugin implements IMixinConfigPlugin {
       return IrisShaderCapture.isEnabled()
           && IrisMetalFeatureFlags.enabled(
               IrisTranslationCoordinator.TRANSLATION_ENABLED_PROPERTY)
-          && FabricLoader.getInstance().isModLoaded("iris");
+          && ModList.get().isLoaded("iris");
     } catch (Throwable ignored) {
       return false;
     }
