@@ -188,16 +188,57 @@ public final class IrisMetalGraphFramePlanner {
 
       IrisRenderExecutionPlan.PipelineStep pipeline =
           (IrisRenderExecutionPlan.PipelineStep) step;
-      if (pipeline.kind() != IrisRenderGraph.NodeKind.DRAW) {
-        throw unsupported("graph-frame-dispatch-unimplemented");
+      boolean compute = pipeline.kind() == IrisRenderGraph.NodeKind.DISPATCH;
+      if (!compute && pipeline.kind() != IrisRenderGraph.NodeKind.DRAW) {
+        throw unsupported("graph-frame-pipeline-kind-unsupported");
       }
-      TargetExtent extent = targetExtent(plan, pipeline, tokensById);
+      TargetExtent extent = compute
+          ? new TargetExtent(1, 1)
+          : targetExtent(plan, pipeline, tokensById);
       DrawResult resolvedResult = drawResolver.resolve(pipeline,
           extent.width(), extent.height());
       if (resolvedResult instanceof UnsupportedDraw blocked) {
         throw unsupported(blocked.reason());
       }
       ResolvedDraw resolved = ((CompleteDraw) resolvedResult).draw();
+
+      if (compute) {
+        if (!(pipeline.pending().command()
+            instanceof IrisExecutionCommand.Dispatch dispatch)) {
+          throw unsupported("graph-frame-compute-command-invalid");
+        }
+        List<ResourceUse> nodeUses = plan.graph().nodes()
+            .get(pipeline.nodeId()).resources();
+        for (ResourceUse use : nodeUses) {
+          if (use.access().reads() && !initialized.contains(use.resourceId())) {
+            throw unsupported("graph-frame-compute-read-uninitialized");
+          }
+        }
+        Map<Integer, Integer> externalBuffers = inputBuffers.register(
+            resolved.requiredBufferImages());
+        Map<Integer, Integer> externalTextures = inputTextures.register(
+            resolved.requiredTextures(), Set.of());
+        List<Integer> graphResources = nodeUses.stream()
+            .filter(use -> tokensById.containsKey(use.resourceId()))
+            .map(ResourceUse::resourceId)
+            .distinct().sorted().toList();
+        operations.add(new IrisMetalGraphFramePacketEncoder.Compute(
+            resolved.pipelineKeySha256(),
+            resolved.replayPacket(Set.of(), externalBuffers, externalTextures),
+            dispatch.groupsX(), dispatch.groupsY(), dispatch.groupsZ(),
+            graphResources));
+        for (ResourceUse use : nodeUses) {
+          if (use.access().writes()) {
+            initialized.add(use.resourceId());
+            written.add(use.resourceId());
+          }
+        }
+        if (pipeline.nodeId() == diagnosticReadbackNode) {
+          break;
+        }
+        continue;
+      }
+
       DrawTargets targets = drawTargets(plan, pipeline, resolved.state(),
           tokensById, idsByHandle);
       // A persistent graph attachment has no defined contents on its first
