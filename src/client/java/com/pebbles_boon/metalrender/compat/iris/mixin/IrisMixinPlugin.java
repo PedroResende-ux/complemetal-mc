@@ -28,10 +28,21 @@ public final class IrisMixinPlugin implements IMixinConfigPlugin {
   public boolean shouldApplyMixin(String targetClassName,
       String mixinClassName) {
     try {
+      if (!ModList.get().isLoaded("iris")) {
+        return false;
+      }
+
+      // The 1.21.1 ABI accessor is observational and must be present whenever
+      // Iris 1.8.x is installed. The experimental capture/translation Mixins
+      // remain separately gated so merely installing Iris cannot suppress its
+      // normal renderer.
+      if (mixinClassName.endsWith("Iris1211RenderingPipelineMixin")) {
+        return true;
+      }
+
       return IrisShaderCapture.isEnabled()
           && IrisMetalFeatureFlags.enabled(
-              IrisTranslationCoordinator.TRANSLATION_ENABLED_PROPERTY)
-          && ModList.get().isLoaded("iris");
+              IrisTranslationCoordinator.TRANSLATION_ENABLED_PROPERTY);
     } catch (Throwable ignored) {
       return false;
     }
