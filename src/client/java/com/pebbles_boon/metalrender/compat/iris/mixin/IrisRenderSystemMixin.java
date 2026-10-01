@@ -235,14 +235,15 @@ public abstract class IrisRenderSystemMixin {
   }
 
   @Inject(method = "clearBufferSubData", at = @At("HEAD"), require = 0,
-      remap = false, cancellable = true)
+      remap = false)
   private static void metalrender$clearBufferSubData(int target,
       int internalFormat, long offset, long size, int format, int type,
       int[] values, CallbackInfo ci) {
-    if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
-        "graph-ownership-buffer-clear-unimplemented")) {
-      ci.cancel();
-    }
+    // Metal graph replay has no buffer-clear operation yet. Keep the real GL
+    // call intact and invalidate only the candidate graph, so an unsupported
+    // buffer mutation cannot be silently omitted from the rendered frame.
+    IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+        "graph-frame-buffer-clear-unimplemented");
   }
 
   @Inject(method = "createFramebuffer", at = @At("RETURN"),
