@@ -3,7 +3,6 @@ package com.pebbles_boon.metalrender.sodium.mixins;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.StartupBlocker;
 import com.pebbles_boon.metalrender.compat.IrisCompatibility;
-import com.pebbles_boon.metalrender.gui.StartupBlockerOverlay;
 import com.pebbles_boon.metalrender.performance.PerformanceController;
 import com.pebbles_boon.metalrender.render.MetalRenderHookState;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
@@ -24,16 +23,6 @@ public class MinecraftClientMixin {
   @Unique
   private int metalrender$debugCounter = 0;
 
-  @Inject(method = "<init>", at = @At("TAIL"), require = 1)
-  private void metalrender$showStartupBlocker(GameConfig gameConfig,
-      CallbackInfo ci) {
-    if (StartupBlocker.shouldBlockStartup()) {
-      Minecraft minecraft = (Minecraft) (Object) this;
-      if (minecraft.gui != null) {
-        minecraft.gui.setOverlay(new StartupBlockerOverlay());
-      }
-    }
-  }
 
   @Inject(method = "runTick", at = @At("HEAD"), require = 1)
   private void metalrender$startFrame(boolean tick, CallbackInfo ci) {
