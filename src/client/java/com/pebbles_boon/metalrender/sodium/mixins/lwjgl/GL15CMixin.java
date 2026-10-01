@@ -3,6 +3,7 @@ package com.pebbles_boon.metalrender.sodium.mixins.lwjgl;
 import com.pebbles_boon.metalrender.backend.GLIntercept;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlVertexArrayTracker;
+import com.pebbles_boon.metalrender.compat.iris.mixin.IrisGlStateManagerMixin;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import org.spongepowered.asm.mixin.Mixin;
@@ -28,6 +29,9 @@ public class GL15CMixin {
   @Inject(method = "glBufferData", at = @At("HEAD"), remap = false)
   private static void metalrender$onBufferDataBB(int target, ByteBuffer data,
       int usage, CallbackInfo ci) {
+    if (IrisGlStateManagerMixin.metalrender$isMojangBufferDataActive()) {
+      return;
+    }
     if (data == null || !IrisGlBufferMirror.isEnabled()) {
       if (com.pebbles_boon.metalrender.config.MetalRenderConfig
           .mirrorUploads()) {
@@ -53,6 +57,9 @@ public class GL15CMixin {
       require = 0)
   private static void metalrender$onBufferDataSize(int target, long size,
       int usage, CallbackInfo ci) {
+    if (IrisGlStateManagerMixin.metalrender$isMojangBufferDataActive()) {
+      return;
+    }
     if (IrisGlBufferMirror.isEnabled()) {
       int buffer = IrisGlVertexArrayTracker.global().boundBuffer(target);
       if (buffer > 0 && size > 0) {
