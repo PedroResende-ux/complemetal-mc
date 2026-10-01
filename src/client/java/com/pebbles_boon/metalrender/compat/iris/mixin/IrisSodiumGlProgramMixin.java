@@ -13,6 +13,7 @@ import org.lwjgl.opengl.GL32C;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
  * Captures Sodium 0.6.13 program binds that bypass Mojang's
