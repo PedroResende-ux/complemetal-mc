@@ -145,6 +145,13 @@ public abstract class IrisGlStateManagerMixin {
     metalrender$exitBufferDataScope();
   }
 
+  @Inject(method = "_glDeleteVertexArrays", at = @At("TAIL"),
+      require = 0)
+  private static void metalrender$deleteVertexArray(int vertexArray,
+      CallbackInfo ci) {
+    metalrender$vertices().deleteVertexArray(vertexArray);
+  }
+
   @Inject(method = "_glDeleteBuffers", at = @At("TAIL"))
   private static void metalrender$deleteBuffer(int buffer, CallbackInfo ci) {
     metalrender$vertices().deleteBuffer(buffer);
