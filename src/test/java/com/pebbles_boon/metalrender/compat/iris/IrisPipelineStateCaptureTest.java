@@ -1,6 +1,7 @@
 package com.pebbles_boon.metalrender.compat.iris;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -44,6 +45,21 @@ final class IrisPipelineStateCaptureTest {
     assertEquals(2, command.firstVertex());
     assertEquals(3, command.instanceCount());
     assertTrue(capture.poll().isPresent());
+  }
+
+  @Test
+  void dispatchReportsFalseWhenProgramIdentityIsMissing() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker(4, 4, 4);
+    IrisProgramIdentityRegistry identities =
+        new IrisProgramIdentityRegistry(4);
+    IrisPipelineStateCapture capture = new IrisPipelineStateCapture(
+        tracker, identities, 4, 8);
+    capture.initializeOpenGlDefaults();
+    tracker.registerProgram(5);
+    capture.useProgram(5);
+
+    assertFalse(capture.dispatch(new IrisExecutionCommand.Dispatch(1, 1, 1)));
+    assertEquals(0, capture.queued());
   }
 
   @Test
