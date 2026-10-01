@@ -98,6 +98,31 @@ final class IrisMetalGraphFramePacketEncoderTest {
   }
 
   @Test
+  void encodesInitialTextureBootstrapOperation() {
+    IrisMetalGraphFramePacketEncoder.Frame frame =
+        new IrisMetalGraphFramePacketEncoder.Frame(21, List.of(
+            new IrisMetalGraphFramePacketEncoder.Resource(2, 202)),
+            List.of(new IrisMetalGraphFramePacketEncoder.InputTexture(0,
+                IrisGlTextureMirror.TextureSnapshot.fromReadback(
+                    42, 7, new IrisGlTextureMirror.TextureMetadata(
+                        "rgba8-unorm", 4, 4, 1, 4, 7), 0, 1,
+                    new byte[16]))),
+            List.of(new IrisMetalGraphFramePacketEncoder.CopyInputTexture(
+                0, 2, 1, 2, 2)), -1,
+            IrisMetalGraphFramePacketEncoder.NO_PRESENTATION);
+
+    ByteBuffer buffer = ByteBuffer.wrap(
+        IrisMetalGraphFramePacketEncoder.encode(frame));
+    buffer.position(28 + 12 + 4 + 4 + 4 + 4 + 16 + 4);
+    assertEquals(7, buffer.getInt());
+    assertEquals(0, buffer.getInt());
+    assertEquals(2, buffer.getInt());
+    assertEquals(1, buffer.getInt());
+    assertEquals(2, buffer.getInt());
+    assertEquals(2, buffer.getInt());
+  }
+
+  @Test
   void encodesComputeOperationWithDispatchResources() {
     IrisMetalGraphFramePacketEncoder.Compute compute =
         new IrisMetalGraphFramePacketEncoder.Compute(
