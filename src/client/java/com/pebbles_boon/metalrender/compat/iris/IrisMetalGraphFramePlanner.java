@@ -299,13 +299,6 @@ public final class IrisMetalGraphFramePlanner {
       if ((pipeline.phase() == IrisRenderGraph.Phase.FINAL
           || pipeline.nodeId() == diagnosticReadbackNode)
           && !targets.colors().isEmpty()) {
-        IrisMetalGraphFramePacketEncoder.ColorTarget outputTarget =
-            targets.colors().stream()
-                .filter(target -> target.slot() == 0)
-                .findFirst().orElse(targets.colors().getFirst());
-        if (outputTarget.mipLevel() != 0) {
-          throw unsupported("graph-frame-final-attachment-mip-unimplemented");
-        }
         readbackResourceId = targets.colors().stream()
             .filter(target -> target.slot() == 0)
             .map(IrisMetalGraphFramePacketEncoder.ColorTarget::resourceId)
