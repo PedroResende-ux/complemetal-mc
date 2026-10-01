@@ -5456,7 +5456,7 @@ static bool parse_iris_metal4_graph_frame(
     operation.textureOverrides.clear();
     operation.resources.clear();
     if (!reader.u32(operation.kind) || operation.kind < 1 ||
-        operation.kind > 6) {
+        operation.kind > 7) {
       return false;
     }
     if (operation.kind == 1) {
@@ -5529,6 +5529,19 @@ static bool parse_iris_metal4_graph_frame(
       if (!reader.u32(operation.firstResource) ||
           resourceIds.find(operation.firstResource) ==
               resourceIds.end()) {
+        return false;
+      }
+    } else if (operation.kind == 7) {
+      if (!reader.u32(operation.firstResource) ||
+          operation.firstResource >= result.inputTextures.size() ||
+          !reader.u32(operation.secondResource) ||
+          resourceIds.find(operation.secondResource) == resourceIds.end() ||
+          !reader.u32(operation.destinationLevel) ||
+          operation.destinationLevel > 15 ||
+          !iris_graph_read_i32(reader, operation.width) ||
+          operation.width <= 0 ||
+          !iris_graph_read_i32(reader, operation.height) ||
+          operation.height <= 0) {
         return false;
       }
     } else if (operation.kind == 5) {
@@ -6915,6 +6928,89 @@ static jlongArray run_iris_metal4_graph_frame(
                                                    operation.destinationY, 0)];
             [encoder endEncoding];
             pendingReads.insert(operation.firstResource);
+            pendingWrites.insert(operation.secondResource);
+            transfers++;
+          } else if (operation.kind == 7) {
+            if (operation.firstResource >= graphInputTextures.size()) {
+              status = 0;
+              reason = kIrisGraphReasonDrawExternalTextureMissing;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph input texture bootstrap missing"
+                           userInfo:nil];
+            }
+            id<MTLTexture> source =
+                graphInputTextures[operation.firstResource].texture;
+            id<MTLTexture> destination =
+                textureFor(operation.secondResource);
+            if (!source || !destination) {
+              status = 0;
+              reason = kIrisGraphReasonCopyTextureMissing;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph input texture bootstrap target missing"
+                           userInfo:nil];
+            }
+            if (source.pixelFormat != destination.pixelFormat) {
+              status = 0;
+              reason = kIrisGraphReasonCopyFormatMismatch;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph input texture bootstrap format mismatch"
+                           userInfo:nil];
+            }
+            if (operation.destinationLevel >= destination.mipmapLevelCount) {
+              status = 0;
+              reason = kIrisGraphReasonCopyMipLevelUnsupported;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph input texture bootstrap mip unavailable"
+                           userInfo:nil];
+            }
+            NSUInteger destinationWidth =
+                std::max((NSUInteger)1,
+                    destination.width >> operation.destinationLevel);
+            NSUInteger destinationHeight =
+                std::max((NSUInteger)1,
+                    destination.height >> operation.destinationLevel);
+            if (source.sampleCount != 1 || destination.sampleCount < 1 ||
+                operation.width != (int32_t)source.width ||
+                operation.height != (int32_t)source.height ||
+                operation.width > (int32_t)destinationWidth ||
+                operation.height > (int32_t)destinationHeight) {
+              status = 0;
+              reason = kIrisGraphReasonCopyBoundsUnsupported;
+              @throw [NSException
+                  exceptionWithName:@"MetalRenderGraphUnsupported"
+                             reason:@"graph input texture bootstrap extent unsupported"
+                           userInfo:nil];
+            }
+            id<MTL4ComputeCommandEncoder> encoder =
+                [commandBuffer computeCommandEncoder];
+            if (!encoder)
+              @throw [NSException exceptionWithName:@"MetalRenderGraphSetup"
+                                             reason:@"input bootstrap encoder unavailable"
+                                           userInfo:nil];
+            bool applyBarrier =
+                writeNeedsBarrier(operation.secondResource);
+            if (applyBarrier) {
+              [encoder barrierAfterQueueStages:graphStages
+                                  beforeStages:graphStages
+                             visibilityOptions:MTL4VisibilityOptionDevice];
+              profileBarrierCalls++;
+              consumeBarrier();
+            }
+            [encoder copyFromTexture:source
+                         sourceSlice:0
+                         sourceLevel:0
+                        sourceOrigin:MTLOriginMake(0, 0, 0)
+                          sourceSize:MTLSizeMake(operation.width,
+                                               operation.height, 1)
+                           toTexture:destination
+                    destinationSlice:0
+                    destinationLevel:operation.destinationLevel
+                   destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [encoder endEncoding];
             pendingWrites.insert(operation.secondResource);
             transfers++;
           } else if (operation.kind == 4) {
