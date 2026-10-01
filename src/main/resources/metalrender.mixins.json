@@ -19,7 +19,8 @@
     "accessor.WindowAccessor",
     "accessor.AccessorLightTexture",
     "lwjgl.GL11CMixin",
-    "lwjgl.GL15CMixin"
+    "lwjgl.GL15CMixin",
+    "lwjgl.GL30CMixin"
   ],
   "injectors": {
     "defaultRequire": 1
