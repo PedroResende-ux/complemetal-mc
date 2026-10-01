@@ -10,6 +10,7 @@ public sealed interface IrisExecutionCommand {
     DIRECT_GL,
     MOJANG_COMMAND_ENCODER,
     INDIRECT_BUFFER,
+    SODIUM_COMMAND_LIST,
     UNSPECIFIED
   }
 
