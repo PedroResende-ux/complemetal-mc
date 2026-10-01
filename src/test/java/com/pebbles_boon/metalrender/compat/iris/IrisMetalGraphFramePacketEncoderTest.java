@@ -44,6 +44,36 @@ final class IrisMetalGraphFramePacketEncoderTest {
   }
 
   @Test
+  void encodesDrawAttachmentMipLevels() {
+    IrisMetalGraphFramePacketEncoder.Draw draw =
+        new IrisMetalGraphFramePacketEncoder.Draw(
+            "a".repeat(64), new byte[] {7},
+            List.of(new IrisMetalGraphFramePacketEncoder.ColorTarget(0, 3, 2)),
+            4, 1, 5, 1, Map.of(17, 6));
+    IrisMetalGraphFramePacketEncoder.Frame frame =
+        new IrisMetalGraphFramePacketEncoder.Frame(13, List.of(
+            new IrisMetalGraphFramePacketEncoder.Resource(3, 103),
+            new IrisMetalGraphFramePacketEncoder.Resource(4, 104),
+            new IrisMetalGraphFramePacketEncoder.Resource(5, 105),
+            new IrisMetalGraphFramePacketEncoder.Resource(6, 106)), List.of(draw),
+            -1);
+
+    ByteBuffer buffer = ByteBuffer.wrap(
+        IrisMetalGraphFramePacketEncoder.encode(frame));
+    buffer.position(12 + 4 + 4 * 12);
+    assertEquals(1, buffer.getInt());
+    assertEquals(0, buffer.getInt());
+    assertEquals(3, buffer.getInt());
+    assertEquals(2, buffer.getInt());
+    assertEquals(4, buffer.getInt());
+    assertEquals(1, buffer.getInt());
+    assertEquals(5, buffer.getInt());
+    assertEquals(1, buffer.getInt());
+    assertEquals(17, buffer.getInt());
+    assertEquals(6, buffer.getInt());
+  }
+
+  @Test
   void encodesComputeOperationWithDispatchResources() {
     IrisMetalGraphFramePacketEncoder.Compute compute =
         new IrisMetalGraphFramePacketEncoder.Compute(
