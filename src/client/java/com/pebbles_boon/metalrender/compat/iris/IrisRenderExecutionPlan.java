@@ -96,8 +96,6 @@ public record IrisRenderExecutionPlan(IrisRenderGraph graph,
       } else if (command instanceof IrisExecutionCommand.MultiDrawIndexed draw
           && draw.indexElementBytes() == 1) {
         addDistinct(blockers, "uint8-indices-require-expansion");
-      } else if (command instanceof IrisExecutionCommand.IndirectDraw) {
-        addDistinct(blockers, "indirect-buffer-mirroring-required");
       } else if (command instanceof IrisExecutionCommand.IndirectDispatch) {
         addDistinct(blockers, "indirect-buffer-mirroring-required");
       }
