@@ -16,7 +16,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(ClientChunkCache.class)
 public class ChunkLoadMixin {
-  @Inject(method = "replaceWithPacketData", at = @At("RETURN"), require = 1)
+  @Inject(method = "replaceWithPacketData", at = @At("RETURN"), require = 0)
   private void metalrender$onChunkLoaded(
       int x, int z, FriendlyByteBuf buf, Map<?, ?> heightmaps,
       Consumer<ClientboundLevelChunkPacketData.BlockEntityTagOutput> blockEntityOutput,
