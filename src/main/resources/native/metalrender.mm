@@ -9293,6 +9293,9 @@ struct IrisMetal4GraphPreparedDraw {
   IrisShadowReplayPacket packet;
   IrisMetal4PipelineEntry pipeline;
   IrisShadowRuntimeResources resources;
+  std::vector<uint32_t> colorTargetMips;
+  uint32_t depthTargetMip = 0;
+  uint32_t stencilTargetMip = 0;
   MTLPrimitiveType primitiveType = MTLPrimitiveTypeTriangle;
   std::vector<id> additionalAllocations;
   std::vector<id> encodedObjects;
@@ -9511,15 +9514,28 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
       return found == graphTextures.end() ? nil : found->second;
     };
     auto validTarget = [&](id<MTLTexture> texture,
-                           MTLPixelFormat format) -> bool {
-      return texture && texture.pixelFormat == format &&
-          texture.sampleCount == entry.rasterSampleCount &&
-          texture.width == packet.width && texture.height == packet.height &&
-          (texture.usage & MTLTextureUsageRenderTarget) != 0;
+                           MTLPixelFormat format,
+                           uint32_t mipLevel) -> bool {
+      if (!texture || texture.pixelFormat != format ||
+          texture.sampleCount != entry.rasterSampleCount ||
+          (texture.usage & MTLTextureUsageRenderTarget) == 0 ||
+          mipLevel >= texture.mipmapLevelCount) {
+        return false;
+      }
+      NSUInteger mipWidth = std::max((NSUInteger)1,
+          texture.width >> mipLevel);
+      NSUInteger mipHeight = std::max((NSUInteger)1,
+          texture.height >> mipLevel);
+      return mipWidth == packet.width && mipHeight == packet.height;
     };
 
     prepared->resources.colorTargets.resize(entry.colorFormats.size(), nil);
-    for (const auto &target : operation.colorTargets) {
+    prepared->colorTargetMips.assign(operation.colorTargets.size(), 0);
+    for (size_t targetIndex = 0; targetIndex < operation.colorTargets.size();
+         targetIndex++) {
+      const auto &target = operation.colorTargets[targetIndex];
+      uint32_t mipLevel = targetIndex < operation.colorTargetMips.size()
+          ? operation.colorTargetMips[targetIndex] : 0;
       if (target.first >= entry.colorFormats.size() ||
           entry.colorFormats[target.first] == MTLPixelFormatInvalid) {
         outcome = 0;
@@ -9527,12 +9543,13 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
         return nullptr;
       }
       id<MTLTexture> texture = graphTexture(target.second);
-      if (!validTarget(texture, entry.colorFormats[target.first])) {
+      if (!validTarget(texture, entry.colorFormats[target.first], mipLevel)) {
         outcome = 0;
         reason = kIrisGraphReasonDrawColorTargetMismatch;
         return nullptr;
       }
       prepared->resources.colorTargets[target.first] = [texture retain];
+      prepared->colorTargetMips[targetIndex] = mipLevel;
     }
     for (size_t slot = 0; slot < entry.colorFormats.size(); slot++) {
       if ((entry.colorFormats[slot] != MTLPixelFormatInvalid) !=
@@ -9554,17 +9571,18 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
     if (operation.depthResource >= 0) {
       id<MTLTexture> texture = graphTexture(
           (uint32_t)operation.depthResource);
-      if (!validTarget(texture, entry.depthFormat)) {
+      if (!validTarget(texture, entry.depthFormat, operation.depthMipLevel)) {
         outcome = 0;
         reason = kIrisGraphReasonDrawDepthTargetMismatch;
         return nullptr;
       }
       prepared->resources.depthTarget = [texture retain];
+      prepared->depthTargetMip = operation.depthMipLevel;
     }
     if (operation.stencilResource >= 0) {
       id<MTLTexture> texture = graphTexture(
           (uint32_t)operation.stencilResource);
-      if (!validTarget(texture, entry.stencilFormat)) {
+      if (!validTarget(texture, entry.stencilFormat, operation.stencilMipLevel)) {
         outcome = 0;
         reason = kIrisGraphReasonDrawStencilTargetMismatch;
         return nullptr;
@@ -9577,6 +9595,7 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
         }
         prepared->resources.stencilTarget =
             prepared->resources.depthTarget;
+        prepared->stencilTargetMip = prepared->depthTargetMip;
       } else {
         if (entry.stencilFormat == entry.depthFormat &&
             entry.depthFormat != MTLPixelFormatInvalid) {
@@ -9585,6 +9604,7 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
           return nullptr;
         }
         prepared->resources.stencilTarget = [texture retain];
+        prepared->stencilTargetMip = operation.stencilMipLevel;
       }
     }
 
