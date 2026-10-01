@@ -145,6 +145,15 @@ public final class IrisMetalGraphFramePacketEncoder {
       out.putInt(copy.height());
       return;
     }
+    if (operation instanceof CopyInputTexture copy) {
+      out.putInt(7);
+      out.putInt(copy.inputTextureId());
+      out.putInt(copy.destinationResourceId());
+      out.putInt(copy.destinationLevel());
+      out.putInt(copy.width());
+      out.putInt(copy.height());
+      return;
+    }
     if (operation instanceof GenerateMipmaps mipmaps) {
       out.putInt(4);
       out.putInt(mipmaps.resourceId());
@@ -222,6 +231,8 @@ public final class IrisMetalGraphFramePacketEncoder {
       } else if (operation instanceof Barrier
           || operation instanceof GenerateMipmaps) {
         size = addSize(size, 8L);
+      } else if (operation instanceof CopyInputTexture) {
+        size = addSize(size, 24L);
       } else if (operation instanceof CopyTexture) {
         size = addSize(size, 44L);
       } else if (operation instanceof Draw draw) {
@@ -535,7 +546,7 @@ public final class IrisMetalGraphFramePacketEncoder {
   }
 
   public sealed interface Operation permits Clear, Barrier, CopyTexture,
-      GenerateMipmaps, Draw, Compute {
+      CopyInputTexture, GenerateMipmaps, Draw, Compute {
     List<Integer> resourceIds();
   }
 
@@ -607,6 +618,26 @@ public final class IrisMetalGraphFramePacketEncoder {
     @Override
     public List<Integer> resourceIds() {
       return List.of(sourceResourceId, destinationResourceId);
+    }
+  }
+
+  /** Seeds a persistent graph texture from an inline captured GL subresource. */
+  public record CopyInputTexture(int inputTextureId,
+                                 int destinationResourceId,
+                                 int destinationLevel,
+                                 int width, int height)
+      implements Operation {
+    public CopyInputTexture {
+      if (inputTextureId < 0 || destinationResourceId < 0
+          || destinationLevel < 0 || width <= 0 || height <= 0) {
+        throw new IllegalArgumentException(
+            "invalid graph input texture bootstrap");
+      }
+    }
+
+    @Override
+    public List<Integer> resourceIds() {
+      return List.of(destinationResourceId);
     }
   }
 
