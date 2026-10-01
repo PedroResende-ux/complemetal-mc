@@ -81,12 +81,17 @@ public record IrisMetalGraphResourcePlan(List<Allocation> allocations) {
       IrisGlStateSnapshot snapshot = pipeline.pending().snapshot();
       for (IrisGlStateSnapshot.ColorTarget target
           : snapshot.colorTargets()) {
-        markRenderTarget(plan, usages, target.attachment());
+        target.attachment().valueIfKnown().ifPresent(attachment ->
+            markRenderTarget(plan, usages, attachment.texture()));
       }
-      snapshot.depthAttachment().ifPresent(attachment ->
-          markRenderTarget(plan, usages, attachment));
-      snapshot.stencilAttachment().ifPresent(attachment ->
-          markRenderTarget(plan, usages, attachment));
+      if (snapshot.depthAttachment().isKnown()) {
+        snapshot.depthAttachment().value().ifPresent(attachment ->
+            markRenderTarget(plan, usages, attachment.texture()));
+      }
+      if (snapshot.stencilAttachment().isKnown()) {
+        snapshot.stencilAttachment().value().ifPresent(attachment ->
+            markRenderTarget(plan, usages, attachment.texture()));
+      }
     }
 
     // Graphics passes can write storage images without using them as
