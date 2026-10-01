@@ -504,6 +504,10 @@ public final class IrisMetalGraphFramePlanner {
     }
     ArrayList<IrisMetalGraphFramePacketEncoder.Operation> operations =
         new ArrayList<>();
+    if (hasRepeatedFormat(plan, sources)
+        || hasRepeatedFormat(plan, destinations)) {
+      throw unsupported("graph-frame-blit-routing-ambiguous");
+    }
     ArrayList<Integer> unmatched = new ArrayList<>(destinations);
     for (Integer source : sources) {
       Resource sourceResource = plan.graph().resources().get(source);
@@ -544,6 +548,18 @@ public final class IrisMetalGraphFramePlanner {
       throw unsupported("graph-frame-blit-routing-ambiguous");
     }
     return List.copyOf(operations);
+  }
+
+  private static boolean hasRepeatedFormat(
+      IrisRenderExecutionPlan plan, List<Integer> resourceIds) {
+    HashSet<String> formats = new HashSet<>();
+    for (Integer resourceId : resourceIds) {
+      String format = plan.graph().resources().get(resourceId).format();
+      if (!formats.add(format)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static IrisMetalGraphFramePacketEncoder.CopyTexture copyTexture(
