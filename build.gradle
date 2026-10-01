@@ -1,6 +1,8 @@
 plugins {
-    id 'net.neoforged.moddev' version '2.0.148'
+    id 'java-library'
     id 'maven-publish'
+    id 'net.neoforged.moddev' version '2.0.148'
+    id 'idea'
 }
 
 group = project.maven_group
@@ -42,6 +44,8 @@ dependencies {
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
 
+sourceSets.main.java.srcDir("src/client/java")
+
 neoForge {
     version = project.neoforge_version
     validateAccessTransformers = true
@@ -49,9 +53,8 @@ neoForge {
     runs {
         client {
             client()
-            sourceSet = sourceSets.client
-            loadedMods = [mods.complemetal_with_client]
-            vmArg "-Djava.library.path=${projectDir}/src/main/resources"
+            systemProperty 'neoforge.enabledGameTestNamespaces', 'complemetal'
+            vmArg "-Djava.library.path=" + projectDir + "/src/main/resources"
             vmArg "--enable-native-access=ALL-UNNAMED"
             vmArg "-Xmx8g"
             vmArg "-Xms2g"
@@ -63,21 +66,17 @@ neoForge {
         complemetal {
             sourceSet(sourceSets.main)
         }
-        complemetal_with_client {
-            sourceSet(sourceSets.main)
-            sourceSet(sourceSets.client)
-        }
     }
+}
+
+configurations {
+    runtimeClasspath.extendsFrom localRuntime
 }
 
 sourceSets {
     test {
-        compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
-        runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
-    }
-    gametest {
-        compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
-        runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
     }
 }
 
