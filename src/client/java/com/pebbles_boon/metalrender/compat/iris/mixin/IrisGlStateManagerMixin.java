@@ -93,19 +93,6 @@ public abstract class IrisGlStateManagerMixin {
     }
   }
 
-  @Inject(method = "_glBufferSubData(IJLjava/nio/ByteBuffer;)V",
-      at = @At("RETURN"))
-  private static void metalrender$bufferSubData(int target, long offset,
-      ByteBuffer bytes, CallbackInfo ci) {
-    if (!IrisGlBufferMirror.isEnabled() || bytes == null) {
-      return;
-    }
-    int buffer = metalrender$vertices().boundBuffer(target);
-    IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
-    mirror.write(buffer, mirror.size(buffer), offset, bytes.remaining(),
-        bytes);
-  }
-
   @Inject(method = "_glDeleteBuffers", at = @At("TAIL"))
   private static void metalrender$deleteBuffer(int buffer, CallbackInfo ci) {
     metalrender$vertices().deleteBuffer(buffer);
@@ -210,26 +197,6 @@ public abstract class IrisGlStateManagerMixin {
     metalrender$state().capability(IrisGlStateTracker.GL_BLEND, false);
   }
 
-  @Inject(method = "_enableBlend", at = @At("TAIL"))
-  private static void metalrender$enableBlend(int index, CallbackInfo ci) {
-    if (index == 0) {
-      metalrender$state().capability(IrisGlStateTracker.GL_BLEND, true);
-    } else {
-      metalrender$state().capabilityIndexed(IrisGlStateTracker.GL_BLEND,
-          index, true);
-    }
-  }
-
-  @Inject(method = "_disableBlend", at = @At("TAIL"))
-  private static void metalrender$disableBlend(int index, CallbackInfo ci) {
-    if (index == 0) {
-      metalrender$state().capability(IrisGlStateTracker.GL_BLEND, false);
-    } else {
-      metalrender$state().capabilityIndexed(IrisGlStateTracker.GL_BLEND,
-          index, false);
-    }
-  }
-
   @Inject(method = {"_blendFuncSeparate", "glBlendFuncSeparate"},
       at = @At("TAIL"))
   private static void metalrender$blendFuncSeparate(int sourceRgb,
@@ -246,11 +213,13 @@ public abstract class IrisGlStateManagerMixin {
     metalrender$state().blendEquationSeparate(equation, equation);
   }
 
-  @Inject(method = {"_blendEquationSeparate", "glBlendEquationSeparate"},
-      at = @At("TAIL"))
-  private static void metalrender$blendEquationSeparate(int rgb, int alpha,
+  @Inject(method = "glBlendFuncSeparate", at = @At("TAIL"),
+      require = 0)
+  private static void metalrender$glBlendFuncSeparate(int sourceRgb,
+      int destinationRgb, int sourceAlpha, int destinationAlpha,
       CallbackInfo ci) {
-    metalrender$state().blendEquationSeparate(rgb, alpha);
+    metalrender$state().blendFuncSeparate(sourceRgb, destinationRgb,
+        sourceAlpha, destinationAlpha);
   }
 
   @Inject(method = "_enableCull", at = @At("TAIL"))
@@ -292,19 +261,6 @@ public abstract class IrisGlStateManagerMixin {
   private static void metalrender$colorMaskGlobal(boolean red, boolean green,
       boolean blue, boolean alpha, CallbackInfo ci) {
     metalrender$state().colorMask(red, green, blue, alpha);
-  }
-
-  @Inject(method = "_colorMask(I)V", at = @At("TAIL"))
-  private static void metalrender$colorMask(int mask, CallbackInfo ci) {
-    metalrender$state().colorMask((mask & 1) != 0, (mask & 2) != 0,
-        (mask & 4) != 0, (mask & 8) != 0);
-  }
-
-  @Inject(method = "_colorMask(II)V", at = @At("TAIL"))
-  private static void metalrender$colorMaskIndexed(int index, int mask,
-      CallbackInfo ci) {
-    metalrender$state().colorMaskIndexed(index, (mask & 1) != 0,
-        (mask & 2) != 0, (mask & 4) != 0, (mask & 8) != 0);
   }
 
   @Inject(method = "glGenFramebuffers", at = @At("RETURN"))
@@ -368,9 +324,7 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_drawElements", at = @At("HEAD"), cancellable = true)
   private static void metalrender$drawElements(int mode, int count, int type,
       long indices, CallbackInfo ci) {
-    if (IrisGlCommandEncoderMixin.metalrender$isHighLevelDrawCaptureActive()) {
-      return;
-    }
+
     IrisVisualParityCapture.global().beginDrawInvocation();
     int bytes = switch (type) {
       case 0x1401 -> 1;
@@ -415,56 +369,12 @@ public abstract class IrisGlStateManagerMixin {
     }
   }
 
+  
   @Inject(method = "_drawElements", at = @At("RETURN"))
   private static void metalrender$drawElementsComplete(int mode, int count,
       int type, long indices, CallbackInfo ci) {
-    if (IrisGlCommandEncoderMixin.metalrender$isHighLevelDrawCaptureActive()) {
-      return;
-    }
     IrisVisualParityCapture.global().endDrawInvocation();
   }
 
-  @Inject(method = "_drawArrays", at = @At("HEAD"), cancellable = true)
-  private static void metalrender$drawArrays(int mode, int first, int count,
-      CallbackInfo ci) {
-    if (IrisGlCommandEncoderMixin.metalrender$isHighLevelDrawCaptureActive()) {
-      return;
-    }
-    IrisVisualParityCapture.global().beginDrawInvocation();
-    try {
-      var pending = metalrender$capture().captureDrawDirect(
-          new IrisExecutionCommand.DrawArrays(
-              mode, first, count, 1, 0,
-              IrisExecutionCommand.Source.DIRECT_GL));
-      if (pending.isPresent()
-          && (IrisTranslationCoordinator.tryFullGraphCutover(
-              pending.orElseThrow())
-              || IrisTranslationCoordinator.tryFinalCutover(
-                  pending.orElseThrow()))) {
-        IrisVisualParityCapture.global().endDrawInvocation();
-        ci.cancel();
-      } else if (pending.isEmpty()
-          && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
-              "graph-ownership-direct-arrays-unresolved")) {
-        IrisVisualParityCapture.global().endDrawInvocation();
-        ci.cancel();
-      }
-    } catch (IllegalArgumentException error) {
-      metalrender$capture().draw(mode);
-      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
-          "graph-ownership-direct-arrays-invalid")) {
-        IrisVisualParityCapture.global().endDrawInvocation();
-        ci.cancel();
-      }
-    }
-  }
 
-  @Inject(method = "_drawArrays", at = @At("RETURN"))
-  private static void metalrender$drawArraysComplete(int mode, int first,
-      int count, CallbackInfo ci) {
-    if (IrisGlCommandEncoderMixin.metalrender$isHighLevelDrawCaptureActive()) {
-      return;
-    }
-    IrisVisualParityCapture.global().endDrawInvocation();
-  }
 }
