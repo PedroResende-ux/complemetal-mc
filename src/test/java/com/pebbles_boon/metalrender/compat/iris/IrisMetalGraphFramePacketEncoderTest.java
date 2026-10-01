@@ -44,6 +44,38 @@ final class IrisMetalGraphFramePacketEncoderTest {
   }
 
   @Test
+  void encodesComputeOperationWithDispatchResources() {
+    IrisMetalGraphFramePacketEncoder.Compute compute =
+        new IrisMetalGraphFramePacketEncoder.Compute(
+            "a".repeat(64), new byte[] {1, 2, 3}, 8, 4, 2,
+            List.of(1, 2));
+    IrisMetalGraphFramePacketEncoder.Frame frame =
+        new IrisMetalGraphFramePacketEncoder.Frame(9, List.of(
+            new IrisMetalGraphFramePacketEncoder.Resource(1, 101),
+            new IrisMetalGraphFramePacketEncoder.Resource(2, 102)), List.of(
+                compute), -1);
+
+    byte[] encoded = IrisMetalGraphFramePacketEncoder.encode(frame);
+    ByteBuffer buffer = ByteBuffer.wrap(encoded);
+    assertEquals(IrisMetalGraphFramePacketEncoder.MAGIC, buffer.getInt());
+    assertEquals(IrisMetalGraphFramePacketEncoder.SCHEMA, buffer.getInt());
+    assertEquals(9, buffer.getLong());
+    assertEquals(-1, buffer.getInt());
+    assertEquals(-1, buffer.getInt());
+    assertEquals(2, buffer.getInt());
+    buffer.position(buffer.position() + 24);
+    assertEquals(1, buffer.getInt());
+    assertEquals(6, buffer.getInt());
+  }
+
+  @Test
+  void rejectsInvalidComputeDispatchDimensions() {
+    assertThrows(IllegalArgumentException.class, () ->
+        new IrisMetalGraphFramePacketEncoder.Compute(
+            "b".repeat(64), new byte[] {1}, 0, 1, 1, List.of()));
+  }
+
+  @Test
   void rejectsMissingAndAliasedResources() {
     assertThrows(IllegalArgumentException.class, () ->
         new IrisMetalGraphFramePacketEncoder.Frame(1, List.of(
