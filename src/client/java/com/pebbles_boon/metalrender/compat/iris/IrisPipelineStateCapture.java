@@ -339,8 +339,8 @@ public final class IrisPipelineStateCapture {
         vertexInputBindings));
   }
 
-  public void dispatch() {
-    dispatch(new IrisExecutionCommand.UnknownDispatch());
+  public boolean dispatch() {
+    return dispatch(new IrisExecutionCommand.UnknownDispatch());
   }
 
   public IrisExecutionCommand.Dispatch captureIndirectDispatchCommand(
@@ -393,7 +393,7 @@ public final class IrisPipelineStateCapture {
     }
   }
 
-  public void dispatch(IrisExecutionCommand command) {
+  public boolean dispatch(IrisExecutionCommand command) {
     Objects.requireNonNull(command, "command");
     if (command instanceof IrisExecutionCommand.Draw) {
       throw new IllegalArgumentException("draw command used for dispatch");
@@ -402,11 +402,12 @@ public final class IrisPipelineStateCapture {
     Optional<IrisProgramIdentityRegistry.Registration> registration =
         identities.lookup(glProgram);
     if (registration.isEmpty()) {
-      return;
+      return false;
     }
     dispatchesObserved.incrementAndGet();
     capture(registration.orElseThrow(), tracker.snapshotDispatch(), command,
         IrisVertexInputBindings.complete(java.util.List.of(), null));
+    return true;
   }
 
   private PendingState capture(
