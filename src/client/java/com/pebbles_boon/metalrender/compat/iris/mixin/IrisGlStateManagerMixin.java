@@ -517,7 +517,7 @@ public abstract class IrisGlStateManagerMixin {
         metalrender$finishMojangDraw();
         ci.cancel();
       }
-    } catch (IllegalArgumentException error) {
+    } catch (RuntimeException error) {
       metalrender$capture().draw(mode);
       if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
           "graph-ownership-direct-indexed-invalid")) {
@@ -565,7 +565,7 @@ public abstract class IrisGlStateManagerMixin {
         metalrender$finishMojangDraw();
         ci.cancel();
       }
-    } catch (IllegalArgumentException error) {
+    } catch (RuntimeException error) {
       metalrender$capture().draw(mode);
       if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
           "graph-ownership-direct-array-capture-invalid")) {
