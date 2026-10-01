@@ -112,6 +112,16 @@ public final class IrisRenderGraphCapture {
     return phase;
   }
 
+  /**
+   * Returns whether the current render thread is inside a frame that can
+   * actually retain captured graph operations. Ownership cancellation must not
+   * suppress OpenGL after capture backpressure or an aborted frame has already
+   * discarded this builder.
+   */
+  public synchronized boolean hasActiveFrame() {
+    return current != null;
+  }
+
   public synchronized void draw(
       IrisPipelineStateCapture.PendingState pending) {
     recordPipelineEvent(pending, true);
