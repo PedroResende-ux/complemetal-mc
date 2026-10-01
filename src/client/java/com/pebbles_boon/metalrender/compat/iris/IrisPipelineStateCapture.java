@@ -142,6 +142,25 @@ public final class IrisPipelineStateCapture {
         resolved.descriptor()));
   }
 
+  /**
+   * Captures any generation-safe direct GL execution command, including
+   * Sodium's multi-draw batch representation.
+   */
+  public Optional<PendingState> captureDrawDirect(
+      IrisExecutionCommand command) {
+    Objects.requireNonNull(command, "command");
+    int glProgram = currentGlProgram;
+    Optional<IrisProgramIdentityRegistry.Registration> registration =
+        identities.lookup(glProgram);
+    if (registration.isEmpty()) {
+      return Optional.empty();
+    }
+    IrisProgramIdentityRegistry.Registration resolved =
+        registration.orElseThrow();
+    return captureDraw(command, IrisGlVertexArrayTracker.global().snapshot(
+        resolved.descriptor()));
+  }
+
   public void draw(IrisExecutionCommand.Draw command,
       IrisVertexInputBindings vertexInputBindings) {
     captureDraw(command, vertexInputBindings);
