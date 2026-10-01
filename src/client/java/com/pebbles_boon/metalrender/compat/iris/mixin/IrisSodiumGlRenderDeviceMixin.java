@@ -156,7 +156,9 @@ public abstract class IrisSodiumGlRenderDeviceMixin {
   private void metalrender$deleteVertexArray(GlVertexArray array,
       CallbackInfo ci) {
     try {
-      IrisSodiumGlStateBridge.bindVertexArray(0);
+      if (array != null) {
+        IrisSodiumGlStateBridge.deleteVertexArray(array.handle());
+      }
     } catch (RuntimeException ignored) {
       // Observational path is fail-open.
     }
