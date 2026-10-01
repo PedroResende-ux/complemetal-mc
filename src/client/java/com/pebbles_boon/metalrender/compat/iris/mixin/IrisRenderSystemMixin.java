@@ -609,10 +609,6 @@ public abstract class IrisRenderSystemMixin {
     } catch (IllegalArgumentException error) {
       metalrender$capture().dispatch();
     }
-    if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
-        "graph-ownership-compute-dispatch-unimplemented")) {
-      ci.cancel();
-    }
   }
 
   @Inject(method = "dispatchCompute(Lorg/joml/Vector3i;)V",
