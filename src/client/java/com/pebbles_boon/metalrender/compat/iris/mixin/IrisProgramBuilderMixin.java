@@ -10,7 +10,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
- * Optional ABI-specific hooks for Iris 26.2's final ProgramBuilder sources.
+ * Iris 1.8.12-compatible ProgramBuilder source capture; experimental only.
  *
  * <p>Capture runs only after Iris has successfully compiled and linked the
  * normal OpenGL program. It does not cancel, alter, hash, translate, or persist
