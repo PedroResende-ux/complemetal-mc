@@ -785,6 +785,14 @@ public final class IrisMetalGraphFramePlanner {
             || !storageImageWriteTextures.contains(writeHandle.name())) {
           throw unsupported("graph-frame-storage-image-write-unimplemented");
         }
+        // Storage-image writes are valid graph side effects when the texture
+        // is allocated with SHADER_WRITE usage. The replay argument table
+        // binds the same graph texture for read_write image access; the native
+        // MTL4 path already tracks the operation as a pending write and inserts
+        // the required queue barrier before subsequent consumers. Keep only
+        // true render-target feedback blocked here because Metal cannot bind a
+        // texture simultaneously as an attachment and a read/write image in
+        // the same render pass.
       }
       if (!use.access().reads() || initialized.contains(use.resourceId())) {
         continue;
