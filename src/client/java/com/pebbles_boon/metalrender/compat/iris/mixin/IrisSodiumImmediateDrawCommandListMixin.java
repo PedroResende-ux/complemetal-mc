@@ -88,6 +88,7 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
           && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
               "graph-ownership-sodium-multidraw-unresolved")) {
         IrisVisualParityCapture.global().endDrawInvocation();
+        METALRENDER_DRAW_ACTIVE.remove();
         ci.cancel();
       }
     } catch (RuntimeException error) {
