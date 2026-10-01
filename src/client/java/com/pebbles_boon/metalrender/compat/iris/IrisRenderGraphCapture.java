@@ -213,6 +213,21 @@ public final class IrisRenderGraphCapture {
     }
   }
 
+  /**
+   * Records that the frame contains an operation the Metal graph cannot
+   * represent. The original OpenGL operation must still execute; this only
+   * prevents an incomplete graph from being accepted for ownership.
+   */
+  public synchronized void markUnsupportedFullReplayOperation(String reason) {
+    if (current != null && current.fullReplay) {
+      current.fullReplayComplete = false;
+      current.preferFullReplayAbortReason(
+          reason == null || reason.isBlank()
+              ? "graph-frame-operation-unsupported"
+              : reason);
+    }
+  }
+
   public synchronized boolean memoryBarrier(int bits) {
     if (current != null && bits >= 0) {
       return add(new RawBarrier(phase, bits));
