@@ -248,6 +248,11 @@ public final class MetalRenderHookState {
         stage, frameId, reason);
   }
 
+  /** Returns true only during a prepared Metal world frame, before presentation. */
+  public static boolean isFramePrepared() {
+    return framePrepared && !framePresented;
+  }
+
   public static boolean canReplaceTerrain() {
     MetalRenderConfig config = MetalRenderClient.getConfig();
     return config != null && config.enableFastTerrainReplacement &&
