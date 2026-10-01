@@ -127,7 +127,7 @@ public final class IrisRenderGraphCapture {
     if (current == null) {
       return;
     }
-    if (graphics && current.fullReplay) {
+    if (current.fullReplay) {
       String resourceAbortReason = fullReplayResourceAbortReason(
           pending.replayBuffers(), pending.replayTextures(),
           pending.replaySamplers());
@@ -150,7 +150,7 @@ public final class IrisRenderGraphCapture {
         current.preferFullReplayAbortReason(
             "graph-frame-capture-byte-capacity-exceeded");
       }
-      if (current.fullReplayParity && (phase == Phase.FINAL
+      if (graphics && current.fullReplayParity && (phase == Phase.FINAL
           || IrisVisualParityCapture.diagnosticGraphReadback(pending))
           && pending.replayBuffers().captureEnabled()) {
         Optional<ResourceHandle> output = primaryColorOutput(pending);
