@@ -6520,8 +6520,10 @@ static jlongArray run_iris_metal4_graph_frame(
               barriers += foldedBarriers;
               for (size_t index = drawIndex; index < runEnd; index++) {
                 const auto &draw = packet.operations[index];
-                for (const auto &sampled : draw.textureOverrides)
+                for (const auto &sampled : draw.textureOverrides) {
                   pendingReads.insert(sampled.second);
+                  pendingWrites.insert(sampled.second);
+                }
                 for (const auto &target : draw.colorTargets)
                   pendingWrites.insert(target.second);
                 if (draw.depthResource >= 0)
@@ -6914,8 +6916,10 @@ static jlongArray run_iris_metal4_graph_frame(
             for (size_t drawIndex = operationIndex;
                  drawIndex < runEnd; drawIndex++) {
               const auto &drawOperation = packet.operations[drawIndex];
-              for (const auto &sampled : drawOperation.textureOverrides)
+              for (const auto &sampled : drawOperation.textureOverrides) {
                 pendingReads.insert(sampled.second);
+                pendingWrites.insert(sampled.second);
+              }
               for (const auto &target : drawOperation.colorTargets)
                 pendingWrites.insert(target.second);
               if (drawOperation.depthResource >= 0) {
