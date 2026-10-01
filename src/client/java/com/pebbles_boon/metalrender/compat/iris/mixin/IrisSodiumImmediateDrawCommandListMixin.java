@@ -95,6 +95,10 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
     } catch (RuntimeException error) {
       // Preserve Sodium's GL path. The next graph validation stage will report
       // an incomplete capture instead of replacing an unproven terrain draw.
+      if (METALRENDER_DRAW_ACTIVE.get() != null) {
+        METALRENDER_DRAW_ACTIVE.remove();
+        IrisVisualParityCapture.global().endDrawInvocation();
+      }
     }
   }
 
