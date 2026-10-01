@@ -364,12 +364,14 @@ public final class IrisPipelineStateCapture {
     IrisRenderGraph.Phase phase =
         IrisRenderGraphCapture.global().currentPhase();
     boolean draw = command instanceof IrisExecutionCommand.Draw;
+    boolean dispatch = command instanceof IrisExecutionCommand.Dispatch;
     boolean sampledReplay = IrisGlBufferMirror.isEnabled() && draw
         && IrisRenderGraphCapture.global().reserveShadowReplaySample();
     boolean cutoverReplay = IrisGlBufferMirror.isEnabled() && draw
         && IrisTranslationCoordinator.cutoverCaptureRequested(phase,
             registration, snapshot);
-    boolean graphReplay = IrisGlBufferMirror.isEnabled() && draw
+    boolean graphReplay = IrisGlBufferMirror.isEnabled()
+        && (draw || dispatch)
         && IrisRenderGraphCapture.global().captureFullGraphReplay();
     boolean captureReplay = sampledReplay || cutoverReplay || graphReplay;
     Optional<IrisReplayCaptureRequirements> captureRequirements =
@@ -388,7 +390,7 @@ public final class IrisPipelineStateCapture {
                 IrisGlBufferMirror.global(), registration.descriptor(),
                 IrisGlGenericAttributeTracker.global())
             : IrisShadowReplayBufferSnapshot.disabled();
-    if (captureReplay) {
+    if (captureReplay && draw) {
       IrisPrimitiveExpansion.Result expansion =
           IrisPrimitiveExpansion.expand(command, replayBuffers);
       command = expansion.command();
