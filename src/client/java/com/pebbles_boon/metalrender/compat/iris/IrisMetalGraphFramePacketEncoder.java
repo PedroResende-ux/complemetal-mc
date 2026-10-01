@@ -149,6 +149,16 @@ public final class IrisMetalGraphFramePacketEncoder {
       out.putInt(mipmaps.resourceId());
       return;
     }
+    if (operation instanceof Compute compute) {
+      out.putInt(6);
+      putString(out, compute.pipelineKeySha256());
+      out.putInt(compute.replayPacket().length);
+      out.put(compute.replayPacket);
+      out.putInt(compute.groupsX());
+      out.putInt(compute.groupsY());
+      out.putInt(compute.groupsZ());
+      return;
+    }
     if (operation instanceof Draw draw) {
       out.putInt(5);
       putString(out, draw.pipelineKeySha256());
@@ -512,7 +522,7 @@ public final class IrisMetalGraphFramePacketEncoder {
   }
 
   public sealed interface Operation permits Clear, Barrier, CopyTexture,
-      GenerateMipmaps, Draw {
+      GenerateMipmaps, Draw, Compute {
     List<Integer> resourceIds();
   }
 
@@ -661,6 +671,36 @@ public final class IrisMetalGraphFramePacketEncoder {
       }
       ids.addAll(textureOverrides.values());
       return List.copyOf(ids);
+    }
+  }
+
+  public record Compute(String pipelineKeySha256, byte[] replayPacket,
+                        int groupsX, int groupsY, int groupsZ,
+                        List<Integer> resources) implements Operation {
+    public Compute {
+      IrisRenderGraph.requireSha(pipelineKeySha256, "pipelineKeySha256");
+      replayPacket = Objects.requireNonNull(replayPacket, "replayPacket").clone();
+      if (replayPacket.length <= 0 ||
+          replayPacket.length > IrisMetalShadowReplayPacketEncoder.MAX_PACKET_BYTES) {
+        throw new IllegalArgumentException("invalid compute replay packet");
+      }
+      if (groupsX <= 0 || groupsY <= 0 || groupsZ <= 0) {
+        throw new IllegalArgumentException("invalid compute dispatch groups");
+      }
+      resources = resources == null ? List.of() : List.copyOf(resources);
+      if (resources.stream().anyMatch(id -> id == null || id < 0)) {
+        throw new IllegalArgumentException("invalid compute graph resources");
+      }
+    }
+
+    @Override
+    public byte[] replayPacket() {
+      return replayPacket.clone();
+    }
+
+    @Override
+    public List<Integer> resourceIds() {
+      return resources;
     }
   }
 
