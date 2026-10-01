@@ -24,7 +24,7 @@ public final class MetalRenderCommands {
 
     public static void register() {
         // NeoForge owns the client command dispatcher; registration is event-driven.
-        com.neoforged.neoforge.common.NeoForge.EVENT_BUS.addListener((RegisterClientCommandsEvent event) -> {
+        net.neoforged.neoforge.common.NeoForge.EVENT_BUS.addListener((RegisterClientCommandsEvent event) -> {
             CommandDispatcher<CommandSourceStack> dispatcher = event.getDispatcher();
             dispatcher.register(commandTree("complemetal"));
             dispatcher.register(commandTree("cm"));
