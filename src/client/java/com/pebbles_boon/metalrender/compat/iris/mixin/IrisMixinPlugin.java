@@ -35,15 +35,20 @@ public final class IrisMixinPlugin implements IMixinConfigPlugin {
         return false;
       }
 
-      // This mixin shadows private fields whose layout was verified against
-      // Iris 1.8.12 for Minecraft 1.21.1. Do not apply it to another Iris
-      // build: a harmless-looking class-layout change can hard-crash startup.
+      String installedVersion = ModList.get().getModContainerById("iris")
+          .map(container -> container.getModInfo().getVersion().toString())
+          .orElse("");
+      // Every compatibility mixin in this config targets the verified
+      // Minecraft 1.21.1 / Iris 1.8.12 ABI. Partial loading against a newer
+      // Iris build is more dangerous than disabling the Metal integration.
+      if (!SUPPORTED_IRIS_VERSION.equals(installedVersion)) {
+        return false;
+      }
+
+      // The field accessor is observational and may be applied without
+      // enabling the experimental Metal translation path.
       if (mixinClassName.endsWith("Iris1211RenderingPipelineMixin")) {
-        return SUPPORTED_IRIS_VERSION.equals(
-            ModList.get().getModContainerById("iris")
-                .map(container ->
-                    container.getModInfo().getVersion().toString())
-                .orElse(""));
+        return true;
       }
 
       return IrisShaderCapture.isEnabled()
