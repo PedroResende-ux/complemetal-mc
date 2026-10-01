@@ -5067,6 +5067,7 @@ struct IrisMetal4GraphFrameOperation {
   uint32_t groupsX = 0;
   uint32_t groupsY = 0;
   uint32_t groupsZ = 0;
+  std::vector<uint32_t> resources;
 };
 
 static constexpr NSUInteger kIrisMetal4FrameArenaChunkBytes =
@@ -5410,6 +5411,7 @@ static bool parse_iris_metal4_graph_frame(
     operation.depthResource = -1;
     operation.stencilResource = -1;
     operation.textureOverrides.clear();
+    operation.resources.clear();
     if (!reader.u32(operation.kind) || operation.kind < 1 ||
         operation.kind > 6) {
       return false;
@@ -5564,6 +5566,25 @@ static bool parse_iris_metal4_graph_frame(
           operation.groupsX > 1048576 || operation.groupsY > 1048576 ||
           operation.groupsZ > 1048576) {
         return false;
+      }
+      uint32_t resourceCount = 0;
+      if (!read_bounded_count(reader, 16384, resourceCount)) {
+        return false;
+      }
+      try {
+        operation.resources.resize(resourceCount);
+      } catch (...) {
+        return false;
+      }
+      static thread_local std::unordered_set<uint32_t> computeResourceIds;
+      computeResourceIds.clear();
+      computeResourceIds.reserve(resourceCount);
+      for (uint32_t &resourceId : operation.resources) {
+        if (!reader.u32(resourceId) ||
+            resourceIds.find(resourceId) == resourceIds.end() ||
+            !computeResourceIds.emplace(resourceId).second) {
+          return false;
+        }
       }
       operation.replayPacketLength = packetLength;
       for (char value : operation.pipelineKey) {
