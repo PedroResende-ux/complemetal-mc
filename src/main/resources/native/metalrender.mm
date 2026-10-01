@@ -5054,6 +5054,9 @@ struct IrisMetal4GraphFrameOperation {
   int32_t depthResource = -1;
   int32_t stencilResource = -1;
   std::unordered_map<uint32_t, uint32_t> textureOverrides;
+  uint32_t groupsX = 0;
+  uint32_t groupsY = 0;
+  uint32_t groupsZ = 0;
 };
 
 static constexpr NSUInteger kIrisMetal4FrameArenaChunkBytes =
