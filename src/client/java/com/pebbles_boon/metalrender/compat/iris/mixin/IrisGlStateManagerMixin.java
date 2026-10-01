@@ -345,7 +345,7 @@ public abstract class IrisGlStateManagerMixin {
       int xOffset, int yOffset, int width, int height, int format,
       int type, long pixels, CallbackInfo ci) {
     if (!IrisGlTextureMirror.isEnabled() || target != 0x0DE1
-        || level < 0 || width <= 0 || height <= 0 || pixels <= 0) {
+        || level < 0 || width <= 0 || height <= 0 || pixels < 0) {
       return;
     }
 
@@ -361,12 +361,7 @@ public abstract class IrisGlStateManagerMixin {
       return;
     }
 
-    int bytesPerPixel = IrisGlFormat.exactUploadBytesPerPixel(
-        metadata.format().startsWith("gl-0x")
-            ? 0 : 0, format, type).orElse(metadata.bytesPerPixel());
-    if (bytesPerPixel != metadata.bytesPerPixel()) {
-      bytesPerPixel = metadata.bytesPerPixel();
-    }
+    int bytesPerPixel = metadata.bytesPerPixel();
     long rowBytes = (long) width * bytesPerPixel;
     long required = rowBytes * height;
     if (rowBytes <= 0 || required <= 0 || required > Integer.MAX_VALUE
@@ -376,6 +371,9 @@ public abstract class IrisGlStateManagerMixin {
 
     try {
       int pbo = GL15C.glGetInteger(GL15C.GL_PIXEL_UNPACK_BUFFER_BINDING);
+      if (pbo == 0 && pixels == 0) {
+        return;
+      }
       ByteBuffer source;
       if (pbo > 0) {
         long generation = IrisGlBufferMirror.global().generation(pbo);
@@ -390,7 +388,7 @@ public abstract class IrisGlStateManagerMixin {
       }
       mirror.write(texture, level, 0, xOffset, yOffset, width, height, width,
           source);
-    } catch (IllegalArgumentException | RuntimeException ignored) {
+    } catch (RuntimeException ignored) {
       // Upload metadata remains valid; unknown pixel layouts fail closed.
     }
   }
