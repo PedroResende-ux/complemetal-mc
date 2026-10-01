@@ -197,8 +197,8 @@ public abstract class IrisGlStateManagerMixin {
     metalrender$state().capability(IrisGlStateTracker.GL_BLEND, false);
   }
 
-  @Inject(method = {"_blendFuncSeparate", "glBlendFuncSeparate"},
-      at = @At("TAIL"))
+  @Inject(method = "glBlendFuncSeparate", at = @At("TAIL"),
+      require = 0)
   private static void metalrender$blendFuncSeparate(int sourceRgb,
       int destinationRgb, int sourceAlpha, int destinationAlpha,
       CallbackInfo ci) {
