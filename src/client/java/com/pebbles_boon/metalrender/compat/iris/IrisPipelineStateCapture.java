@@ -157,8 +157,11 @@ public final class IrisPipelineStateCapture {
     }
     IrisProgramIdentityRegistry.Registration resolved =
         registration.orElseThrow();
-    return captureDraw(command, IrisGlVertexArrayTracker.global().snapshot(
-        resolved.descriptor()));
+    drawsObserved.incrementAndGet();
+    IrisVertexInputBindings inputs =
+        IrisGlVertexArrayTracker.global().snapshot(resolved.descriptor());
+    return Optional.of(capture(resolved,
+        tracker.snapshotDraw(command.primitiveMode()), command, inputs));
   }
 
   public void draw(IrisExecutionCommand.Draw command,
