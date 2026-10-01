@@ -1,5 +1,5 @@
 plugins {
-    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+    id 'net.neoforged.moddev' version '2.0.147'
     id 'maven-publish'
 }
 
@@ -11,18 +11,13 @@ base {
 }
 
 java {
-    toolchain.languageVersion = JavaLanguageVersion.of(25)
-    sourceCompatibility = JavaVersion.VERSION_25
-    targetCompatibility = JavaVersion.VERSION_25
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
     withSourcesJar()
 }
 
-repositories {
-    maven {
-        name = "Fabric"
-        url = "https://maven.fabricmc.net/"
-    }
-    mavenCentral()
+repositories {    mavenCentral()
     maven {
         name = "Modrinth"
         url = "https://api.modrinth.com/maven"
@@ -31,61 +26,38 @@ repositories {
 
 dependencies {
     minecraft "com.mojang:minecraft:${minecraft_version}"
-    implementation "net.fabricmc:fabric-loader:${loader_version}"
-    implementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
-    compileOnly "maven.modrinth:sodium:${sodium_version}"
+    implementation "net.neoforged:neoforge:${neoforge_version}"
+    compileOnly "maven.modrinth:AANobbMI:${sodium_maven_version}"
+    compileOnly "maven.modrinth:YL57xq9U:${iris_maven_version}"
+    runtimeOnly "maven.modrinth:AANobbMI:${sodium_maven_version}"
+    runtimeOnly "maven.modrinth:YL57xq9U:${iris_maven_version}"
 
     testImplementation platform("org.junit:junit-bom:${junit_version}")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
 
-loom {
-    splitEnvironmentSourceSets()
-
-    mods {
-        "complemetal" {
-            sourceSet sourceSets.main
-            sourceSet sourceSets.client
-        }
-    }
+neoForge {
+    version = project.neoforge_version
+    validateAccessTransformers = true
 
     runs {
         client {
             client()
-            source sourceSets.client
+            sourceSet sourceSets.client
             vmArg "-Djava.library.path=${projectDir}/src/main/resources"
             vmArg "--enable-native-access=ALL-UNNAMED"
-            if (project.hasProperty('zgc')) {
-                vmArg "-XX:+UseZGC"
-            } else {
-                vmArg "-XX:+UseG1GC"
-            }
             vmArg "-Xmx8g"
             vmArg "-Xms2g"
             vmArg "-XX:+AlwaysPreTouch"
-            
-            if (project.hasProperty('gl2metal')) {
-                vmArg "-Dmetalrender.gl2metal=true"
-            }
-            
-            ['state', 'drawcalls', 'buffers', 'textures', 'shaders', 'fbos', 'vaos', 'debug'].each { category ->
-                if (project.hasProperty("gl2metal.${category}")) {
-                    vmArg "-Dmetalrender.gl2metal.${category}=true"
-                }
-            }
         }
     }
-}
 
-fabricApi {
-    configureTests {
-        createSourceSet = true
-        modId = "complemetal-tests"
-        enableGameTests = false
-        enableClientGameTests = true
-        clearRunDirectory = true
-        username = "ComplemetalQA"
+    mods {
+        complemetal {
+            sourceSet sourceSets.main
+            sourceSet sourceSets.client
+        }
     }
 }
 
@@ -102,31 +74,11 @@ sourceSets {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = "UTF-8"
-    options.release = 25
+    options.release = 21
 }
 
 tasks.withType(Test).configureEach {
     useJUnitPlatform()
-}
-
-tasks.named("runClientGameTest", JavaExec) {
-    def sanitizerRuntime = providers.environmentVariable(
-        "METALRENDER_DYLD_INSERT_LIBRARIES")
-    if (sanitizerRuntime.isPresent()) {
-        environment "DYLD_INSERT_LIBRARIES", sanitizerRuntime.get()
-    }
-    [
-        "metalrender.enabled",
-        "metalrender.feature.metal4",
-        "metalrender.gametest.baseline",
-        "metalrender.gametest.requireRetina",
-        "metalrender.gametest.iconify"
-    ].each { propertyName ->
-        def propertyValue = System.getProperty(propertyName)
-        if (propertyValue != null) {
-            systemProperty propertyName, propertyValue
-        }
-    }
 }
 
 tasks.named("compileTestJava") {
@@ -142,7 +94,7 @@ processResources {
     inputs.property "version", project.version
     exclude "libmetalrender_debug_v2.dylib"
 
-    filesMatching("fabric.mod.json") {
+    filesMatching("META-INF/neoforge.mods.toml") {
         expand "version": project.version
     }
 }
