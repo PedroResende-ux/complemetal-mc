@@ -217,27 +217,26 @@ public final class IrisVertexLayoutCapture {
 
     Map<Integer, net.caffeinemc.mods.sodium.client.gl.attribute
         .GlVertexAttributeBinding> byLocation = new HashMap<>();
-    Map<Integer, Integer> strideByBinding = new HashMap<>();
     for (var binding : bindings) {
-      byLocation.put(binding.getIndex(), binding);
-      Integer prior = strideByBinding.put(binding.getIndex(),
-          binding.getStride());
-      if (prior != null && prior.intValue() != binding.getStride()) {
+      GlVertexAttributeBinding prior =
+          byLocation.put(binding.getIndex(), binding);
+      if (prior != null) {
         throw new IllegalArgumentException(
-            "Sodium vertex buffer binding has conflicting strides");
+            "Sodium linked format has duplicate attribute locations");
       }
     }
 
-    ArrayList<IrisPipelineState.VertexBufferLayout> buffers =
-        new ArrayList<>();
-    ArrayList<Integer> bindingIndices = new ArrayList<>(
-        strideByBinding.keySet());
-    bindingIndices.sort(Integer::compareTo);
-    for (int index : bindingIndices) {
-      buffers.add(new IrisPipelineState.VertexBufferLayout(
-          index, strideByBinding.get(index),
-          IrisPipelineState.StepFunction.PER_VERTEX, 0));
+    // Iris/Sodium terrain uses one TessellationBinding.forVertexBuffer() for
+    // the region geometry. GlVertexAttributeBinding.index is the shader
+    // attribute location, not a physical Metal vertex-buffer slot.
+    int terrainStride = format.getStride();
+    if (terrainStride <= 0) {
+      throw new IllegalArgumentException("invalid Sodium terrain stride");
     }
+    ArrayList<IrisPipelineState.VertexBufferLayout> buffers =
+        new ArrayList<>(1);
+    buffers.add(new IrisPipelineState.VertexBufferLayout(
+        0, terrainStride, IrisPipelineState.StepFunction.PER_VERTEX, 0));
 
     int count = GL20C.glGetProgrami(glProgram, GL20C.GL_ACTIVE_ATTRIBUTES);
     int maxNameLength = GL20C.glGetProgrami(glProgram,
