@@ -32,6 +32,13 @@ import org.lwjgl.system.MemoryUtil;
  */
 @Mixin(GlStateManager.class)
 public abstract class IrisGlStateManagerMixin {
+  private static final ThreadLocal<Boolean> METALRENDER_MOJANG_DRAW_SCOPE =
+      new ThreadLocal<>();
+
+  public static boolean metalrender$isMojangDrawActive() {
+    return METALRENDER_MOJANG_DRAW_SCOPE.get() != null;
+  }
+
   private static IrisPipelineStateCapture metalrender$capture() {
     return IrisPipelineStateCapture.global();
   }
@@ -425,7 +432,7 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_drawElements", at = @At("HEAD"), cancellable = true)
   private static void metalrender$drawElements(int mode, int count, int type,
       long indices, CallbackInfo ci) {
-
+    METALRENDER_MOJANG_DRAW_SCOPE.set(Boolean.TRUE);
     IrisVisualParityCapture.global().beginDrawInvocation();
     int bytes = switch (type) {
       case 0x1401 -> 1;
@@ -474,6 +481,7 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_drawElements", at = @At("RETURN"))
   private static void metalrender$drawElementsComplete(int mode, int count,
       int type, long indices, CallbackInfo ci) {
+    METALRENDER_MOJANG_DRAW_SCOPE.remove();
     IrisVisualParityCapture.global().endDrawInvocation();
   }
 
