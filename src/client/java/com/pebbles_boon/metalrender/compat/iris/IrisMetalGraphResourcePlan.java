@@ -81,8 +81,10 @@ public record IrisMetalGraphResourcePlan(List<Allocation> allocations) {
       IrisGlStateSnapshot snapshot = pipeline.pending().snapshot();
       for (IrisGlStateSnapshot.ColorTarget target
           : snapshot.colorTargets()) {
-        target.attachment().valueIfKnown().ifPresent(attachment ->
-            markRenderTarget(plan, usages, attachment.texture()));
+        if (target.attachment().isKnown()) {
+          target.attachment().value().ifPresent(attachment ->
+              markRenderTarget(plan, usages, attachment.texture()));
+        }
       }
       if (snapshot.depthAttachment().isKnown()) {
         snapshot.depthAttachment().value().ifPresent(attachment ->
