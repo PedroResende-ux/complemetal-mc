@@ -113,7 +113,7 @@ final class IrisMetalGraphFramePacketEncoderTest {
 
     ByteBuffer buffer = ByteBuffer.wrap(
         IrisMetalGraphFramePacketEncoder.encode(frame));
-    buffer.position(28 + 12 + 4 + 4 + 4 + 4 + 16 + 4);
+    buffer.position(115);
     assertEquals(7, buffer.getInt());
     assertEquals(0, buffer.getInt());
     assertEquals(2, buffer.getInt());
