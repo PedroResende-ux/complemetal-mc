@@ -517,15 +517,28 @@ public final class IrisMetalGraphFramePlanner {
       if (!aspectIncluded(sourceResource.format(), blit.mask())) {
         continue;
       }
+      boolean multisampleResolve = sourceResource.sampleCount() != 1
+          || destinationResource.sampleCount() != 1;
+      if (multisampleResolve) {
+        if (blit.mask() != IrisTransferCommand.GL_COLOR_BUFFER_BIT
+            || sourceResource.sampleCount() <= 1
+            || destinationResource.sampleCount() != 1
+            || sourceResource.mipLevels() != 1
+            || destinationResource.mipLevels() != 1
+            || blit.sourceX0() != 0 || blit.sourceY0() != 0
+            || blit.destinationX0() != 0 || blit.destinationY0() != 0
+            || sourceWidth != sourceResource.width()
+            || sourceHeight != sourceResource.height()
+            || destinationWidth != destinationResource.width()
+            || destinationHeight != destinationResource.height()) {
+          throw unsupported("graph-frame-multisample-blit-unimplemented");
+        }
+      }
       operations.add(new IrisMetalGraphFramePacketEncoder.CopyTexture(source,
           destination, 0, 0, blit.sourceX0(), blit.sourceY0(),
           blit.destinationX0(), blit.destinationY0(), sourceWidth,
           sourceHeight));
       unmatched.remove(destination);
-      if (sourceResource.sampleCount() != 1
-          || destinationResource.sampleCount() != 1) {
-        throw unsupported("graph-frame-multisample-blit-unimplemented");
-      }
     }
     if (operations.isEmpty() || !unmatched.isEmpty()) {
       throw unsupported("graph-frame-blit-routing-ambiguous");
