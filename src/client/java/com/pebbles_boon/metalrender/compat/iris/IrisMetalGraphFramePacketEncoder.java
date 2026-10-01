@@ -157,6 +157,10 @@ public final class IrisMetalGraphFramePacketEncoder {
       out.putInt(compute.groupsX());
       out.putInt(compute.groupsY());
       out.putInt(compute.groupsZ());
+      out.putInt(compute.resources().size());
+      for (Integer resourceId : compute.resources()) {
+        out.putInt(resourceId);
+      }
       return;
     }
     if (operation instanceof Draw draw) {
@@ -222,8 +226,9 @@ public final class IrisMetalGraphFramePacketEncoder {
             + draw.colorTargets().size() * 8L
             + draw.textureOverrides().size() * 8L);
       } else if (operation instanceof Compute compute) {
-        size = addSize(size, 20L + asciiLength(
-            compute.pipelineKeySha256()) + compute.replayPacket.length);
+        size = addSize(size, 24L + asciiLength(
+            compute.pipelineKeySha256()) + compute.replayPacket.length
+            + compute.resources().size() * 4L);
       } else {
         throw new IllegalArgumentException("unknown Metal graph operation");
       }
