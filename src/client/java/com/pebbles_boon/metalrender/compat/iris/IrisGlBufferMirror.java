@@ -160,6 +160,43 @@ public final class IrisGlBufferMirror {
     return entry == null ? 0 : entry.bytes.length;
   }
 
+  /**
+   * Mirrors the zero-fill form of GL43C.glClearBufferSubData used by Iris'
+   * ShaderStorageBuffer implementation. Only the exact R8/RED/BYTE form is
+   * accepted here; unsupported formats must fail closed rather than mutate a
+   * replay buffer with guessed conversion semantics.
+   */
+  public synchronized boolean clearZero(int glBuffer, long offsetBytes,
+      long sizeBytes, int internalFormat, int format, int type, int[] values) {
+    if (glBuffer <= 0 || offsetBytes < 0 || sizeBytes <= 0
+        || internalFormat != 0x8229 /* GL_R8 */
+        || format != 0x1903 /* GL_RED */
+        || type != 0x1400 /* GL_BYTE */
+        || values == null || values.length == 0 || values[0] != 0
+        || offsetBytes > Integer.MAX_VALUE
+        || sizeBytes > Integer.MAX_VALUE
+        || offsetBytes + sizeBytes > Integer.MAX_VALUE) {
+      rejectedWrites++;
+      return false;
+    }
+    Entry entry = entries.get(glBuffer);
+    if (entry == null || offsetBytes + sizeBytes > entry.bytes.length) {
+      rejectedWrites++;
+      return false;
+    }
+    int start = Math.toIntExact(offsetBytes);
+    int length = Math.toIntExact(sizeBytes);
+    Arrays.fill(entry.bytes, start, start + length, (byte) 0);
+    if (!entry.ranges.add(offsetBytes, offsetBytes + sizeBytes)) {
+      retainedBytes -= entry.bytes.length;
+      entries.remove(glBuffer);
+      rejectedWrites++;
+      return false;
+    }
+    entry.generation = nextGeneration++;
+    return true;
+  }
+
   public synchronized Optional<BufferSnapshot> snapshot(int glBuffer,
       long generation, long offsetBytes, long lengthBytes) {
     Entry entry = entries.get(glBuffer);
