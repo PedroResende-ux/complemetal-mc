@@ -65,16 +65,14 @@ public abstract class IrisSodiumImmediateDrawCommandListMixin {
         bases[draw] = baseVertex;
       }
 
-      var pending = IrisPipelineStateCapture.global().captureDraw(
+      var pending = IrisPipelineStateCapture.global().captureDrawDirect(
           new IrisExecutionCommand.MultiDrawIndexed(
               primitiveMode,
               indexType.getStride(),
               offsets,
               counts,
               bases,
-              IrisExecutionCommand.Source.UNSPECIFIED),
-          IrisGlVertexArrayTracker.global().snapshot(
-              IrisPipelineStateCapture.global().currentProgramDescriptor()));
+              IrisExecutionCommand.Source.UNSPECIFIED));
 
       if (pending.isPresent()
           && IrisTranslationCoordinator.tryFullGraphCutover(
