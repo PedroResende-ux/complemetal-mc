@@ -7,6 +7,7 @@ import net.irisshaders.iris.shaderpack.properties.PackDirectives;
 import net.irisshaders.iris.targets.RenderTargets;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.Shadow;
 
 /**
@@ -14,6 +15,7 @@ import org.spongepowered.asm.mixin.Shadow;
  * Sodium 0.6.13 + Iris 1.8.12 integration uses: resolver, render targets,
  * flipped texture sets and pack directives.
  */
+@Pseudo
 @Mixin(value = IrisRenderingPipeline.class, remap = false)
 public abstract class Iris1211RenderingPipelineMixin
     implements Iris1211RenderingPipelineAccessor {
