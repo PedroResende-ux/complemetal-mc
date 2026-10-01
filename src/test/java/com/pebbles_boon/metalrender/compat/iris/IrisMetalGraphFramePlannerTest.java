@@ -70,6 +70,40 @@ final class IrisMetalGraphFramePlannerTest {
   }
 
   @Test
+  void acceptsInitialSnapshotAtValidNonzeroMip() {
+    IrisGlTextureMirror mirror = new IrisGlTextureMirror(4, 1_024, 1_024);
+    assertTrue(mirror.define(32, "rgba8-unorm", 8, 8, 1, 1, 3));
+    assertTrue(mirror.write(32, 2, 0, 0, 0, 2, 2, 2,
+        ByteBuffer.allocate(16)));
+    IrisGlTextureMirror.TextureSnapshot snapshot = mirror.snapshot(32,
+        mirror.generation(32), 2, 0).orElseThrow();
+    IrisRenderGraph.Resource resource = new IrisRenderGraph.Resource(0,
+        IrisRenderGraph.ResourceKind.TEXTURE, "rgba8-unorm", 1,
+        8, 8, 1, 3);
+
+    assertEquals(2, snapshot.mipLevel());
+    assertEquals(2, snapshot.width());
+    assertEquals(2, snapshot.height());
+    assertTrue(IrisMetalGraphFramePlanner.initialTextureSnapshotCompatible(
+        snapshot, resource));
+  }
+
+  @Test
+  void rejectsInitialSnapshotWithWrongMipExtent() {
+    IrisGlTextureMirror.TextureSnapshot snapshot =
+        IrisGlTextureMirror.TextureSnapshot.fromReadback(33, 7,
+            new IrisGlTextureMirror.TextureMetadata(
+                "rgba8-unorm", 3, 3, 1, 4, 7), 0, 2,
+            new byte[36]);
+    IrisRenderGraph.Resource resource = new IrisRenderGraph.Resource(0,
+        IrisRenderGraph.ResourceKind.TEXTURE, "rgba8-unorm", 1,
+        8, 8, 1, 3);
+
+    assertFalse(IrisMetalGraphFramePlanner.initialTextureSnapshotCompatible(
+        snapshot, resource));
+  }
+
+  @Test
   void acceptsProvenRg11b10IosurfaceExpansionForGraphOverride() {
     IrisRenderGraph.Resource resource = new IrisRenderGraph.Resource(0,
         IrisRenderGraph.ResourceKind.TEXTURE, "rg11b10-float", 1,
