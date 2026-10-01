@@ -2,7 +2,7 @@ package com.pebbles_boon.metalrender.compat;
 
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import java.lang.reflect.Method;
-import net.fabricmc.loader.api.FabricLoader;
+import net.neoforged.fml.ModList;
 
 /**
  * Optional Iris integration without a hard runtime dependency.
@@ -30,7 +30,7 @@ public final class IrisCompatibility {
 
   public static boolean isIrisLoaded() {
     try {
-      return FabricLoader.getInstance().isModLoaded("iris");
+      return ModList.get().isLoaded("iris");
     } catch (Throwable ignored) {
       return false;
     }
