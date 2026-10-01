@@ -635,13 +635,15 @@ public abstract class IrisRenderSystemMixin {
     try {
       metalrender$capture().dispatch(
           metalrender$capture().captureIndirectDispatchCommand(offset));
+      if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+        ci.cancel();
+      }
     } catch (IllegalArgumentException error) {
       metalrender$capture().dispatch();
       if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
           "graph-ownership-indirect-dispatch-capture-failed")) {
         ci.cancel();
       }
-      return;
     }
   }
 }
