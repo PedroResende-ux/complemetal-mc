@@ -9029,8 +9029,16 @@ static int iris_shadow_prepare_arguments(
     API_AVAILABLE(macos(26.0)) {
   if (!function)
     return stage.arguments.empty() ? 1 : 0;
-  id *tableSlot = stage.stage == 0
-      ? &resources.vertexTable : &resources.fragmentTable;
+  id *tableSlot = nullptr;
+  if (stage.stage == 0) {
+    tableSlot = &resources.vertexTable;
+  } else if (stage.stage == 4) {
+    tableSlot = &resources.fragmentTable;
+  } else if (stage.stage == 5) {
+    tableSlot = &resources.computeTable;
+  } else {
+    return 0;
+  }
   *tableSlot = g_irisMetal4ArgumentTableFactory.make();
   if (!*tableSlot)
     return -1;
@@ -9192,8 +9200,10 @@ struct IrisMetal4GraphPreparedDraw {
     if (!pipelineRetained)
       return;
     if (pipeline.render) [pipeline.render release];
+    if (pipeline.compute) [pipeline.compute release];
     if (pipeline.vertexFunction) [pipeline.vertexFunction release];
     if (pipeline.fragmentFunction) [pipeline.fragmentFunction release];
+    if (pipeline.computeFunction) [pipeline.computeFunction release];
     if (pipeline.depthStencil) [pipeline.depthStencil release];
   }
 };
