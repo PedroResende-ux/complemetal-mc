@@ -45,6 +45,24 @@ final class IrisMetalGraphFramePacketEncoderTest {
   }
 
   @Test
+  void encodesClearMipLevel() {
+    IrisMetalGraphFramePacketEncoder.Frame frame =
+        new IrisMetalGraphFramePacketEncoder.Frame(13, List.of(
+            new IrisMetalGraphFramePacketEncoder.Resource(3, 103)), List.of(
+                new IrisMetalGraphFramePacketEncoder.Clear(3, 2,
+                    IrisMetalGraphFramePacketEncoder.Aspect.COLOR,
+                    IrisClearCommand.ValueKind.FLOAT32,
+                    List.of(0L, 0L, 0L, 0L), Optional.empty())), -1);
+
+    ByteBuffer buffer = ByteBuffer.wrap(
+        IrisMetalGraphFramePacketEncoder.encode(frame));
+    buffer.position(28 + 12 + 4);
+    assertEquals(1, buffer.getInt());
+    assertEquals(3, buffer.getInt());
+    assertEquals(2, buffer.getInt());
+  }
+
+  @Test
   void encodesDrawAttachmentMipLevels() {
     IrisMetalGraphFramePacketEncoder.Draw draw =
         new IrisMetalGraphFramePacketEncoder.Draw(
