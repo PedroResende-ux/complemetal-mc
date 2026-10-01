@@ -4313,6 +4313,9 @@ struct IrisShadowDraw {
   uint32_t instanceCount = 0;
   uint32_t baseInstance = 0;
   uint32_t indexElementBytes = 0;
+  uint32_t groupsX = 0;
+  uint32_t groupsY = 0;
+  uint32_t groupsZ = 0;
   struct Indexed {
     uint64_t offset = 0;
     uint32_t count = 0;
@@ -4454,8 +4457,20 @@ static bool parse_iris_shadow_replay_packet_data(
     return false;
 
   if (!reader.u32(result.draw.kind) || result.draw.kind < 1 ||
-      result.draw.kind > 3 || !reader.u32(result.draw.primitiveMode))
+      result.draw.kind > 4)
     return false;
+  if (result.draw.kind == 4) {
+    if (!reader.u32(result.draw.groupsX) ||
+        !reader.u32(result.draw.groupsY) ||
+        !reader.u32(result.draw.groupsZ) ||
+        result.draw.groupsX == 0 || result.draw.groupsY == 0 ||
+        result.draw.groupsZ == 0 ||
+        result.draw.groupsX > 1048576 || result.draw.groupsY > 1048576 ||
+        result.draw.groupsZ > 1048576)
+      return false;
+  } else if (!reader.u32(result.draw.primitiveMode)) {
+    return false;
+  }
   if (result.draw.kind == 1) {
     if (!iris_shadow_read_i32(reader, result.draw.firstVertex) ||
         result.draw.firstVertex < 0 || !reader.u32(result.draw.vertexCount) ||
@@ -4616,7 +4631,7 @@ static bool parse_iris_shadow_replay_packet_data(
   for (auto &stage : result.stages) {
     uint32_t argumentCount = 0;
     if (!reader.u32(stage.stage) ||
-        (stage.stage != 0 && stage.stage != 4) ||
+        (stage.stage != 0 && stage.stage != 4 && stage.stage != 5) ||
         occupiedStages[stage.stage] ||
         !read_bounded_count(reader, kIrisShadowReplayMaximumArguments,
                             argumentCount) ||
@@ -5383,7 +5398,7 @@ static bool parse_iris_metal4_graph_frame(
     operation.stencilResource = -1;
     operation.textureOverrides.clear();
     if (!reader.u32(operation.kind) || operation.kind < 1 ||
-        operation.kind > 5) {
+        operation.kind > 6) {
       return false;
     }
     if (operation.kind == 1) {
@@ -5453,6 +5468,96 @@ static bool parse_iris_metal4_graph_frame(
           resourceIds.find(operation.firstResource) ==
               resourceIds.end()) {
         return false;
+      }
+    } else if (operation.kind == 5) {
+      uint32_t packetLength = 0;
+      uint32_t targetCount = 0;
+      uint32_t overrideCount = 0;
+      if (!reader.string(operation.pipelineKey) ||
+          operation.pipelineKey.size() != 64 ||
+          !reader.u32(packetLength) || packetLength == 0 ||
+          packetLength > (uint32_t)kIrisShadowReplayMaximumPacketBytes ||
+          !(borrowPayloads
+              ? reader.bytesView(packetLength,
+                  operation.borrowedReplayPacket)
+              : reader.bytes(packetLength, operation.replayPacket)) ||
+          !reader.u32(targetCount) || targetCount > 8) {
+        return false;
+      }
+      operation.replayPacketLength = packetLength;
+      for (char value : operation.pipelineKey) {
+        if (!((value >= '0' && value <= '9') ||
+              (value >= 'a' && value <= 'f'))) {
+          return false;
+        }
+      }
+      try {
+        operation.colorTargets.resize(targetCount);
+      } catch (...) {
+        return false;
+      }
+      bool occupiedSlots[8] = {};
+      for (auto &target : operation.colorTargets) {
+        if (!reader.u32(target.first) || target.first >= 8 ||
+            occupiedSlots[target.first] || !reader.u32(target.second) ||
+            resourceIds.find(target.second) == resourceIds.end()) {
+          return false;
+        }
+        occupiedSlots[target.first] = true;
+      }
+      if (!iris_graph_read_i32(reader, operation.depthResource) ||
+          operation.depthResource < -1 ||
+          (operation.depthResource >= 0 &&
+           resourceIds.find((uint32_t)operation.depthResource) ==
+               resourceIds.end()) ||
+          !iris_graph_read_i32(reader, operation.stencilResource) ||
+          operation.stencilResource < -1 ||
+          (operation.stencilResource >= 0 &&
+           resourceIds.find((uint32_t)operation.stencilResource) ==
+               resourceIds.end()) ||
+          (operation.colorTargets.empty() &&
+           operation.depthResource < 0 && operation.stencilResource < 0) ||
+          !reader.u32(overrideCount) || overrideCount > 256) {
+        return false;
+      }
+      for (uint32_t index = 0; index < overrideCount; index++) {
+        uint32_t glName = 0;
+        uint32_t resourceId = 0;
+        if (!reader.u32(glName) || glName == 0 ||
+            !reader.u32(resourceId) ||
+            resourceIds.find(resourceId) == resourceIds.end() ||
+            !operation.textureOverrides.emplace(glName,
+                                                 resourceId).second) {
+          return false;
+        }
+      }
+    } else if (operation.kind == 6) {
+      if (!reader.string(operation.pipelineKey) ||
+          operation.pipelineKey.size() != 64) {
+        return false;
+      }
+      uint32_t packetLength = 0;
+      if (!reader.u32(packetLength) || packetLength == 0 ||
+          packetLength > (uint32_t)kIrisShadowReplayMaximumPacketBytes ||
+          !(borrowPayloads
+              ? reader.bytesView(packetLength,
+                  operation.borrowedReplayPacket)
+              : reader.bytes(packetLength, operation.replayPacket)) ||
+          !reader.u32(operation.groupsX) ||
+          !reader.u32(operation.groupsY) ||
+          !reader.u32(operation.groupsZ) ||
+          operation.groupsX == 0 || operation.groupsY == 0 ||
+          operation.groupsZ == 0 ||
+          operation.groupsX > 1048576 || operation.groupsY > 1048576 ||
+          operation.groupsZ > 1048576) {
+        return false;
+      }
+      operation.replayPacketLength = packetLength;
+      for (char value : operation.pipelineKey) {
+        if (!((value >= '0' && value <= '9') ||
+              (value >= 'a' && value <= 'f'))) {
+          return false;
+        }
       }
     } else {
       uint32_t packetLength = 0;
