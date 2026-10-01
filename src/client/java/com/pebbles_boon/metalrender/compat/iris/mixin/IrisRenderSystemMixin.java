@@ -130,8 +130,9 @@ public abstract class IrisRenderSystemMixin {
       remap = false, cancellable = true)
   private static void metalrender$memoryBarrier(int barriers,
       CallbackInfo ci) {
-    IrisRenderGraphCapture.global().memoryBarrier(barriers);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global().memoryBarrier(barriers);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -142,10 +143,12 @@ public abstract class IrisRenderSystemMixin {
       int sourceX0, int sourceY0, int sourceX1, int sourceY1,
       int destinationX0, int destinationY0, int destinationX1,
       int destinationY1, int mask, int filter, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().blitFramebuffer(source, destination,
-        sourceX0, sourceY0, sourceX1, sourceY1, destinationX0,
-        destinationY0, destinationX1, destinationY1, mask, filter);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global().blitFramebuffer(
+        source, destination, sourceX0, sourceY0, sourceX1, sourceY1,
+        destinationX0, destinationY0, destinationX1, destinationY1, mask,
+        filter);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -155,11 +158,12 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$copyTexImage2D(int target, int level,
       int internalFormat, int x, int y, int width, int height, int border,
       CallbackInfo ci) {
-    IrisRenderGraphCapture.global().copyBoundTexture(target, level,
-        internalFormat, x, y, width, height, border,
+    boolean captured = IrisRenderGraphCapture.global().copyBoundTexture(
+        target, level, internalFormat, x, y, width, height, border,
         org.lwjgl.opengl.GL11C.glGetInteger(
             org.lwjgl.opengl.GL11C.GL_READ_BUFFER));
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -169,11 +173,13 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$copyTexSubImage2D(int destination,
       int target, int level, int destinationX, int destinationY, int sourceX,
       int sourceY, int width, int height, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().copyTexture(destination, target, level,
-        destinationX, destinationY, sourceX, sourceY, width, height,
+    boolean captured = IrisRenderGraphCapture.global().copyTexture(
+        destination, target, level, destinationX, destinationY, sourceX,
+        sourceY, width, height,
         org.lwjgl.opengl.GL11C.glGetInteger(
             org.lwjgl.opengl.GL11C.GL_READ_BUFFER));
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -182,8 +188,10 @@ public abstract class IrisRenderSystemMixin {
       remap = false, cancellable = true)
   private static void metalrender$generateMipmaps(int texture, int target,
       CallbackInfo ci) {
-    IrisRenderGraphCapture.global().generateMipmaps(texture, target);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global().generateMipmaps(
+        texture, target);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -192,9 +200,10 @@ public abstract class IrisRenderSystemMixin {
       remap = false, cancellable = true)
   private static void metalrender$clearBufferFloat(int framebuffer,
       int buffer, int drawBuffer, float[] values, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().clearNamedFramebufferFloat(framebuffer,
-        buffer, drawBuffer, values);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global()
+        .clearNamedFramebufferFloat(framebuffer, buffer, drawBuffer, values);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -203,9 +212,11 @@ public abstract class IrisRenderSystemMixin {
       remap = false, cancellable = true)
   private static void metalrender$clearBufferSignedInt(int framebuffer,
       int buffer, int drawBuffer, int[] values, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().clearNamedFramebufferSignedInt(
-        framebuffer, buffer, drawBuffer, values);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global()
+        .clearNamedFramebufferSignedInt(
+            framebuffer, buffer, drawBuffer, values);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -214,9 +225,11 @@ public abstract class IrisRenderSystemMixin {
       remap = false, cancellable = true)
   private static void metalrender$clearBufferUnsignedInt(int framebuffer,
       int buffer, int drawBuffer, int[] values, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().clearNamedFramebufferUnsignedInt(
-        framebuffer, buffer, drawBuffer, values);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global()
+        .clearNamedFramebufferUnsignedInt(
+            framebuffer, buffer, drawBuffer, values);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
