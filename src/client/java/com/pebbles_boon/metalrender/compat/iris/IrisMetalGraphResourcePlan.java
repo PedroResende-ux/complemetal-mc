@@ -96,6 +96,33 @@ public record IrisMetalGraphResourcePlan(List<Allocation> allocations) {
       }
     }
 
+    // A full-surface color MSAA blit is lowered to a Metal render-pass
+    // multisample resolve. Both sides therefore participate in render-pass
+    // attachment validation rather than using the ordinary transfer-copy
+    // usage path.
+    for (IrisRenderExecutionPlan.Step step : plan.steps()) {
+      if (!(step instanceof IrisRenderExecutionPlan.TransferStep transfer)
+          || !(transfer.command()
+              instanceof IrisTransferCommand.BlitFramebuffer blit)
+          || blit.mask() != IrisTransferCommand.GL_COLOR_BUFFER_BIT) {
+        continue;
+      }
+      boolean multisample = transfer.resources().stream()
+          .map(IrisRenderGraph.ResourceUse::resourceId)
+          .distinct()
+          .anyMatch(resourceId ->
+              plan.graph().resources().get(resourceId).sampleCount() > 1);
+      if (!multisample) {
+        continue;
+      }
+      for (IrisRenderGraph.ResourceUse use : transfer.resources()) {
+        int resourceId = use.resourceId();
+        if (resourceId >= 0 && resourceId < usages.length) {
+          usages[resourceId] |= USAGE_RENDER_TARGET;
+        }
+      }
+    }
+
     // Graphics passes can write storage images without using them as
     // framebuffer attachments. Mark those exact image-bound textures as
     // shader-writable so their persistent Metal allocation is created with
