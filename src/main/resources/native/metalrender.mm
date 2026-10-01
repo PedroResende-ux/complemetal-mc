@@ -8642,12 +8642,14 @@ struct IrisShadowRuntimeResources {
   id<MTLTexture> stencilTarget = nil;
   id vertexTable = nil;
   id fragmentTable = nil;
+  id computeTable = nil;
 
   void transferTo(IrisMetal4RetiredSubmission &submission);
 
   ~IrisShadowRuntimeResources() {
     if (vertexTable) [vertexTable release];
     if (fragmentTable) [fragmentTable release];
+    if (computeTable) [computeTable release];
     for (id<MTLSamplerState> value : samplers) [value release];
     for (id<MTLBuffer> value : argumentBuffers)
       g_irisMetal4TransientBufferPool.recycle(value);
@@ -8744,6 +8746,10 @@ void IrisShadowRuntimeResources::transferTo(
   if (fragmentTable) {
     submission.resourceObjects.push_back(fragmentTable);
     fragmentTable = nil;
+  }
+  if (computeTable) {
+    submission.resourceObjects.push_back(computeTable);
+    computeTable = nil;
   }
   for (id<MTLSamplerState> value : samplers)
     submission.resourceObjects.push_back(value);
