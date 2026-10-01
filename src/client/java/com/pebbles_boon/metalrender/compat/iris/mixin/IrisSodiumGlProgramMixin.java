@@ -34,7 +34,7 @@ public abstract class IrisSodiumGlProgramMixin {
     IrisPipelineStateCapture.global().useProgram(0);
   }
 
-  @Inject(method = "delete", at = @At("TAIL"), require = 0,
+  @Inject(method = "delete", at = @At("HEAD"), require = 0,
       remap = false)
   private void metalrender$delete(CallbackInfo ci) {
     try {
