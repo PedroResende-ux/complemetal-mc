@@ -66,6 +66,20 @@ public abstract class IrisSodiumGlUniformMixin<T> {
     }
   }
 
+  @Inject(method = "set", at = @At("TAIL"), require = 0,
+      remap = false)
+  private void metalrender$setFloat2Primitive(float x, float y,
+      CallbackInfo ci) {
+    metalrender$tracker().uniformFloats(index, x, y);
+  }
+
+  @Inject(method = "set", at = @At("TAIL"), require = 0,
+      remap = false)
+  private void metalrender$setFloat3Primitive(float x, float y, float z,
+      CallbackInfo ci) {
+    metalrender$tracker().uniformFloats(index, x, y, z);
+  }
+
   @Inject(method = "set", at = @At("TAIL"), require = 0, remap = false)
   private void metalrender$setInt(Integer value, CallbackInfo ci) {
     if (value != null) {
