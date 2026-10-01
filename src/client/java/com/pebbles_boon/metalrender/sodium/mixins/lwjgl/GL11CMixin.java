@@ -6,6 +6,7 @@ import com.pebbles_boon.metalrender.compat.iris.IrisPipelineStateCapture;
 import com.pebbles_boon.metalrender.compat.iris.IrisShaderCapture;
 import com.pebbles_boon.metalrender.compat.iris.IrisTranslationCoordinator;
 import com.pebbles_boon.metalrender.compat.iris.IrisVisualParityCapture;
+import com.pebbles_boon.metalrender.compat.iris.mixin.IrisGlStateManagerMixin;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.injection.At;
@@ -34,7 +35,8 @@ public class GL11CMixin {
       GLIntercept.onDrawElements(mode, count, type, indicesOffset, null);
     }
 
-    if (!IrisShaderCapture.isEnabled() || count <= 0) {
+    if (IrisGlStateManagerMixin.metalrender$isMojangDrawActive()
+        || !IrisShaderCapture.isEnabled() || count <= 0) {
       return;
     }
 
@@ -83,7 +85,9 @@ public class GL11CMixin {
       require = 0)
   private static void metalrender$onDrawElementsComplete(int mode, int count,
       int type, long indicesOffset, CallbackInfo ci) {
-    metalrender$finishDraw();
+    if (!IrisGlStateManagerMixin.metalrender$isMojangDrawActive()) {
+      metalrender$finishDraw();
+    }
   }
 
   @Inject(method = "glDrawArrays", at = @At("HEAD"), remap = false,
