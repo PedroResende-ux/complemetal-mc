@@ -955,10 +955,18 @@ public final class IrisMetalGraphFramePlanner {
         && (snapshot.format().equals(resource.format())
             || resource.format().equals("rg11b10-float")
                 && snapshot.format().equals("rgba16-float"));
-    return snapshot != null && snapshot.mipLevel() == 0
-        && snapshot.layer() == 0 && formatCompatible
-        && snapshot.width() == resource.width()
-        && snapshot.height() == resource.height();
+    if (snapshot == null || snapshot.layer() != 0
+        || !formatCompatible || snapshot.mipLevel() < 0
+        || snapshot.mipLevel() >= resource.mipLevels()
+        || snapshot.mipLevel() > 30) {
+      return false;
+    }
+    int expectedWidth = Math.max(1,
+        resource.width() >> snapshot.mipLevel());
+    int expectedHeight = Math.max(1,
+        resource.height() >> snapshot.mipLevel());
+    return snapshot.width() == expectedWidth
+        && snapshot.height() == expectedHeight;
   }
 
   private static boolean clearFormatMatches(String format, int buffer) {
