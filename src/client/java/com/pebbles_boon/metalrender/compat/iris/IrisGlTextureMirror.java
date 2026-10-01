@@ -41,6 +41,11 @@ public final class IrisGlTextureMirror {
     return GLOBAL;
   }
 
+  public static boolean isEnabled() {
+    return IrisMetalFeatureFlags.enabled(
+        "metalrender.experimental.irisMetalShadowReplay");
+  }
+
   public synchronized boolean define(int texture, String format,
       int width, int height, int depthOrLayers, int mipLevels,
       int bytesPerPixel) {
