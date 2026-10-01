@@ -291,7 +291,8 @@ public final class IrisMetalGraphFramePlanner {
           resolved.replayPacket(overrides.keySet(), externalBuffers,
               externalTextures),
           targets.colors(), targets.depthResourceId(),
-          targets.stencilResourceId(), overrides));
+          targets.depthMipLevel(), targets.stencilResourceId(),
+          targets.stencilMipLevel(), overrides));
       initialized.addAll(targets.allTargets());
       written.addAll(targets.allTargets());
       if ((pipeline.phase() == IrisRenderGraph.Phase.FINAL
@@ -654,25 +655,27 @@ public final class IrisMetalGraphFramePlanner {
       }
       IrisGlStateSnapshot.TextureAttachment attachment =
           target.attachment().value().orElseThrow();
-      if (attachment.mipLevel() != 0) {
-        throw unsupported("graph-frame-attachment-mip-unimplemented");
-      }
       Integer resourceId = idsByHandle.get(attachment.texture());
       if (resourceId == null || !tokensById.containsKey(resourceId)
           || !expected.format().cacheName().equals(
-              plan.graph().resources().get(resourceId).format())) {
+              plan.graph().resources().get(resourceId).format())
+          || attachment.mipLevel() >= plan.graph().resources()
+              .get(resourceId).mipLevels()) {
         throw unsupported("graph-frame-color-target-mismatch");
       }
       colors.add(new IrisMetalGraphFramePacketEncoder.ColorTarget(
-          expected.slot(), resourceId));
+          expected.slot(), resourceId, attachment.mipLevel()));
       allTargets.add(resourceId);
     }
     int depth = attachmentResource(snapshot.depthAttachment(),
         state.depthAttachmentFormat(), plan, tokensById, idsByHandle,
         "depth");
+    int depthMip = depth >= 0 ? attachmentMip(snapshot.depthAttachment()) : 0;
     int stencil = attachmentResource(snapshot.stencilAttachment(),
         state.stencilAttachmentFormat(), plan, tokensById, idsByHandle,
         "stencil");
+    int stencilMip =
+        stencil >= 0 ? attachmentMip(snapshot.stencilAttachment()) : 0;
     if (depth >= 0) {
       allTargets.add(depth);
     }
@@ -682,7 +685,8 @@ public final class IrisMetalGraphFramePlanner {
     if (colors.isEmpty() && depth < 0 && stencil < 0) {
       throw unsupported("graph-frame-draw-has-no-target");
     }
-    return new DrawTargets(colors, depth, stencil, allTargets);
+    return new DrawTargets(colors, depth, depthMip, stencil, stencilMip,
+        allTargets);
   }
 
   private static int attachmentResource(IrisGlStateSnapshot.StateValue<
@@ -701,16 +705,24 @@ public final class IrisMetalGraphFramePlanner {
     }
     IrisGlStateSnapshot.TextureAttachment attachment =
         captured.value().orElseThrow();
-    if (attachment.mipLevel() != 0) {
-      throw unsupported("graph-frame-attachment-mip-unimplemented");
-    }
     Integer resourceId = idsByHandle.get(attachment.texture());
     if (resourceId == null || !tokensById.containsKey(resourceId)
         || !expected.orElseThrow().cacheName().equals(
-            plan.graph().resources().get(resourceId).format())) {
+            plan.graph().resources().get(resourceId).format())
+        || attachment.mipLevel() >= plan.graph().resources()
+            .get(resourceId).mipLevels()) {
       throw unsupported("graph-frame-" + label + "-target-mismatch");
     }
     return resourceId;
+  }
+
+  private static int attachmentMip(
+      IrisGlStateSnapshot.StateValue<Optional<
+          IrisGlStateSnapshot.TextureAttachment>> captured) {
+    if (!captured.isKnown() || captured.value().isEmpty()) {
+      return 0;
+    }
+    return captured.value().orElseThrow().mipLevel();
   }
 
   private static Map<Integer, Integer> textureOverrides(
@@ -1368,7 +1380,8 @@ public final class IrisMetalGraphFramePlanner {
 
   private record DrawTargets(
       List<IrisMetalGraphFramePacketEncoder.ColorTarget> colors,
-      int depthResourceId, int stencilResourceId,
+      int depthResourceId, int depthMipLevel,
+      int stencilResourceId, int stencilMipLevel,
       Set<Integer> allTargets) {
     private DrawTargets {
       colors = List.copyOf(colors);
