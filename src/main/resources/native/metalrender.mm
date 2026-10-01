@@ -6542,6 +6542,8 @@ static jlongArray run_iris_metal4_graph_frame(
             bool fold = !loadClears.empty() &&
                 drawIndex < packet.operations.size() &&
                 packet.operations[drawIndex].kind == 5 &&
+                preparedDraws[drawIndex] &&
+                preparedDraws[drawIndex]->feedbackCopies.empty() &&
                 std::all_of(loadClears.begin(), loadClears.end(),
                     [&](const auto *clear) {
                       return clearMatchesDrawTarget(
@@ -6551,6 +6553,8 @@ static jlongArray run_iris_metal4_graph_frame(
               size_t runEnd = drawIndex + 1;
               while (runEnd < packet.operations.size() &&
                      packet.operations[runEnd].kind == 5 &&
+                     preparedDraws[runEnd] &&
+                     preparedDraws[runEnd]->feedbackCopies.empty() &&
                      iris_graph_prepared_draw_can_share_pass(
                          preparedDraws[drawIndex],
                          preparedDraws[runEnd])) {
@@ -10253,9 +10257,6 @@ static int iris_graph_encode_prepared_draw_run(
   IrisShadowReplayPacket &packet = first->packet;
   IrisMetal4PipelineEntry &entry = first->pipeline;
   IrisShadowRuntimeResources &resources = first->resources;
-  for (const IrisMetal4GraphPreparedDraw *prepared : draws) {
-    (void)prepared;
-  }
   if (!draws[begin]->feedbackCopies.empty()) {
     int feedbackOutcome = iris_graph_encode_feedback_copies(
         draws[begin], commandBuffer, applyBarrier, graphStages, reason);
