@@ -98,6 +98,30 @@ public abstract class WorldRendererBlitMixin {
       Matrix4f positionMatrix,
       Matrix4f projectionMatrix,
       CallbackInfo ci) {
+    metalrender$presentTerrainBeforeEntities();
+  }
+
+  /**
+   * Secondary 1.21.1 presentation boundary. The exact renderSectionLayer
+   * ordinal is intentionally retained above for the normal path, but Sodium,
+   * NeoForge or another renderer mixin can change that call ordering. The
+   * first renderEntity invocation is an unambiguous semantic boundary before
+   * entity rendering and therefore keeps terrain presentation fail-safe.
+   */
+  @Inject(method = "renderEntity", at = @At("HEAD"), require = 0)
+  private void metalrender$presentBeforeFirstEntity(
+      net.minecraft.world.entity.Entity entity,
+      double camX,
+      double camY,
+      double camZ,
+      float partialTick,
+      com.mojang.blaze3d.vertex.PoseStack poseStack,
+      net.minecraft.client.renderer.MultiBufferSource bufferSource,
+      CallbackInfo ci) {
+    metalrender$presentTerrainBeforeEntities();
+  }
+
+  private void metalrender$presentTerrainBeforeEntities() {
     if (!metalrender$frameActive || metalrender$frameEnded) {
       return;
     }
@@ -114,7 +138,8 @@ public abstract class WorldRendererBlitMixin {
       Minecraft mc = Minecraft.getInstance();
       if (worldRenderer == null || !worldRenderer.metalActive()
           || mc == null || mc.getWindow() == null) {
-        MetalRenderHookState.failOpen("world-renderer-missing-before-entities", null);
+        MetalRenderHookState.failOpen(
+            "world-renderer-missing-before-entities", null);
         worldRenderer = null;
         return;
       }
