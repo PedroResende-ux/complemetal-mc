@@ -42,6 +42,19 @@ final class IrisRenderGraphCaptureTest {
   }
 
   @Test
+  void unresolvedOperationDoesNotCountAsCapturedForSuppression() {
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(
+        new IrisGlStateTracker());
+    capture.beginFrame();
+
+    assertTrue(capture.memoryBarrier(1));
+    assertFalse(capture.generateMipmaps(999, GL_TEXTURE_2D));
+
+    capture.endFrame();
+    assertEquals(1, capture.poll().orElseThrow().events().size());
+  }
+
+  @Test
   void fullReplayReservationBypassesRegularFrameSamplingInterval() {
     AtomicLong now = new AtomicLong(1_000_000_000L);
     AtomicBoolean fullReplay = new AtomicBoolean();
