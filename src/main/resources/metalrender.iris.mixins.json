@@ -6,7 +6,8 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [],
   "client": [
-    "Iris1211RenderingPipelineMixin"
+    "Iris1211RenderingPipelineMixin",
+    "IrisProgramBuilderMixin"
   ],
   "injectors": {
     "defaultRequire": 0
