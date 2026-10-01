@@ -270,6 +270,83 @@ public abstract class IrisRenderSystemMixin {
     }
   }
 
+  @Inject(method = "texImage1D", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$texImage1D(int texture, int target,
+      int level, int internalFormat, int width, int border, int format,
+      int type, ByteBuffer pixels, CallbackInfo ci) {
+    if (texture <= 0 || level < 0 || width <= 0) {
+      return;
+    }
+    int bytesPerPixel = IrisGlFormat.exactUploadBytesPerPixel(
+        internalFormat, format, type).orElse(0);
+    if (bytesPerPixel <= 0) {
+      bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat).orElse(0);
+    }
+    if (bytesPerPixel <= 0) {
+      return;
+    }
+    String cacheFormat = IrisGlFormat.cacheName(internalFormat)
+        .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
+    if (!IrisGlTextureMirror.global().define(texture, cacheFormat, width, 1,
+        1, Math.max(1, level + 1), bytesPerPixel)) {
+      return;
+    }
+    if (pixels != null && level == 0
+        && pixels.remaining() >= width * bytesPerPixel) {
+      IrisGlTextureMirror.global().write(texture, level, 0, 0, 0, width, 1,
+          width, pixels);
+    }
+  }
+
+  @Inject(method = "texImage3D", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$texImage3D(int texture, int target,
+      int level, int internalFormat, int width, int height, int depth,
+      int border, int format, int type, ByteBuffer pixels,
+      CallbackInfo ci) {
+    if (texture <= 0 || level < 0 || width <= 0 || height <= 0
+        || depth <= 0) {
+      return;
+    }
+    int bytesPerPixel = IrisGlFormat.exactUploadBytesPerPixel(
+        internalFormat, format, type).orElse(0);
+    if (bytesPerPixel <= 0) {
+      bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat).orElse(0);
+    }
+    if (bytesPerPixel <= 0) {
+      return;
+    }
+    String cacheFormat = IrisGlFormat.cacheName(internalFormat)
+        .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
+    if (!IrisGlTextureMirror.global().define(texture, cacheFormat, width,
+        height, depth, Math.max(1, level + 1), bytesPerPixel)) {
+      return;
+    }
+    if (pixels == null || level != 0) {
+      return;
+    }
+
+    long layerBytes = (long) width * height * bytesPerPixel;
+    if (layerBytes > Integer.MAX_VALUE
+        || layerBytes > pixels.remaining()) {
+      return;
+    }
+    for (int layer = 0; layer < depth; layer++) {
+      long start = (long) pixels.position() + layer * layerBytes;
+      if (start > Integer.MAX_VALUE
+          || start < 0
+          || start + layerBytes > (long) pixels.limit()) {
+        return;
+      }
+      ByteBuffer slice = pixels.duplicate();
+      slice.position(Math.toIntExact(start));
+      slice.limit(Math.toIntExact(start + layerBytes));
+      IrisGlTextureMirror.global().write(texture, level, layer, 0, 0, width,
+          height, width, slice.slice());
+    }
+  }
+
   @Inject(method = "framebufferTexture2D", at = @At("RETURN"), require = 0,
       remap = false)
   private static void metalrender$framebufferTexture2D(int framebuffer,
