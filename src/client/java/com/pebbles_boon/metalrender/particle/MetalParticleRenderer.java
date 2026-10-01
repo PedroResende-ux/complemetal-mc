@@ -23,7 +23,7 @@ import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.core.BlockPos;
-import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.LightLayer;
 import org.joml.Quaternionf;
@@ -327,7 +327,7 @@ public class MetalParticleRenderer {
       return;
     Quaternionf camRot = camera.rotation();
     int currentGlTexId = -1;
-    Identifier currentAtlasId = null;
+    ResourceLocation currentAtlasId = null;
     int batchStartVertex = 0;
     int batchVertexCount = 0;
     for (int _pi = 0; _pi < count; _pi++) {
@@ -457,7 +457,7 @@ public class MetalParticleRenderer {
     vtxCount++;
   }
 
-  private long getOrCreateMetalTexture(int glTextureId, Identifier atlasId) {
+  private long getOrCreateMetalTexture(int glTextureId, ResourceLocation atlasId) {
     if (glTextureId == 0 || device == 0)
       return 0;
     boolean inBounds = glTextureId >= 0 && glTextureId < TEXTURE_CACHE_SIZE;
@@ -521,7 +521,7 @@ public class MetalParticleRenderer {
   }
 
   private boolean shouldRefreshTexture(long cached, int lastUpload,
-      Identifier atlasId) {
+      ResourceLocation atlasId) {
     if (cached == TEXTURE_UNCACHED || lastUpload < 0) {
       return true;
     }
@@ -531,7 +531,7 @@ public class MetalParticleRenderer {
     return frameCount - lastUpload >= ATLAS_REFRESH_FRAMES;
   }
 
-  private int getGlTextureIdForAtlas(Identifier atlasId) {
+  private int getGlTextureIdForAtlas(ResourceLocation atlasId) {
     try {
       Minecraft mc = Minecraft.getInstance();
       if (mc == null)
@@ -612,13 +612,13 @@ public class MetalParticleRenderer {
     float zRotation;
     float minU, maxU, minV, maxV;
     int light;
-    Identifier atlasId;
+    ResourceLocation atlasId;
   }
 
   private static class ParticleDrawCommand {
     int startVertex;
     int vertexCount;
     int glTextureId;
-    Identifier atlasId;
+    ResourceLocation atlasId;
   }
 }
