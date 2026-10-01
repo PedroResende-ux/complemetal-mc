@@ -1856,8 +1856,9 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     if (!pending.replaySamplers().complete()) {
       addDistinct(blockers, "graph-frame-sampler-capture-incomplete");
     }
-    if (!pending.dynamicState().completeFor(
-        IrisGlStateSnapshot.Operation.DRAW)) {
+    IrisGlStateSnapshot.Operation operation =
+        pending.snapshot().operation();
+    if (!pending.dynamicState().completeFor(operation)) {
       addDistinct(blockers, "graph-frame-dynamic-state-incomplete");
     }
     if (!supportedReplayCommand(pending.command())) {
@@ -3483,6 +3484,12 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     }
     if (command instanceof IrisExecutionCommand.MultiDrawIndexed indexed) {
       return indexed.indexElementBytes() != 1;
+    }
+    if (command instanceof IrisExecutionCommand.Dispatch dispatch) {
+      return dispatch.groupsX() > 0 && dispatch.groupsY() > 0
+          && dispatch.groupsZ() > 0
+          && dispatch.localSizeX() > 0 && dispatch.localSizeY() > 0
+          && dispatch.localSizeZ() > 0;
     }
     return false;
   }
