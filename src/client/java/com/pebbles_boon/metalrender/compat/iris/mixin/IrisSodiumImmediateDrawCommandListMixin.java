@@ -24,6 +24,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class IrisSodiumImmediateDrawCommandListMixin {
   private static final ThreadLocal<Boolean> METALRENDER_DRAW_ACTIVE =
       new ThreadLocal<>();
+
+  public static boolean metalrender$isHighLevelDrawActive() {
+    return METALRENDER_DRAW_ACTIVE.get() != null;
+  }
   @Inject(method = "multiDrawElementsBaseVertex", at = @At("HEAD"),
       require = 0, remap = false, cancellable = true)
   private void metalrender$multiDraw(MultiDrawBatch batch,
