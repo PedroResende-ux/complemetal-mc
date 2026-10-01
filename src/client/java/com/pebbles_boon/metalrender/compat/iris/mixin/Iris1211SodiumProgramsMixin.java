@@ -116,7 +116,21 @@ public abstract class Iris1211SodiumProgramsMixin {
       }
       String passLower = pass.name().toLowerCase(java.util.Locale.ROOT);
       String sourceLower = sourceName.toLowerCase(java.util.Locale.ROOT);
-      return sourceLower.contains(passLower);
+      if (sourceLower.contains(passLower)) {
+        return true;
+      }
+
+      // Iris 1.21.1 maps SodiumPrograms.TRANSLUCENT to ProgramId.Water,
+      // whose shaderpack source name is gbuffers_water rather than a name
+      // containing "translucent". Match the canonical ProgramId source name
+      // as well so the water terrain program is not silently dropped.
+      try {
+        String originalId = pass.getOriginalId().getSourceName()
+            .toLowerCase(java.util.Locale.ROOT);
+        return sourceLower.contains(originalId);
+      } catch (RuntimeException | LinkageError ignored) {
+        return false;
+      }
     }
   }
 }
