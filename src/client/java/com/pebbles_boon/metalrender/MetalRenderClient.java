@@ -493,17 +493,14 @@ public class MetalRenderClient {
    * teardown and reconstruction used by Minecraft itself.</p>
    */
   public static boolean rebuildLevelRenderer(Minecraft mc) {
-    if (mc == null || mc.level == null || mc.levelRenderer == null
-        || mc.options == null || mc.gameRenderer == null) {
+    if (mc == null || mc.level == null || mc.levelRenderer == null) {
       return false;
     }
     try {
-      mc.levelRenderer.invalidateCompiledGeometry(mc.level, mc.options,
-          mc.gameRenderer.mainCamera(), mc.getBlockColors());
-      return mc.levelRenderer.viewArea() != null;
+      mc.levelRenderer.allChanged();
+      return true;
     } catch (Throwable error) {
-      MetalLogger.warn("level renderer rebuild failed: %s",
-          error.getMessage());
+      MetalLogger.warn("level renderer rebuild failed: %s", error.getMessage());
       return false;
     }
   }
