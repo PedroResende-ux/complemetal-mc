@@ -4,6 +4,7 @@ import com.pebbles_boon.metalrender.compat.iris.IrisSodiumGlStateBridge;
 import net.caffeinemc.mods.sodium.client.gl.array.GlVertexArray;
 import net.caffeinemc.mods.sodium.client.gl.buffer.GlBuffer;
 import net.caffeinemc.mods.sodium.client.gl.buffer.GlBufferMapping;
+import net.caffeinemc.mods.sodium.client.gl.buffer.GlImmutableBuffer;
 import net.caffeinemc.mods.sodium.client.gl.buffer.GlBufferTarget;
 import net.caffeinemc.mods.sodium.client.gl.buffer.GlMutableBuffer;
 import net.caffeinemc.mods.sodium.client.gl.buffer.GlBufferUsage;
@@ -61,6 +62,20 @@ public abstract class IrisSodiumGlRenderDeviceMixin {
       IrisSodiumGlStateBridge.upload(buffer.handle(), bytes);
     } catch (RuntimeException ignored) {
       // Future replay will fail closed if the mirror is incomplete.
+    }
+  }
+
+  @Inject(method = "createImmutableBuffer", at = @At("RETURN"),
+      require = 0, remap = false)
+  private void metalrender$createImmutableBuffer(long size,
+      EnumBitField<?> flags, CallbackInfoReturnable<GlImmutableBuffer> callback) {
+    GlImmutableBuffer buffer = callback.getReturnValue();
+    if (buffer != null) {
+      try {
+        IrisSodiumGlStateBridge.allocate(buffer.handle(), size);
+      } catch (RuntimeException ignored) {
+        // Mapped staging remains valid; replay will fail closed if needed.
+      }
     }
   }
 
