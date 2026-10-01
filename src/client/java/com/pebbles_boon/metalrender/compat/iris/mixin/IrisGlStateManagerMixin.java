@@ -341,6 +341,9 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_drawElements", at = @At("HEAD"), cancellable = true)
   private static void metalrender$drawElements(int mode, int count, int type,
       long indices, CallbackInfo ci) {
+    if (IrisGlCommandEncoderMixin.metalrender$isHighLevelDrawCaptureActive()) {
+      return;
+    }
     IrisVisualParityCapture.global().beginDrawInvocation();
     int bytes = switch (type) {
       case 0x1401 -> 1;
@@ -394,6 +397,9 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_drawArrays", at = @At("HEAD"), cancellable = true)
   private static void metalrender$drawArrays(int mode, int first, int count,
       CallbackInfo ci) {
+    if (IrisGlCommandEncoderMixin.metalrender$isHighLevelDrawCaptureActive()) {
+      return;
+    }
     IrisVisualParityCapture.global().beginDrawInvocation();
     try {
       var pending = metalrender$capture().captureDrawDirect(
