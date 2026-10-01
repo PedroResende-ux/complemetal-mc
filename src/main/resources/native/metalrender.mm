@@ -9820,6 +9820,8 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
           prepared->feedbackCopies.push_back({texture, snapshot});
           prepared->resources.sampledTextures.push_back(snapshot);
           prepared->resources.sampledByName.emplace(captured.glName, snapshot);
+          prepared->additionalAllocations.push_back(
+              (id<MTLAllocation>)snapshot);
           overrideUses++;
           continue;
         }
@@ -10083,6 +10085,56 @@ static bool iris_graph_prepared_draw_can_share_pass(
   return true;
 }
 
+static int iris_graph_encode_feedback_copies(
+    IrisMetal4GraphPreparedDraw *draw,
+    id<MTL4CommandBuffer> commandBuffer, bool applyBarrier,
+    MTLStages graphStages, jlong &reason) API_AVAILABLE(macos(26.0)) {
+  if (!draw || !commandBuffer) {
+    reason = 5;
+    return -1;
+  }
+  if (draw->feedbackCopies.empty()) {
+    return 1;
+  }
+  id<MTL4ComputeCommandEncoder> encoder =
+      [commandBuffer computeCommandEncoder];
+  if (!encoder) {
+    reason = kIrisGraphReasonDrawFeedbackSnapshotUnsupported;
+    return -1;
+  }
+  if (applyBarrier || !draws[begin]->feedbackCopies.empty()) {
+    [encoder barrierAfterQueueStages:graphStages
+                        beforeStages:graphStages
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+  }
+  for (const auto &copy : draw->feedbackCopies) {
+    if (!copy.source || !copy.snapshot ||
+        copy.source.sampleCount != 1 ||
+        copy.snapshot.mipmapLevelCount != copy.source.mipmapLevelCount) {
+      [encoder endEncoding];
+      reason = kIrisGraphReasonDrawFeedbackSnapshotUnsupported;
+      return 0;
+    }
+    for (NSUInteger level = 0;
+         level < copy.source.mipmapLevelCount; level++) {
+      NSUInteger width = std::max((NSUInteger)1, copy.source.width >> level);
+      NSUInteger height = std::max((NSUInteger)1, copy.source.height >> level);
+      [encoder copyFromTexture:copy.source
+                   sourceSlice:0
+                   sourceLevel:level
+                  sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:MTLSizeMake(width, height, 1)
+                      toTexture:copy.snapshot
+               destinationSlice:0
+               destinationLevel:level
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+    }
+  }
+  [encoder endEncoding];
+  reason = 0;
+  return 1;
+}
+
 static int iris_graph_encode_prepared_draw_commands(
     IrisMetal4GraphPreparedDraw *draw,
     id<MTL4RenderCommandEncoder> encoder,
@@ -10201,6 +10253,16 @@ static int iris_graph_encode_prepared_draw_run(
   IrisShadowReplayPacket &packet = first->packet;
   IrisMetal4PipelineEntry &entry = first->pipeline;
   IrisShadowRuntimeResources &resources = first->resources;
+  for (const IrisMetal4GraphPreparedDraw *prepared : draws) {
+    (void)prepared;
+  }
+  if (!draws[begin]->feedbackCopies.empty()) {
+    int feedbackOutcome = iris_graph_encode_feedback_copies(
+        draws[begin], commandBuffer, applyBarrier, graphStages, reason);
+    if (feedbackOutcome <= 0) {
+      return feedbackOutcome;
+    }
+  }
   MTL4RenderPassDescriptor *pass =
       [[MTL4RenderPassDescriptor alloc] init];
   if (!pass) {
