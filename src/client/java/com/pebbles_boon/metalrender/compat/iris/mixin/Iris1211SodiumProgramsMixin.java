@@ -23,7 +23,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 @Mixin(value = SodiumPrograms.class, remap = false)
 public abstract class Iris1211SodiumProgramsMixin {
   @Inject(method = "transformShaders", at = @At("RETURN"), require = 0)
-  private static void complemetal$captureSodiumTerrainShaders(
+  private void complemetal$captureSodiumTerrainShaders(
       ProgramSource source,
       AlphaTest alphaTest,
       ProgramSet programSet,
