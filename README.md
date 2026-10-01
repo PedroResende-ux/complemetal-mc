@@ -148,6 +148,38 @@ Development checks:
 ./gradlew --no-daemon runClientGameTest
 ```
 
+### NeoForge 1.21.1 Iris development branch
+
+The `neoforge-1.21.1-port` branch targets Minecraft 1.21.1 with NeoForge
+21.1.252, Sodium 0.6.13, and Iris 1.8.12. Its Iris mixin configuration now
+registers the 1.21.1 Sodium terrain-program hook together with the OpenGL
+state/resource interception layer used by the experimental Metal graph.
+
+For a reproducible local graph-validation run, use:
+
+```bash
+./gradlew --no-daemon -PirisGraph runClient
+```
+
+This enables shader capture/translation, Metal pipeline compilation, resource
+mirroring, visual-parity capture, and Metal graph execution while keeping
+full-frame OpenGL ownership disabled. To test the subsequent ownership gate:
+
+```bash
+./gradlew --no-daemon -PirisGraphOwnership runClient
+```
+
+`irisGraphOwnership` implies the graph prerequisites but does not bypass the
+runtime validation gate. Until the graph has established its required parity
+state, Iris/OpenGL remains the visible owner.
+
+A lighter shader-capture run remains available with:
+
+```bash
+./gradlew --no-daemon -PirisCapture runClient
+```
+
+
 Publishable native release build:
 
 ```bash
