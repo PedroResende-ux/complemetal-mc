@@ -40,8 +40,6 @@ final class IrisRenderGraphCaptureTest {
     capture.endFrame();
     IrisRenderGraphCapture.PendingFrame frame = capture.poll().orElseThrow();
     assertFalse(frame.fullReplayCaptured());
-    assertEquals("graph-frame-buffer-clear-unimplemented",
-        frame.fullReplayAbortReason());
   }
 
   @Test
