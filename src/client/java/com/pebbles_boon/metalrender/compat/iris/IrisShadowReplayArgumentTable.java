@@ -272,8 +272,7 @@ public record IrisShadowReplayArgumentTable(List<StageTable> stages,
         case STORAGE_BUFFER -> storageBuffer(resource, argument, output);
         case SAMPLED_IMAGE, TEXTURE, SAMPLER -> sampled(resource, argument,
             name, output);
-        case STORAGE_IMAGE -> blockers.add(
-            "storage-image-snapshot-unavailable");
+        case STORAGE_IMAGE -> storageImage(argument, name, output);
       }
     }
 
@@ -312,6 +311,38 @@ public record IrisShadowReplayArgumentTable(List<StageTable> stages,
       bindBuffer(argument, new IndexedBufferBinding(
           IrisGlResourceBindingTracker.GL_UNIFORM_BUFFER, binding), output,
           "uniform-buffer-image-unavailable");
+    }
+
+    private void storageImage(ArgumentBinding argument, String name,
+        List<BoundArgument> output) {
+      Integer location = location(name);
+      UniformValue unitValue = location == null
+          ? null : live.uniformValues().get(location);
+      if (unitValue == null || unitValue.rawBits().length != 1) {
+        blockers.add("storage-image-unit-unavailable");
+        return;
+      }
+      int unit = (int) unitValue.rawBits()[0];
+      IrisGlResourceBindingSnapshot.ImageUnitBinding binding =
+          live.imageUnits().get(unit);
+      if (binding == null || binding.texture() <= 0) {
+        blockers.add("storage-image-binding-unavailable");
+        return;
+      }
+      if (binding.layered()) {
+        blockers.add("layered-image-snapshot-unavailable");
+        return;
+      }
+      IrisGlTextureMirror.TextureSnapshot snapshot =
+          textures.textures().get(binding.texture());
+      if (snapshot == null
+          || snapshot.mipLevel() != binding.level()
+          || snapshot.layer() != binding.layer()) {
+        blockers.add("storage-image-snapshot-unavailable");
+        return;
+      }
+      output.add(new BoundArgument(argument.argumentBufferIndex(),
+          argument.primaryId(), new TextureImage(binding.texture())));
     }
 
     private void storageBuffer(ResourceBinding resource,
