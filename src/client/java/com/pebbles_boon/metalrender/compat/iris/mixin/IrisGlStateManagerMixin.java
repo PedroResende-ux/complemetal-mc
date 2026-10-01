@@ -1,6 +1,6 @@
 package com.pebbles_boon.metalrender.compat.iris.mixin;
 
-import com.mojang.blaze3d.opengl.GlStateManager;
+import com.mojang.blaze3d.platform.GlStateManager;
 import com.pebbles_boon.metalrender.compat.iris.IrisExecutionCommand;
 import com.pebbles_boon.metalrender.compat.iris.IrisDynamicDrawStateTracker;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlStateTracker;
