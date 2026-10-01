@@ -14,6 +14,7 @@
     "IrisSodiumGlRenderDeviceMixin",
     "IrisSodiumGlTessellationMixin",
     "IrisSodiumImmediateDrawCommandListMixin",
+    "IrisSodiumGlUniformMixin",
     "IrisRenderingPipelineGraphMixin",
     "IrisShadowRendererGraphMixin",
     "IrisFinalPassGraphMixin",
