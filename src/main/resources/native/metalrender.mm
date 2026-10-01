@@ -6804,8 +6804,7 @@ static jlongArray run_iris_metal4_graph_frame(
             IrisMetal4GraphPreparedDraw *prepared =
                 preparedDraws[operationIndex];
             if (!prepared || prepared->packet.draw.kind != 4 ||
-                !prepared->pipeline.compute ||
-                !prepared->resources.computeTable) {
+                !prepared->pipeline.compute) {
               status = 0;
               reason = kIrisGraphReasonDrawPipelineUnavailable;
               @throw [NSException
@@ -6838,8 +6837,10 @@ static jlongArray run_iris_metal4_graph_frame(
               consumeBarrier();
             }
             [encoder setComputePipelineState:prepared->pipeline.compute];
-            [encoder setArgumentTable:
-                (id<MTL4ArgumentTable>)prepared->resources.computeTable];
+            if (prepared->resources.computeTable) {
+              [encoder setArgumentTable:
+                  (id<MTL4ArgumentTable>)prepared->resources.computeTable];
+            }
             [encoder dispatchThreadgroups:
                 MTLSizeMake(prepared->packet.draw.groupsX,
                             prepared->packet.draw.groupsY,
