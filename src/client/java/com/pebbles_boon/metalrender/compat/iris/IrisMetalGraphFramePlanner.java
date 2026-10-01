@@ -299,12 +299,6 @@ public final class IrisMetalGraphFramePlanner {
           written.add(target);
         }
       }
-      Set<Integer> storageImageWriteTextures = pipeline.pending()
-          .resourceBindings().imageUnits().values().stream()
-          .filter(binding -> binding.texture() > 0
-              && binding.access() != 0x88B8)
-          .map(IrisGlResourceBindingSnapshot.ImageUnitBinding::texture)
-          .collect(java.util.stream.Collectors.toUnmodifiableSet());
       validateDrawResourceRouting(plan, pipeline, tokensById, initialized,
           targets.allTargets(), handlesById,
           resolved.sampledTextureNames(), storageImageWriteTextures,
