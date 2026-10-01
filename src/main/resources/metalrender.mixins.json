@@ -13,6 +13,8 @@
     "OptionsSaveMixin",
     "ChunkLoadMixin",
     "TextureAtlasAnimationMixin",
+    "WorldRendererBlitMixin",
+    "WorldRendererTerrainMixin",
     "accessor.WindowAccessor",
     "accessor.BillboardParticleAccessor",
     "accessor.ParticleAccessor",
