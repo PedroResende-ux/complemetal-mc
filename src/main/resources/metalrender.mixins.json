@@ -15,6 +15,7 @@
     "TextureAtlasAnimationMixin",
     "WorldRendererBlitMixin",
     "WorldRendererTerrainMixin",
+    "SodiumRenderSectionManagerMixin",
     "accessor.WindowAccessor",
     "accessor.AccessorLightTexture",
     "accessor.ParticleManagerAccessor"
