@@ -624,13 +624,14 @@ public abstract class IrisRenderSystemMixin {
       CallbackInfo ci) {
     try {
       metalrender$capture().dispatch(
-          new IrisExecutionCommand.IndirectDispatch(offset));
+          metalrender$capture().captureIndirectDispatchCommand(offset));
     } catch (IllegalArgumentException error) {
       metalrender$capture().dispatch();
-    }
-    if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
-        "graph-ownership-indirect-dispatch-unimplemented")) {
-      ci.cancel();
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-indirect-dispatch-capture-failed")) {
+        ci.cancel();
+      }
+      return;
     }
   }
 }
