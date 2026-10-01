@@ -160,8 +160,157 @@ public final class IrisPipelineStateCapture {
     drawsObserved.incrementAndGet();
     IrisVertexInputBindings inputs =
         IrisGlVertexArrayTracker.global().snapshot(resolved.descriptor());
+    PreparedDirectCapture prepared = prepareDirectCapture(command, inputs,
+        resolved.descriptor());
     return Optional.of(capture(resolved,
-        tracker.snapshotDraw(command.primitiveMode()), command, inputs));
+        tracker.snapshotDraw(prepared.command().primitiveMode()),
+        prepared.command(), prepared.vertexInputs()));
+  }
+
+  private PreparedDirectCapture prepareDirectCapture(
+      IrisExecutionCommand command, IrisVertexInputBindings inputs,
+      IrisProgramIdentityRegistry.ProgramDescriptor descriptor) {
+    if (!(command instanceof IrisExecutionCommand.MultiDrawIndexed multi)
+        || multi.source() != IrisExecutionCommand.Source.SODIUM_COMMAND_LIST) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+    if (!inputs.complete() || inputs.vertexBuffers().isEmpty()
+        || inputs.indexBuffer().isEmpty()) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    IrisPipelineState.VertexBufferLayout vertexLayout =
+        descriptor.vertexBuffers().stream()
+            .filter(layout -> layout.bufferIndex() == 0)
+            .findFirst().orElse(null);
+    IrisVertexInputBindings.BufferSlice vertexSlice =
+        inputs.vertexBuffers().stream()
+            .filter(slice -> slice.slot() == 0)
+            .findFirst().orElse(null);
+    IrisVertexInputBindings.BufferSlice indexSlice =
+        inputs.indexBuffer().orElse(null);
+    if (vertexLayout == null || vertexSlice == null || indexSlice == null
+        || vertexLayout.strideBytes() <= 0) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    long[] offsets = multi.indexOffsetsBytes();
+    int[] counts = multi.indexCounts();
+    int[] bases = multi.baseVertices();
+    int indexBytes = multi.indexElementBytes();
+    long minIndexOffset = Long.MAX_VALUE;
+    long maxIndexEnd = Long.MIN_VALUE;
+    for (int draw = 0; draw < offsets.length; draw++) {
+      long offset = offsets[draw];
+      long bytes = Math.multiplyExact((long) counts[draw], indexBytes);
+      long end = Math.addExact(offset, bytes);
+      if (offset < indexSlice.offsetBytes()
+          || end > Math.addExact(indexSlice.offsetBytes(),
+              indexSlice.lengthBytes())) {
+        return new PreparedDirectCapture(command, inputs);
+      }
+      if (bytes > 0) {
+        minIndexOffset = Math.min(minIndexOffset, offset);
+        maxIndexEnd = Math.max(maxIndexEnd, end);
+      }
+    }
+    if (minIndexOffset == Long.MAX_VALUE || maxIndexEnd <= minIndexOffset) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    long indexRelative = minIndexOffset - indexSlice.offsetBytes();
+    long indexLength = maxIndexEnd - minIndexOffset;
+    Optional<IrisGlBufferMirror.BufferSnapshot> indexSnapshot =
+        IrisGlBufferMirror.global().snapshot(
+            indexSlice.glBuffer(), indexSlice.mirrorGeneration(),
+            minIndexOffset, indexLength);
+    if (indexSnapshot.isEmpty()) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    long minVertex = Long.MAX_VALUE;
+    long maxVertex = Long.MIN_VALUE;
+    byte[] indexBytesData = indexSnapshot.orElseThrow().ownedBytes();
+    ByteBuffer indexData = ByteBuffer.wrap(indexBytesData)
+        .order(ByteOrder.LITTLE_ENDIAN);
+    for (int draw = 0; draw < offsets.length; draw++) {
+      int count = counts[draw];
+      long relative = offsets[draw] - minIndexOffset;
+      for (int element = 0; element < count; element++) {
+        long byteOffset = relative + (long) element * indexBytes;
+        if (byteOffset < 0
+            || byteOffset > indexBytesData.length - indexBytes) {
+          return new PreparedDirectCapture(command, inputs);
+        }
+        long raw = switch (indexBytes) {
+          case 1 -> Byte.toUnsignedInt(
+              indexData.get(Math.toIntExact(byteOffset)));
+          case 2 -> Short.toUnsignedInt(
+              indexData.getShort(Math.toIntExact(byteOffset)));
+          case 4 -> Integer.toUnsignedLong(
+              indexData.getInt(Math.toIntExact(byteOffset)));
+          default -> throw new IllegalArgumentException(
+              "unsupported Sodium index width");
+        };
+        long vertex = raw + bases[draw];
+        if (vertex < 0) {
+          return new PreparedDirectCapture(command, inputs);
+        }
+        minVertex = Math.min(minVertex, vertex);
+        maxVertex = Math.max(maxVertex, vertex);
+      }
+    }
+    if (minVertex == Long.MAX_VALUE || maxVertex < minVertex) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    long stride = vertexLayout.strideBytes();
+    long vertexStart = Math.addExact(vertexSlice.offsetBytes(),
+        Math.multiplyExact(minVertex, stride));
+    long vertexEndExclusive = Math.addExact(
+        vertexSlice.offsetBytes(),
+        Math.multiplyExact(Math.addExact(maxVertex, 1), stride));
+    long vertexBufferEnd = Math.addExact(vertexSlice.offsetBytes(),
+        vertexSlice.lengthBytes());
+    if (vertexStart < vertexSlice.offsetBytes()
+        || vertexEndExclusive > vertexBufferEnd) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    long[] rebasedOffsets = new long[offsets.length];
+    int[] rebasedBases = new int[bases.length];
+    long minBase = minVertex;
+    if (minBase < Integer.MIN_VALUE || minBase > Integer.MAX_VALUE) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+    int rebase = Math.toIntExact(minBase);
+    for (int draw = 0; draw < offsets.length; draw++) {
+      rebasedOffsets[draw] = Math.subtractExact(offsets[draw],
+          minIndexOffset);
+      rebasedBases[draw] = Math.subtractExact(bases[draw], rebase);
+    }
+
+    IrisVertexInputBindings compactInputs =
+        new IrisVertexInputBindings(
+            List.of(new IrisVertexInputBindings.BufferSlice(
+                vertexSlice.slot(), vertexSlice.glBuffer(), vertexStart,
+                vertexEndExclusive - vertexStart,
+                vertexSlice.mirrorGeneration())),
+            Optional.of(new IrisVertexInputBindings.BufferSlice(
+                indexSlice.slot(), indexSlice.glBuffer(), minIndexOffset,
+                indexLength, indexSlice.mirrorGeneration())),
+            "");
+
+    IrisExecutionCommand.MultiDrawIndexed compactCommand =
+        new IrisExecutionCommand.MultiDrawIndexed(
+            multi.primitiveMode(), indexBytes, rebasedOffsets, counts,
+            rebasedBases, multi.source());
+    return new PreparedDirectCapture(compactCommand, compactInputs);
+  }
+
+  private record PreparedDirectCapture(
+      IrisExecutionCommand command,
+      IrisVertexInputBindings vertexInputs) {
   }
 
   public void draw(IrisExecutionCommand.Draw command,
