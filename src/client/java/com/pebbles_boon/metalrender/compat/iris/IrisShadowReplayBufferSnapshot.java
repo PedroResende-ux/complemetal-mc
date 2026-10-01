@@ -184,7 +184,11 @@ public record IrisShadowReplayBufferSnapshot(
     Objects.requireNonNull(mirror, "mirror");
     Builder builder = new Builder(mirror, retainedCapture);
 
-    if (vertexInputBindings.complete()) {
+    boolean computePipeline = descriptor != null
+        && descriptor.pass().kind() == IrisPipelineState.PassKind.COMPUTE;
+    if (computePipeline) {
+      // Compute dispatches do not have vertex/index bindings.
+    } else if (vertexInputBindings.complete()) {
       for (IrisVertexInputBindings.BufferSlice slice
           : vertexInputBindings.vertexBuffers()) {
         BufferRef reference = builder.captureRange(slice.glBuffer(),
