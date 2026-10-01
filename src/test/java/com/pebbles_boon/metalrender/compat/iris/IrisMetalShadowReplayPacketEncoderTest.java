@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.pebbles_boon.metalrender.compat.iris.IrisGlStateSnapshot.StateValue;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -168,4 +169,113 @@ final class IrisMetalShadowReplayPacketEncoderTest {
         buffers, textures, layout, arguments, 4, 2,
         java.util.Set.of(19)).length > 0);
   }
+  @Test
+  void lowersIndexedIndirectDrawIntoMultiDrawPacket() {
+    ByteBuffer indirect = ByteBuffer.allocate(40).order(ByteOrder.LITTLE_ENDIAN);
+    indirect.putInt(3).putInt(1).putInt(0).putInt(0).putInt(0);
+    indirect.putInt(6).putInt(1).putInt(3).putInt(5).putInt(0);
+
+    IrisShadowReplayBufferSnapshot buffers =
+        new IrisShadowReplayBufferSnapshot(true, List.of(
+            new IrisShadowReplayBufferSnapshot.BufferImage(
+                0, 7, 1, 0, new byte[48]),
+            new IrisShadowReplayBufferSnapshot.BufferImage(
+                1, 8, 2, 0, new byte[32]),
+            new IrisShadowReplayBufferSnapshot.BufferImage(
+                2, 71, 3, 0, indirect.array())),
+            List.of(new IrisShadowReplayBufferSnapshot.VertexBufferRef(0,
+                new IrisShadowReplayBufferSnapshot.BufferRef(0))),
+            Optional.of(new IrisShadowReplayBufferSnapshot.BufferRef(1)),
+            Optional.of(new IrisShadowReplayBufferSnapshot.BufferRef(2)),
+            Map.of(), Map.of(), List.of());
+
+    IrisMslArgumentLayout msl = new IrisMslArgumentLayout(List.of(
+        new IrisMslArgumentLayout.StageLayout(IrisShaderStage.VERTEX,
+            List.of(new IrisMslArgumentLayout.ArgumentBinding(
+                new IrisSpirvResourceLayout.UniformLocation(0, 0),
+                IrisSpirvResourceLayout.ResourceKind.UNIFORM,
+                0, 0, -1)))));
+    IrisMetalVertexBindingLayout vertexLayout =
+        IrisMetalVertexBindingLayout.resolve(
+            IrisMetalPipelineKeyTest.state(), msl);
+    IrisShadowReplayArgumentTable arguments =
+        new IrisShadowReplayArgumentTable(List.of(
+            new IrisShadowReplayArgumentTable.StageTable(
+                IrisShaderStage.VERTEX, List.of(
+                    new IrisShadowReplayArgumentTable.BoundArgument(0, 0,
+                        new IrisShadowReplayArgumentTable.InlineUniform(
+                            new byte[64]))))), List.of());
+    IrisDynamicDrawState dynamic = new IrisDynamicDrawState(
+        StateValue.known(new IrisDynamicDrawState.Rect(0, 0, 16, 16)),
+        StateValue.known(false),
+        StateValue.known(new IrisDynamicDrawState.Rect(0, 0, 0, 0)));
+
+    byte[] packet = IrisMetalShadowReplayPacketEncoder.encode(
+        new IrisExecutionCommand.IndirectDraw(4, 2, 71, 0, 2,
+            IrisExecutionCommand.Source.INDIRECT_BUFFER),
+        dynamic, buffers, IrisShadowReplayTextureSnapshot.emptyEnabled(),
+        vertexLayout, arguments, 16, 16);
+
+    ByteBuffer encoded = ByteBuffer.wrap(packet);
+    encoded.position(49);
+    assertEquals(3, encoded.getInt());
+    assertEquals(4, encoded.getInt());
+    assertEquals(2, encoded.getInt());
+    assertEquals(2, encoded.getInt());
+    assertEquals(0L, encoded.getLong());
+    assertEquals(3, encoded.getInt());
+    assertEquals(0, encoded.getInt());
+    assertEquals(6L, encoded.getLong());
+    assertEquals(6, encoded.getInt());
+    assertEquals(5, encoded.getInt());
+  }
+
+  @Test
+  void refusesIndexedIndirectInstanceBaseModesNotRepresentableByPacket() {
+    ByteBuffer indirect = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN);
+    indirect.putInt(3).putInt(2).putInt(0).putInt(0).putInt(0);
+
+    IrisShadowReplayBufferSnapshot buffers =
+        new IrisShadowReplayBufferSnapshot(true, List.of(
+            new IrisShadowReplayBufferSnapshot.BufferImage(
+                0, 7, 1, 0, new byte[48]),
+            new IrisShadowReplayBufferSnapshot.BufferImage(
+                1, 8, 2, 0, new byte[32]),
+            new IrisShadowReplayBufferSnapshot.BufferImage(
+                2, 71, 3, 0, indirect.array())),
+            List.of(new IrisShadowReplayBufferSnapshot.VertexBufferRef(0,
+                new IrisShadowReplayBufferSnapshot.BufferRef(0))),
+            Optional.of(new IrisShadowReplayBufferSnapshot.BufferRef(1)),
+            Optional.of(new IrisShadowReplayBufferSnapshot.BufferRef(2)),
+            Map.of(), Map.of(), List.of());
+
+    IrisMslArgumentLayout msl = new IrisMslArgumentLayout(List.of(
+        new IrisMslArgumentLayout.StageLayout(IrisShaderStage.VERTEX,
+            List.of(new IrisMslArgumentLayout.ArgumentBinding(
+                new IrisSpirvResourceLayout.UniformLocation(0, 0),
+                IrisSpirvResourceLayout.ResourceKind.UNIFORM,
+                0, 0, -1)))));
+    IrisMetalVertexBindingLayout vertexLayout =
+        IrisMetalVertexBindingLayout.resolve(
+            IrisMetalPipelineKeyTest.state(), msl);
+    IrisShadowReplayArgumentTable arguments =
+        new IrisShadowReplayArgumentTable(List.of(
+            new IrisShadowReplayArgumentTable.StageTable(
+                IrisShaderStage.VERTEX, List.of(
+                    new IrisShadowReplayArgumentTable.BoundArgument(0, 0,
+                        new IrisShadowReplayArgumentTable.InlineUniform(
+                            new byte[64]))))), List.of());
+    IrisDynamicDrawState dynamic = new IrisDynamicDrawState(
+        StateValue.known(new IrisDynamicDrawState.Rect(0, 0, 16, 16)),
+        StateValue.known(false),
+        StateValue.known(new IrisDynamicDrawState.Rect(0, 0, 0, 0)));
+
+    assertThrows(IllegalArgumentException.class, () ->
+        IrisMetalShadowReplayPacketEncoder.encode(
+            new IrisExecutionCommand.IndirectDraw(4, 2, 71, 0, 1,
+                IrisExecutionCommand.Source.INDIRECT_BUFFER),
+            dynamic, buffers, IrisShadowReplayTextureSnapshot.emptyEnabled(),
+            vertexLayout, arguments, 16, 16));
+  }
+
 }
