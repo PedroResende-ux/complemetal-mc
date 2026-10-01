@@ -48,15 +48,18 @@ public abstract class Iris1211SodiumProgramsMixin {
 
     Map<PatchShaderType, String> transformed = callback.getReturnValue();
     String vertex = transformed.get(PatchShaderType.VERTEX);
+    String tessControl = transformed.get(PatchShaderType.TESS_CONTROL);
+    String tessEvaluation = transformed.get(PatchShaderType.TESS_EVALUATION);
     String geometry = transformed.get(PatchShaderType.GEOMETRY);
     String fragment = transformed.get(PatchShaderType.FRAGMENT);
 
-    if (vertex == null && geometry == null && fragment == null) {
+    if (vertex == null && tessControl == null && tessEvaluation == null
+        && geometry == null && fragment == null) {
       return;
     }
 
-    IrisShaderCapture.captureGraphicsBegin(
+    IrisShaderCapture.captureGraphicsLink(
         "iris-sodium:" + name + (shadow ? ":shadow" : ""),
-        vertex, geometry, fragment);
+        vertex, geometry, tessControl, tessEvaluation, fragment);
   }
 }
