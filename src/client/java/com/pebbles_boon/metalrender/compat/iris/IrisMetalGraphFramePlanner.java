@@ -264,6 +264,11 @@ public final class IrisMetalGraphFramePlanner {
           written.add(target);
         }
       }
+      Set<Integer> storageImageTextures = pipeline.pending()
+          .resourceBindings().imageUnits().values().stream()
+          .filter(binding -> binding.texture() > 0)
+          .map(IrisGlResourceBindingSnapshot.ImageUnitBinding::texture)
+          .collect(java.util.stream.Collectors.toUnmodifiableSet());
       Set<Integer> storageImageWriteTextures = pipeline.pending()
           .resourceBindings().imageUnits().values().stream()
           .filter(binding -> binding.texture() > 0
@@ -272,7 +277,8 @@ public final class IrisMetalGraphFramePlanner {
           .collect(java.util.stream.Collectors.toUnmodifiableSet());
       validateDrawResourceRouting(plan, pipeline, tokensById, initialized,
           targets.allTargets(), handlesById,
-          resolved.sampledTextureNames(), storageImageWriteTextures);
+          resolved.sampledTextureNames(), storageImageWriteTextures,
+          storageImageTextures);
       Map<Integer, Integer> overrides = textureOverrides(plan, pipeline,
           tokensById, idsByTextureName, initialized, targets.allTargets(),
           resolved.sampledTextureNames(), storageImageWriteTextures);
@@ -767,7 +773,8 @@ public final class IrisMetalGraphFramePlanner {
       Map<Integer, Long> tokensById, Set<Integer> initialized,
       Set<Integer> targets, Map<Integer, ResourceHandle> handlesById,
       Set<Integer> sampledTextureNames,
-      Set<Integer> storageImageWriteTextures) {
+      Set<Integer> storageImageWriteTextures,
+      Set<Integer> storageImageTextures) {
     for (Integer target : targets) {
       if (!initialized.contains(target)) {
         throw unsupported("graph-frame-render-target-uninitialized");
@@ -801,7 +808,8 @@ public final class IrisMetalGraphFramePlanner {
       if (handle == null || handle.kind() != ResourceKind.TEXTURE) {
         throw unsupported("graph-frame-initial-resource-unavailable");
       }
-      if (!initialTextureSnapshotRequired(handle, sampledTextureNames)) {
+      if (!initialTextureSnapshotRequired(handle, sampledTextureNames,
+          storageImageTextures)) {
         continue;
       }
       IrisGlTextureMirror.TextureSnapshot snapshot = pipeline.pending()
@@ -825,8 +833,20 @@ public final class IrisMetalGraphFramePlanner {
 
   static boolean initialTextureSnapshotRequired(ResourceHandle handle,
       Set<Integer> sampledTextureNames) {
+    return initialTextureSnapshotRequired(handle, sampledTextureNames, Set.of());
+  }
+
+  /**
+   * A resource first consumed through either a sampler or an image unit must
+   * inherit its existing GL contents before Metal takes ownership. Image-only
+   * reads are not necessarily present in the sampler-name set.
+   */
+  static boolean initialTextureSnapshotRequired(ResourceHandle handle,
+      Set<Integer> sampledTextureNames,
+      Set<Integer> storageImageTextures) {
     return handle != null && handle.kind() == ResourceKind.TEXTURE
-        && sampledTextureNames.contains(handle.name());
+        && (sampledTextureNames.contains(handle.name())
+            || storageImageTextures.contains(handle.name()));
   }
 
   /**
