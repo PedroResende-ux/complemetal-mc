@@ -2812,8 +2812,13 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     if (frame == null || !renderGraphCapture.hasActiveFrame()) {
       return false;
     }
+    String normalized = BoundedReasonSet.normalizeReason(reason);
     frame.degraded = true;
-    frame.lastFailure = BoundedReasonSet.normalizeReason(reason);
+    frame.lastFailure = normalized;
+    // The original GL operation is being suppressed, so the graph being
+    // captured for the following presentation must not be accepted as a
+    // complete replay if this operation had no Metal representation.
+    renderGraphCapture.markUnsupportedFullReplayOperation(normalized);
     frame.commandsSuppressed++;
     fullGraphOwnershipCommandsSuppressed.incrementAndGet();
     return true;
