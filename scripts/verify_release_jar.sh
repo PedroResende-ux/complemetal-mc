@@ -27,7 +27,7 @@ jar_path="$(cd "$(dirname "$jar_path")" && pwd)/$(basename "$jar_path")"
 entries="$(jar tf "$jar_path")"
 required_entries=(
   "META-INF/MANIFEST.MF"
-  "fabric.mod.json"
+  "META-INF\/neoforge.mods.toml"
   "metalrender.mixins.json"
   "metalrender.iris.mixins.json"
   "libmetalrender.dylib"
@@ -53,7 +53,7 @@ tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/complemetal-jar.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 (cd "$tmp_dir" && jar xf "$jar_path" \
   libmetalrender.dylib shaders.metallib \
-  fabric.mod.json metalrender.mixins.json metalrender.iris.mixins.json \
+  META-INF\/neoforge.mods.toml metalrender.mixins.json metalrender.iris.mixins.json \
   assets/complemetal/icon.png LICENSE NOTICE META-INF/MANIFEST.MF)
 
 if ! file "$tmp_dir/libmetalrender.dylib" | grep -q 'Mach-O 64-bit.*arm64'; then
@@ -75,20 +75,19 @@ if [[ "$shader_size" -lt 4096 || "$shader_magic" != "4d544c42" ]]; then
   exit 1
 fi
 
-if ! grep -q '"minecraft"[[:space:]]*:[[:space:]]*"[^"]*26\.2' \
-  "$tmp_dir/fabric.mod.json"; then
-  echo "fabric.mod.json does not target Minecraft 26.2" >&2
+mod_version="$(sed -n 's/^mod_version=//p' "$project_dir/gradle.properties" |
+  head -n 1)"
+if [[ -z "$mod_version" ]]; then
+  echo "Could not resolve mod_version from gradle.properties" >&2
   exit 1
 fi
 
-if ! grep -q '"id"[[:space:]]*:[[:space:]]*"complemetal"' \
-  "$tmp_dir/fabric.mod.json" ||
-   ! grep -q '"name"[[:space:]]*:[[:space:]]*"Complemetal"' \
-  "$tmp_dir/fabric.mod.json" ||
-   ! grep -q '"icon"[[:space:]]*:[[:space:]]*"assets/complemetal/icon.png"' \
-  "$tmp_dir/fabric.mod.json" ||
-   ! grep -q '"metalrender"' "$tmp_dir/fabric.mod.json"; then
-  echo "fabric.mod.json does not contain the Complemetal identity and legacy alias" >&2
+if ! grep -Eq '^modId="complemetal"$' "$tmp_dir/META-INF/neoforge.mods.toml" ||
+   ! grep -Eq '^displayName="Complemetal"$' "$tmp_dir/META-INF/neoforge.mods.toml" ||
+   ! grep -Eq '^version="[^"]*"$' "$tmp_dir/META-INF/neoforge.mods.toml" ||
+   ! grep -Fq 'version="[1.21.1]"' "$tmp_dir/META-INF/neoforge.mods.toml" ||
+   ! grep -Fq 'modId="neoforge"' "$tmp_dir/META-INF/neoforge.mods.toml"; then
+  echo "NeoForge metadata does not contain the expected Complemetal 1.21.1 identity" >&2
   exit 1
 fi
 
@@ -109,33 +108,36 @@ if ! grep -Fq 'https://github.com/webblepebbles/MetalRender' \
   exit 1
 fi
 
-if grep -Fq '${version}' "$tmp_dir/fabric.mod.json"; then
-  echo "fabric.mod.json still contains an unexpanded version placeholder" >&2
+if grep -Fq '${version}' "$tmp_dir/META-INF/neoforge.mods.toml"; then
+  echo "NeoForge metadata still contains an unexpanded version placeholder" >&2
   exit 1
 fi
 
-fabric_version="$(sed -n \
-  's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-  "$tmp_dir/fabric.mod.json" | head -n 1)"
+neoforge_version_in_jar="$(sed -n 's/^version="\([^"]*\)"/\1/p'   "$tmp_dir/META-INF/neoforge.mods.toml" | head -n 1)"
 manifest_version="$(tr -d '\r' < "$tmp_dir/META-INF/MANIFEST.MF" |
   sed -n 's/^Implementation-Version: //p' | head -n 1)"
 manifest_title="$(tr -d '\r' < "$tmp_dir/META-INF/MANIFEST.MF" |
   sed -n 's/^Implementation-Title: //p' | head -n 1)"
-if [[ -z "$fabric_version" || "$manifest_version" != "$fabric_version" ||
+if [[ -z "$neoforge_version_in_jar" ||
+      "$manifest_version" != "$neoforge_version_in_jar" ||
       "$manifest_title" != "Complemetal" ]]; then
-  echo "JAR manifest and fabric.mod.json versions do not match" >&2
+  echo "JAR manifest and NeoForge metadata versions do not match" >&2
+  exit 1
+fi
+if [[ "$neoforge_version_in_jar" != "$mod_version" ]]; then
+  echo "Packaged NeoForge version does not match gradle.properties" >&2
   exit 1
 fi
 
-if ! grep -Fq '"compatibilityLevel": "JAVA_25"' \
+if ! grep -Fq '"compatibilityLevel": "JAVA_21"' \
   "$tmp_dir/metalrender.mixins.json"; then
-  echo "Mixin configuration does not target Java 25" >&2
+  echo "Mixin configuration does not target Java 21" >&2
   exit 1
 fi
 
-if ! grep -Fq '"compatibilityLevel": "JAVA_25"' \
+if ! grep -Fq '"compatibilityLevel": "JAVA_21"' \
   "$tmp_dir/metalrender.iris.mixins.json"; then
-  echo "Optional Iris mixin configuration does not target Java 25" >&2
+  echo "Optional Iris mixin configuration does not target Java 21" >&2
   exit 1
 fi
 
@@ -145,7 +147,7 @@ if ! grep -Fq '"required": false' \
   exit 1
 fi
 
-for tool in javac nm rg sips; do
+for tool in javac nm grep sips; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "Required release verification tool is unavailable: $tool" >&2
     exit 1
@@ -162,11 +164,11 @@ jni_actual="$jni_dir/actual.txt"
 jni_missing="$jni_dir/missing.txt"
 jni_orphaned="$jni_dir/orphaned.txt"
 
-rg -o \
+grep -oE \
   'Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_[A-Za-z0-9_]+' \
   "$jni_header" | sort -u > "$jni_expected"
 nm -gU "$tmp_dir/libmetalrender.dylib" |
-  rg -o \
+  grep -oE \
     'Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_[A-Za-z0-9_]+' |
   sort -u > "$jni_actual"
 comm -23 "$jni_expected" "$jni_actual" > "$jni_missing"
