@@ -3137,7 +3137,7 @@ fragment float4 fragment_particle(
     }
   }
   MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-  // Minecraft 26.2 uses reversed-Z: near maps to 1, far maps to 0.
+  // The renderer uses reversed-Z: near maps to 1, far maps to 0.
   dsDesc.depthCompareFunction = MTLCompareFunctionGreater;
   dsDesc.depthWriteEnabled = YES;
   g_depthState = [g_device newDepthStencilStateWithDescriptor:dsDesc];
