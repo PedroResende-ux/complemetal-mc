@@ -68,7 +68,9 @@ neoForge {
                 jvmArgument "-Dmetalrender.experimental.irisMetalPipeline=true"
                 jvmArgument "-Dmetalrender.experimental.irisMetalTranslation=true"
             }
-            if (project.hasProperty('irisGraph') || project.hasProperty('irisGraphOwnership')) {
+            if (project.hasProperty('irisGraph')
+                || project.hasProperty('irisGraphOwnership')
+                || project.hasProperty('complementary')) {
                 jvmArgument "-Dmetalrender.experimental.irisMetalPipeline=true"
                 jvmArgument "-Dmetalrender.experimental.irisMetalTranslation=true"
                 jvmArgument "-Dmetalrender.experimental.irisMetalLibraryValidation=true"
