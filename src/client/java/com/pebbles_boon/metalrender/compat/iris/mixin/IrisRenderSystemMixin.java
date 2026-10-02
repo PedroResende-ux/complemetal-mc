@@ -50,6 +50,18 @@ public abstract class IrisRenderSystemMixin {
     IrisRenderGraphCapture.global().legacyClearColor(red, green, blue, alpha);
   }
 
+  @Inject(method = "clearDepth", at = @At("HEAD"), require = 0,
+      remap = false)
+  private static void metalrender$clearDepth(double depth, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().legacyClearDepth(depth);
+  }
+
+  @Inject(method = "clearStencil", at = @At("HEAD"), require = 0,
+      remap = false)
+  private static void metalrender$clearStencil(int stencil, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().legacyClearStencil(stencil);
+  }
+
   @Inject(method = "vertexAttrib4f", at = @At("RETURN"), require = 0,
       remap = false)
   private static void metalrender$genericVertexAttribute(int location,
