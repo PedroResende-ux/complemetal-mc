@@ -44,6 +44,7 @@ jobs:
       - name: Compile, test, package, and verify
         env:
           MACOSX_DEPLOYMENT_TARGET: "14.0"
+          METALRENDER_IRIS_TRANSLATION_SMOKE: "1"
         run: ./gradlew --no-daemon clean test check build releaseCheck
 
       - name: Smoke-test packaged native payload
