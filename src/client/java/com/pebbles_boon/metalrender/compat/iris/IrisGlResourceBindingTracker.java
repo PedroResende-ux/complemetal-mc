@@ -44,6 +44,7 @@ public final class IrisGlResourceBindingTracker {
   public synchronized void initializeOpenGlDefaults() {
     currentProgram = 0;
     activeTextureUnit = 0;
+    programs.clear();
     textureUnits.clear();
     textureBuffers.clear();
     imageUnits.clear();
