@@ -166,8 +166,11 @@ public final class IrisPipelineStateCapture {
         IrisGlVertexArrayTracker.global().snapshot(resolved.descriptor());
     PreparedDirectCapture prepared = prepareDirectCapture(command, inputs,
         resolved.descriptor());
+    if (!(prepared.command() instanceof IrisExecutionCommand.Draw draw)) {
+      return Optional.empty();
+    }
     return Optional.of(capture(resolved,
-        tracker.snapshotDraw(prepared.command().primitiveMode()),
+        tracker.snapshotDraw(draw.primitiveMode()),
         prepared.command(), prepared.vertexInputs()));
   }
 
