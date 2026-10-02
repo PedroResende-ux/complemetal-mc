@@ -483,7 +483,7 @@ public class MetalRenderClient {
   /**
    * Rebuilds Minecraft's chunk renderer without leaving its ViewArea null.
    *
-   * <p>In 26.2 {@code resetLevelRenderData()} is a teardown-only method. It
+   * <p>In Minecraft 1.21.1 {@code resetLevelRenderData()} is a teardown-only method. It
    * releases the current ViewArea and SectionRenderDispatcher but does not
    * recreate either one, so calling it from a live client crashes the next
    * render frame. {@code invalidateCompiledGeometry(...)} performs the paired
@@ -532,7 +532,7 @@ public class MetalRenderClient {
       }
     } catch (UnsatisfiedLinkError oldNative) {
       MetalLogger.warn(
-          "native runtime configuration API unavailable; rebuild the 26.2 dylib");
+          "native runtime configuration API unavailable; rebuild the 1.21.1 native payload");
       if (config.requireMetal4) {
         initState = InitState.FAILED;
         initFailure =
