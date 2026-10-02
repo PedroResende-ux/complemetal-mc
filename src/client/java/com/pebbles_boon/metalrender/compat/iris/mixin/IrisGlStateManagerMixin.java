@@ -425,7 +425,10 @@ public abstract class IrisGlStateManagerMixin {
     ByteBuffer encoded = ByteBuffer.allocateDirect(
         Math.toIntExact(required)).order(ByteOrder.nativeOrder());
     IntBuffer copy = encoded.asIntBuffer();
-    copy.put(pixels.duplicate());
+    IntBuffer source = pixels.duplicate();
+    source.limit(source.position() + Math.toIntExact(
+        required / Integer.BYTES));
+    copy.put(source);
     encoded.limit(Math.toIntExact(required));
     if (!IrisGlTextureMirror.global().write(texture, 0, 0, 0, 0,
         width, height, width, encoded)) {
