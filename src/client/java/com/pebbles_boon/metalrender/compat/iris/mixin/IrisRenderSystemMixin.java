@@ -155,6 +155,7 @@ public abstract class IrisRenderSystemMixin {
       remap = false)
   private static void metalrender$deleteBuffer(int buffer, CallbackInfo ci) {
     metalrender$vertices().deleteBuffer(buffer);
+    metalrender$resources().deleteBuffer(buffer);
     com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global()
         .delete(buffer);
   }
