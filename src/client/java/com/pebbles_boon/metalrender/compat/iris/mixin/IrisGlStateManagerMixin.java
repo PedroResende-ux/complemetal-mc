@@ -361,20 +361,28 @@ public abstract class IrisGlStateManagerMixin {
           internalFormat, format, type).orElse(0);
     }
     if (bytesPerPixel <= 0) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-texture-allocation-format-unmirrored");
       return;
     }
     String cacheFormat = IrisGlFormat.cacheName(internalFormat)
         .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
     if (!IrisGlTextureMirror.global().define(texture, cacheFormat,
         width, height, 1, 1, bytesPerPixel)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-texture-allocation-mirror-rejected");
       return;
     }
     if (pixels == null || bytesPerPixel != Integer.BYTES) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-texture-allocation-pixels-unavailable");
       return;
     }
     long required = (long) width * height * bytesPerPixel;
     if (required > pixels.remaining() * (long) Integer.BYTES
         || required > Integer.MAX_VALUE) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-texture-allocation-pixels-size-invalid");
       return;
     }
     ByteBuffer encoded = ByteBuffer.allocateDirect(
@@ -382,8 +390,11 @@ public abstract class IrisGlStateManagerMixin {
     IntBuffer copy = encoded.asIntBuffer();
     copy.put(pixels.duplicate());
     encoded.limit(Math.toIntExact(required));
-    IrisGlTextureMirror.global().write(texture, 0, 0, 0, 0, width, height,
-        width, encoded);
+    if (!IrisGlTextureMirror.global().write(texture, 0, 0, 0, 0,
+        width, height, width, encoded)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-texture-allocation-upload-rejected");
+    }
   }
 
   /**
@@ -408,6 +419,8 @@ public abstract class IrisGlStateManagerMixin {
     IrisGlTextureMirror mirror = IrisGlTextureMirror.global();
     var metadata = mirror.metadata(texture, level, 0).orElse(null);
     if (metadata == null) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-texture-upload-metadata-unavailable");
       return;
     }
 
@@ -416,12 +429,16 @@ public abstract class IrisGlStateManagerMixin {
     long required = rowBytes * height;
     if (rowBytes <= 0 || required <= 0 || required > Integer.MAX_VALUE
         || (rowBytes & 3L) != 0) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-texture-upload-range-invalid");
       return;
     }
 
     try {
       int pbo = GL15C.glGetInteger(GL15C.GL_PIXEL_UNPACK_BUFFER_BINDING);
       if (pbo == 0 && pixels == 0) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-texture-upload-pixels-unavailable");
         return;
       }
       ByteBuffer source;
@@ -430,16 +447,22 @@ public abstract class IrisGlStateManagerMixin {
         var snapshot = IrisGlBufferMirror.global().snapshot(
             pbo, generation, pixels, required).orElse(null);
         if (snapshot == null) {
+          IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+              "graph-frame-texture-upload-pbo-range-unmirrored");
           return;
         }
         source = ByteBuffer.wrap(snapshot.bytes());
       } else {
         source = MemoryUtil.memByteBuffer(pixels, Math.toIntExact(required));
       }
-      mirror.write(texture, level, 0, xOffset, yOffset, width, height, width,
-          source);
+      if (!mirror.write(texture, level, 0, xOffset, yOffset, width, height,
+          width, source)) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-texture-upload-mirror-rejected");
+      }
     } catch (RuntimeException ignored) {
-      // Upload metadata remains valid; unknown pixel layouts fail closed.
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-texture-upload-mirror-failed");
     }
   }
 
