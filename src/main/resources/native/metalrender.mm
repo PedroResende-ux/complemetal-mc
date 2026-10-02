@@ -9625,7 +9625,7 @@ static bool iris_graph_prepare_input_textures(
           texture2DDescriptorWithPixelFormat:format width:captured.width
                                         height:captured.height mipmapped:NO];
       descriptor.storageMode = MTLStorageModeShared;
-      descriptor.usage = MTLTextureUsageShaderRead;
+      descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
       texture = [g_device newTextureWithDescriptor:descriptor];
       if (texture) {
         [texture replaceRegion:MTLRegionMake2D(0, 0, captured.width,
@@ -10107,7 +10107,7 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
           texture2DDescriptorWithPixelFormat:format width:captured.width
                                         height:captured.height mipmapped:NO];
       descriptor.storageMode = MTLStorageModeShared;
-      descriptor.usage = MTLTextureUsageShaderRead;
+      descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
       id<MTLTexture> texture = [g_device newTextureWithDescriptor:descriptor];
       if (!texture)
         return nullptr;
@@ -10879,7 +10879,7 @@ static jlongArray run_iris_metal4_replay(
                                           height:captured.height
                                        mipmapped:NO];
           descriptor.storageMode = MTLStorageModeShared;
-          descriptor.usage = MTLTextureUsageShaderRead;
+          descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
           id<MTLTexture> texture = [g_device newTextureWithDescriptor:descriptor];
           if (!texture)
             @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
@@ -11358,7 +11358,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nUploadIrisMetal4In
                                     height:(NSUInteger)height
                                  mipmapped:NO];
     descriptor.storageMode = MTLStorageModeShared;
-    descriptor.usage = MTLTextureUsageShaderRead;
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     id<MTLTexture> texture = [g_device newTextureWithDescriptor:descriptor];
     if (!texture) {
       return 0;
@@ -11586,7 +11586,7 @@ Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_nCaptureIrisMetal4I
                                       height:(NSUInteger)height
                                    mipmapped:NO];
       descriptor.storageMode = MTLStorageModeShared;
-      descriptor.usage = MTLTextureUsageShaderRead;
+      descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
       handoff.metalTexture = [g_device newTextureWithDescriptor:descriptor
                                                        iosurface:handoff.surface
                                                            plane:0];
