@@ -15,9 +15,9 @@ actual="$scratch_dir/actual.txt"
 missing="$scratch_dir/missing.txt"
 orphaned="$scratch_dir/orphaned.txt"
 
-rg -o 'Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_[A-Za-z0-9_]+' \
+grep -oE 'Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_[A-Za-z0-9_]+' \
   "$header" | sort -u > "$expected"
-rg --no-filename -o 'Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_[A-Za-z0-9_]+' \
+grep -h -oE 'Java_com_pebbles_1boon_metalrender_nativebridge_NativeBridge_[A-Za-z0-9_]+' \
   "$native_dir"/*.mm | sort -u > "$actual"
 
 comm -23 "$expected" "$actual" > "$missing"
