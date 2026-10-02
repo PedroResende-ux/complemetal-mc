@@ -35,15 +35,6 @@ public final class Iris1211Compat {
     }
   }
 
-  public static ProgramFallbackResolverAccessor resolver() {
-    IrisRenderingPipeline pipeline = pipeline();
-    if (pipeline == null
-        || !(pipeline instanceof Iris1211RenderingPipelineAccessor accessor)) {
-      return null;
-    }
-    return new ProgramFallbackResolverAccessor(accessor.complemetal$getResolver());
-  }
-
   public record ProgramFallbackResolverAccessor(
       net.irisshaders.iris.shaderpack.programs.ProgramFallbackResolver resolver) {
   }
