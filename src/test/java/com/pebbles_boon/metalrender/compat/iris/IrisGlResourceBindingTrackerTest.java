@@ -11,6 +11,23 @@ final class IrisGlResourceBindingTrackerTest {
   private static final int GL_TEXTURE_BUFFER = 0x8C2A;
 
   @Test
+  void contextResetDropsOldProgramMetadata() {
+    IrisGlResourceBindingTracker tracker =
+        new IrisGlResourceBindingTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerProgram(17);
+    tracker.uniformLocation(17, "oldUniform", 4);
+    tracker.useProgram(17);
+    assertNotNull(tracker.snapshot());
+
+    tracker.initializeOpenGlDefaults();
+    tracker.registerProgram(17);
+    tracker.useProgram(17);
+
+    assertEquals(null, tracker.snapshot());
+  }
+
+  @Test
   void keepsTextureTargetsIndependentOnTheSameUnit() {
     IrisGlResourceBindingTracker tracker =
         new IrisGlResourceBindingTracker();
