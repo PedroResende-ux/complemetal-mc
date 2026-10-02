@@ -147,7 +147,7 @@ final class IrisMetalShadowReplayPacketEncoderTest {
                 0, 3, -1)))));
     IrisMetalVertexBindingLayout layout =
         IrisMetalVertexBindingLayout.resolve(
-            IrisPipelineKeyTest.state(), msl);
+            IrisMetalPipelineKeyTest.state(), msl);
     IrisDynamicDrawState dynamic = new IrisDynamicDrawState(
         StateValue.known(new IrisDynamicDrawState.Rect(0, 0, 4, 4)),
         StateValue.known(false),
