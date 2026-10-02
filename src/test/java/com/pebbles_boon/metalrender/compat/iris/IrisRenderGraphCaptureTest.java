@@ -328,6 +328,44 @@ final class IrisRenderGraphCaptureTest {
   }
 
   @Test
+  void clampsLegacyColorAndDepthClearValuesLikeOpenGl() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerFramebuffer(7);
+    tracker.defineTexture(70, "rgba8-unorm", 1, 32, 16, 1, 1);
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_DRAW_FRAMEBUFFER, 7);
+    tracker.bindTextureToUnit(GL_TEXTURE_2D, 0, 70);
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 70, 0));
+
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(tracker);
+    capture.beginFrame();
+    capture.legacyClearColor(-1.0F, 0.25F, 2.0F, 1.5F);
+    capture.legacyClearDepth(-2.0D);
+    assertTrue(capture.legacyClearBoundFramebuffer(
+        GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
+    capture.endFrame();
+
+    List<IrisRenderGraphCapture.RawEvent> events = capture.poll()
+        .orElseThrow().events();
+    assertEquals(2, events.size());
+    IrisClearCommand color = ((IrisRenderGraphCapture.RawClear) events.get(0))
+        .command();
+    assertEquals(Integer.toUnsignedLong(Float.floatToRawIntBits(0.0F)),
+        color.rawValues().get(0));
+    assertEquals(Integer.toUnsignedLong(Float.floatToRawIntBits(0.25F)),
+        color.rawValues().get(1));
+    assertEquals(Integer.toUnsignedLong(Float.floatToRawIntBits(1.0F)),
+        color.rawValues().get(2));
+    assertEquals(Integer.toUnsignedLong(Float.floatToRawIntBits(1.0F)),
+        color.rawValues().get(3));
+    IrisClearCommand depth = ((IrisRenderGraphCapture.RawClear) events.get(1))
+        .command();
+    assertEquals(Double.doubleToRawLongBits(0.0D),
+        depth.rawValues().getFirst());
+  }
+
+  @Test
   void capturesLegacyDepthAndStencilClearValues() {
     IrisGlStateTracker tracker = new IrisGlStateTracker();
     tracker.initializeOpenGlDefaults();
