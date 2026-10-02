@@ -199,6 +199,15 @@ public record IrisShadowReplayArgumentTable(List<StageTable> stages,
     }
   }
 
+  /** Texture bound to an image unit; native replay requires shader-write usage. */
+  public record StorageTextureImage(int glTexture) implements ArgumentValue {
+    public StorageTextureImage {
+      if (glTexture <= 0) {
+        throw new IllegalArgumentException("invalid storage texture image name");
+      }
+    }
+  }
+
   public record CanonicalZeroTexture() implements ArgumentValue {
   }
 
