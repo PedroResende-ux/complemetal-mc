@@ -386,7 +386,7 @@ public final class IrisVertexLayoutCapture {
       VertexFormatElement element = elements.get(location);
       IrisPipelineState.DataFormat dataFormat =
           new IrisPipelineState.DataFormat(
-              formatCacheName(element.usage().name()));
+              vertexElementDataFormat(element));
       attributes.add(new IrisPipelineState.VertexAttribute(location, 0,
           format.getOffset(element), dataFormat));
       String linkedName = linkedAttributeName(
@@ -398,6 +398,41 @@ public final class IrisVertexLayoutCapture {
       shaderInputs.add(new ShaderInput(linkedName, location, dataFormat));
     }
     return new Layout(buffers, attributes, shaderInputs);
+  }
+
+  private static IrisPipelineState.DataFormat vertexElementDataFormat(
+      VertexFormatElement element) {
+    String prefix = switch (element.type()) {
+      case BYTE -> "r8-sint";
+      case UBYTE -> "r8-uint";
+      case SHORT -> "r16-sint";
+      case USHORT -> "r16-uint";
+      case INT -> "r32-sint";
+      case UINT -> "r32-uint";
+      case FLOAT -> "r32-float";
+    };
+    String component = switch (element.count()) {
+      case 1 -> prefix;
+      case 2 -> prefix.replaceFirst("^r", "rg");
+      case 3 -> prefix.replaceFirst("^r", "rgb");
+      case 4 -> prefix.replaceFirst("^r", "rgba");
+      default -> throw new IllegalArgumentException(
+          "unsupported vertex element width " + element.count());
+    };
+    if (element.usage() == VertexFormatElement.Usage.COLOR) {
+      if (element.type() == VertexFormatElement.Type.UBYTE
+          || element.type() == VertexFormatElement.Type.USHORT) {
+        return new IrisPipelineState.DataFormat(
+            component.replace("-uint", "-unorm"));
+      }
+    } else if (element.usage() == VertexFormatElement.Usage.NORMAL) {
+      if (element.type() == VertexFormatElement.Type.BYTE
+          || element.type() == VertexFormatElement.Type.SHORT) {
+        return new IrisPipelineState.DataFormat(
+            component.replace("-sint", "-snorm"));
+      }
+    }
+    return new IrisPipelineState.DataFormat(component);
   }
 
   static String formatCacheName(String enumName) {
