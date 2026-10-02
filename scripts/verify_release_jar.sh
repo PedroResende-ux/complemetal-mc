@@ -27,7 +27,7 @@ jar_path="$(cd "$(dirname "$jar_path")" && pwd)/$(basename "$jar_path")"
 entries="$(jar tf "$jar_path")"
 required_entries=(
   "META-INF/MANIFEST.MF"
-  "META-INF\/neoforge.mods.toml"
+  "META-INF/neoforge.mods.toml"
   "metalrender.mixins.json"
   "metalrender.iris.mixins.json"
   "libmetalrender.dylib"
@@ -53,7 +53,7 @@ tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/complemetal-jar.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 (cd "$tmp_dir" && jar xf "$jar_path" \
   libmetalrender.dylib shaders.metallib \
-  META-INF\/neoforge.mods.toml metalrender.mixins.json metalrender.iris.mixins.json \
+  META-INF/neoforge.mods.toml metalrender.mixins.json metalrender.iris.mixins.json \
   assets/complemetal/icon.png LICENSE NOTICE META-INF/MANIFEST.MF)
 
 if ! file "$tmp_dir/libmetalrender.dylib" | grep -q 'Mach-O 64-bit.*arm64'; then
