@@ -102,6 +102,7 @@ final class IrisMetalGraphFramePacketEncoderTest {
     IrisMetalGraphFramePacketEncoder.Frame frame =
         new IrisMetalGraphFramePacketEncoder.Frame(21, List.of(
             new IrisMetalGraphFramePacketEncoder.Resource(2, 202)),
+            List.of(),
             List.of(new IrisMetalGraphFramePacketEncoder.InputTexture(0,
                 IrisGlTextureMirror.TextureSnapshot.fromReadback(
                     42, 7, new IrisGlTextureMirror.TextureMetadata(
