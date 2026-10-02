@@ -236,10 +236,9 @@ public final class IrisMetalGraphFramePacketEncoder {
       } else if (operation instanceof CopyTexture) {
         size = addSize(size, 44L);
       } else if (operation instanceof Draw draw) {
-        size = addSize(size, 28L + asciiLength(
+        size = addSize(size, 36L + asciiLength(
             draw.pipelineKeySha256()) + draw.replayPacket.length
             + draw.colorTargets().size() * 12L
-            + 8L + 8L
             + draw.textureOverrides().size() * 8L);
       } else if (operation instanceof Compute compute) {
         size = addSize(size, 28L + asciiLength(
