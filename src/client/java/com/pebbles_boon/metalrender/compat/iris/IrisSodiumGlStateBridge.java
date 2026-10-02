@@ -37,27 +37,50 @@ public final class IrisSodiumGlStateBridge {
   }
 
   public static void allocate(int buffer, long bytes) {
-    if (buffer > 0 && IrisGlBufferMirror.isEnabled()) {
-      IrisGlBufferMirror.global().allocate(buffer, bytes);
+    if (buffer <= 0 || !IrisGlBufferMirror.isEnabled()) {
+      return;
+    }
+    if (bytes <= 0) {
+      IrisGlBufferMirror.global().delete(buffer);
+      return;
+    }
+    if (!IrisGlBufferMirror.global().allocate(buffer, bytes)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-sodium-buffer-allocation-mirror-rejected");
     }
   }
 
   public static void upload(int buffer, ByteBuffer bytes) {
-    if (buffer <= 0 || bytes == null || !IrisGlBufferMirror.isEnabled()) {
+    if (buffer <= 0 || !IrisGlBufferMirror.isEnabled()) {
+      return;
+    }
+    if (bytes == null || !bytes.hasRemaining()) {
+      IrisGlBufferMirror.global().delete(buffer);
       return;
     }
     IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
-    int size = Math.toIntExact(bytes.remaining());
-    if (mirror.allocate(buffer, size)) {
-      mirror.write(buffer, size, 0, size, bytes);
+    try {
+      int size = Math.toIntExact(bytes.remaining());
+      if (!mirror.allocate(buffer, size)
+          || !mirror.write(buffer, size, 0, size, bytes)) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-sodium-buffer-upload-mirror-rejected");
+      }
+    } catch (RuntimeException error) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-sodium-buffer-upload-mirror-failed");
     }
   }
 
   public static void copy(GlBuffer source, GlBuffer destination,
       long readOffset, long writeOffset, long bytes) {
-    if (!IrisGlBufferMirror.isEnabled() || source == null
-        || destination == null || readOffset < 0 || writeOffset < 0
-        || bytes <= 0 || bytes > Integer.MAX_VALUE) {
+    if (!IrisGlBufferMirror.isEnabled()) {
+      return;
+    }
+    if (source == null || destination == null || readOffset < 0
+        || writeOffset < 0 || bytes <= 0 || bytes > Integer.MAX_VALUE) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-sodium-buffer-copy-range-invalid");
       return;
     }
     IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
@@ -69,10 +92,15 @@ public final class IrisSodiumGlStateBridge {
     var snapshot = mirror.snapshot(source.handle(), sourceGeneration,
         readOffset, bytes).orElse(null);
     if (snapshot == null) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-sodium-buffer-copy-source-unavailable");
       return;
     }
-    mirror.write(destination.handle(), mirror.size(destination.handle()),
-        writeOffset, bytes, ByteBuffer.wrap(snapshot.bytes()));
+    if (!mirror.write(destination.handle(), mirror.size(destination.handle()),
+        writeOffset, bytes, ByteBuffer.wrap(snapshot.bytes()))) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-sodium-buffer-copy-destination-rejected");
+    }
   }
 
   public static void mapped(GlBufferMapping mapping, long offset,
@@ -150,6 +178,8 @@ public final class IrisSodiumGlStateBridge {
     if (bytes == null || range.offset() > Integer.MAX_VALUE
         || range.length() > bytes.capacity()
         || range.offset() < 0) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-sodium-buffer-map-memory-unavailable");
       return;
     }
     ByteBuffer view = bytes.duplicate();
@@ -158,10 +188,15 @@ public final class IrisSodiumGlStateBridge {
     long totalSize = IrisGlBufferMirror.global().size(buffer);
     if (totalSize <= 0 || range.offset() > totalSize
         || range.length() > totalSize - range.offset()) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-sodium-buffer-map-storage-unavailable");
       return;
     }
-    IrisGlBufferMirror.global().write(buffer, totalSize, range.offset(),
-        range.length(), view);
+    if (!IrisGlBufferMirror.global().write(buffer, totalSize, range.offset(),
+        range.length(), view)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-sodium-buffer-map-refresh-rejected");
+    }
   }
 
   public static void beginTessellation(int primitiveMode) {
