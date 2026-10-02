@@ -1,7 +1,7 @@
 package com.pebbles_boon.metalrender.compat.iris;
 
 import java.util.Objects;
-import net.fabricmc.loader.api.FabricLoader;
+import net.neoforged.fml.ModList;
 
 /** Production defaults and explicit overrides for the Iris Metal path. */
 public final class IrisMetalFeatureFlags {
@@ -45,14 +45,8 @@ public final class IrisMetalFeatureFlags {
 
   private static String packagedReleaseVersion() {
     try {
-      FabricLoader loader = FabricLoader.getInstance();
-      if (loader.isDevelopmentEnvironment()) {
-        return null;
-      }
-      return loader.getModContainer("complemetal")
-          .or(() -> loader.getModContainer("metalrender"))
-          .map(container -> container.getMetadata().getVersion()
-              .getFriendlyString())
+      return ModList.get().getModContainerById("complemetal")
+          .map(container -> container.getModInfo().getVersion().toString())
           .orElse(null);
     } catch (RuntimeException | LinkageError unavailable) {
       return IrisMetalFeatureFlags.class.getPackage()

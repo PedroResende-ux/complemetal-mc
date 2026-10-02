@@ -15,7 +15,7 @@ import java.util.Optional;
 /** Strict bounded ABI for one batched MTL4 graph command buffer. */
 public final class IrisMetalGraphFramePacketEncoder {
   public static final int MAGIC = 0x4d474639; // MGF9
-  public static final int SCHEMA = 4;
+  public static final int SCHEMA = 5;
   public static final int MAX_PACKET_BYTES =
       IrisMetalShadowReplayPacketEncoder.MAX_PACKET_BYTES;
   public static final int NO_READBACK = -1;
@@ -109,6 +109,7 @@ public final class IrisMetalGraphFramePacketEncoder {
     if (operation instanceof Clear clear) {
       out.putInt(1);
       out.putInt(clear.resourceId());
+      out.putInt(clear.mipLevel());
       out.putInt(clear.aspect().ordinal());
       out.putInt(clear.valueKind().ordinal());
       out.putInt(clear.rawValues().size());
@@ -144,9 +145,32 @@ public final class IrisMetalGraphFramePacketEncoder {
       out.putInt(copy.height());
       return;
     }
+    if (operation instanceof CopyInputTexture copy) {
+      out.putInt(7);
+      out.putInt(copy.inputTextureId());
+      out.putInt(copy.destinationResourceId());
+      out.putInt(copy.destinationLevel());
+      out.putInt(copy.width());
+      out.putInt(copy.height());
+      return;
+    }
     if (operation instanceof GenerateMipmaps mipmaps) {
       out.putInt(4);
       out.putInt(mipmaps.resourceId());
+      return;
+    }
+    if (operation instanceof Compute compute) {
+      out.putInt(6);
+      putString(out, compute.pipelineKeySha256());
+      out.putInt(compute.replayPacket().length);
+      out.put(compute.replayPacket);
+      out.putInt(compute.groupsX());
+      out.putInt(compute.groupsY());
+      out.putInt(compute.groupsZ());
+      out.putInt(compute.resources().size());
+      for (Integer resourceId : compute.resources()) {
+        out.putInt(resourceId);
+      }
       return;
     }
     if (operation instanceof Draw draw) {
@@ -161,9 +185,12 @@ public final class IrisMetalGraphFramePacketEncoder {
       for (ColorTarget target : draw.colorTargets()) {
         out.putInt(target.slot());
         out.putInt(target.resourceId());
+        out.putInt(target.mipLevel());
       }
       out.putInt(draw.depthResourceId());
+      out.putInt(draw.depthMipLevel());
       out.putInt(draw.stencilResourceId());
+      out.putInt(draw.stencilMipLevel());
       out.putInt(draw.textureOverrides().size());
       for (Map.Entry<Integer, Integer> entry
           : draw.textureOverrides().entrySet()) {
@@ -199,18 +226,24 @@ public final class IrisMetalGraphFramePacketEncoder {
     size = addSize(size, 4L);
     for (Operation operation : frame.operations()) {
       if (operation instanceof Clear clear) {
-        size = addSize(size, 21L + clear.rawValues().size() * 8L
+        size = addSize(size, 25L + clear.rawValues().size() * 8L
             + (clear.region().isPresent() ? 16L : 0L));
       } else if (operation instanceof Barrier
           || operation instanceof GenerateMipmaps) {
         size = addSize(size, 8L);
+      } else if (operation instanceof CopyInputTexture) {
+        size = addSize(size, 24L);
       } else if (operation instanceof CopyTexture) {
         size = addSize(size, 44L);
       } else if (operation instanceof Draw draw) {
-        size = addSize(size, 28L + asciiLength(
+        size = addSize(size, 36L + asciiLength(
             draw.pipelineKeySha256()) + draw.replayPacket.length
-            + draw.colorTargets().size() * 8L
+            + draw.colorTargets().size() * 12L
             + draw.textureOverrides().size() * 8L);
+      } else if (operation instanceof Compute compute) {
+        size = addSize(size, 28L + asciiLength(
+            compute.pipelineKeySha256()) + compute.replayPacket.length
+            + compute.resources().size() * 4L);
       } else {
         throw new IllegalArgumentException("unknown Metal graph operation");
       }
@@ -512,18 +545,25 @@ public final class IrisMetalGraphFramePacketEncoder {
   }
 
   public sealed interface Operation permits Clear, Barrier, CopyTexture,
-      GenerateMipmaps, Draw {
+      CopyInputTexture, GenerateMipmaps, Draw, Compute {
     List<Integer> resourceIds();
   }
 
-  public record Clear(int resourceId, Aspect aspect,
+  public record Clear(int resourceId, int mipLevel, Aspect aspect,
                       IrisClearCommand.ValueKind valueKind,
                       List<Long> rawValues,
                       Optional<IrisClearCommand.Rect> region)
       implements Operation {
+    public Clear(int resourceId, Aspect aspect,
+                 IrisClearCommand.ValueKind valueKind,
+                 List<Long> rawValues,
+                 Optional<IrisClearCommand.Rect> region) {
+      this(resourceId, 0, aspect, valueKind, rawValues, region);
+    }
+
     public Clear {
-      if (resourceId < 0) {
-        throw new IllegalArgumentException("negative clear resource");
+      if (resourceId < 0 || mipLevel < 0) {
+        throw new IllegalArgumentException("invalid clear resource");
       }
       Objects.requireNonNull(aspect, "aspect");
       Objects.requireNonNull(valueKind, "valueKind");
@@ -580,6 +620,26 @@ public final class IrisMetalGraphFramePacketEncoder {
     }
   }
 
+  /** Seeds a persistent graph texture from an inline captured GL subresource. */
+  public record CopyInputTexture(int inputTextureId,
+                                 int destinationResourceId,
+                                 int destinationLevel,
+                                 int width, int height)
+      implements Operation {
+    public CopyInputTexture {
+      if (inputTextureId < 0 || destinationResourceId < 0
+          || destinationLevel < 0 || width <= 0 || height <= 0) {
+        throw new IllegalArgumentException(
+            "invalid graph input texture bootstrap");
+      }
+    }
+
+    @Override
+    public List<Integer> resourceIds() {
+      return List.of(destinationResourceId);
+    }
+  }
+
   public record GenerateMipmaps(int resourceId) implements Operation {
     public GenerateMipmaps {
       if (resourceId < 0) {
@@ -595,9 +655,18 @@ public final class IrisMetalGraphFramePacketEncoder {
 
   public record Draw(String pipelineKeySha256, byte[] replayPacket,
                      List<ColorTarget> colorTargets,
-                     int depthResourceId, int stencilResourceId,
+                     int depthResourceId, int depthMipLevel,
+                     int stencilResourceId, int stencilMipLevel,
                      Map<Integer, Integer> textureOverrides)
       implements Operation {
+    public Draw(String pipelineKeySha256, byte[] replayPacket,
+                List<ColorTarget> colorTargets,
+                int depthResourceId, int stencilResourceId,
+                Map<Integer, Integer> textureOverrides) {
+      this(pipelineKeySha256, replayPacket, colorTargets,
+          depthResourceId, 0, stencilResourceId, 0, textureOverrides);
+    }
+
     public Draw {
       IrisRenderGraph.requireSha(pipelineKeySha256, "pipelineKeySha256");
       replayPacket = Objects.requireNonNull(replayPacket, "replayPacket")
@@ -618,7 +687,10 @@ public final class IrisMetalGraphFramePacketEncoder {
       }
       colorTargets = List.copyOf(colors);
       if (colorTargets.size() > IrisPipelineState.MAX_COLOR_ATTACHMENTS
-          || depthResourceId < -1 || stencilResourceId < -1) {
+          || depthResourceId < -1 || stencilResourceId < -1
+          || depthMipLevel < 0 || stencilMipLevel < 0
+          || (depthResourceId < 0 && depthMipLevel != 0)
+          || (stencilResourceId < 0 && stencilMipLevel != 0)) {
         throw new IllegalArgumentException("invalid draw graph targets");
       }
       java.util.TreeMap<Integer, Integer> overrides =
@@ -664,10 +736,46 @@ public final class IrisMetalGraphFramePacketEncoder {
     }
   }
 
-  public record ColorTarget(int slot, int resourceId) {
+  public record Compute(String pipelineKeySha256, byte[] replayPacket,
+                        int groupsX, int groupsY, int groupsZ,
+                        List<Integer> resources) implements Operation {
+    public Compute {
+      IrisRenderGraph.requireSha(pipelineKeySha256, "pipelineKeySha256");
+      replayPacket = Objects.requireNonNull(replayPacket, "replayPacket").clone();
+      if (replayPacket.length <= 0 ||
+          replayPacket.length > IrisMetalShadowReplayPacketEncoder.MAX_PACKET_BYTES) {
+        throw new IllegalArgumentException("invalid compute replay packet");
+      }
+      if (groupsX <= 0 || groupsY <= 0 || groupsZ <= 0) {
+        throw new IllegalArgumentException("invalid compute dispatch groups");
+      }
+      resources = resources == null ? List.of() : List.copyOf(resources);
+      if (resources.size() > IrisRenderGraph.MAX_RESOURCES
+          || resources.stream().anyMatch(id -> id == null || id < 0)
+          || resources.stream().distinct().count() != resources.size()) {
+        throw new IllegalArgumentException("invalid compute graph resources");
+      }
+    }
+
+    @Override
+    public byte[] replayPacket() {
+      return replayPacket.clone();
+    }
+
+    @Override
+    public List<Integer> resourceIds() {
+      return resources;
+    }
+  }
+
+  public record ColorTarget(int slot, int resourceId, int mipLevel) {
+    public ColorTarget(int slot, int resourceId) {
+      this(slot, resourceId, 0);
+    }
+
     public ColorTarget {
       if (slot < 0 || slot >= IrisPipelineState.MAX_COLOR_ATTACHMENTS
-          || resourceId < 0) {
+          || resourceId < 0 || mipLevel < 0) {
         throw new IllegalArgumentException("invalid graph color target");
       }
     }

@@ -45,7 +45,7 @@ public final class IrisFinalShaderProgram {
   }
 
   /**
-   * Captures the exact String arguments accepted by Iris 26.2
+   * Captures the exact String arguments accepted by Iris 1.8.x
    * {@code ShaderCreator.link}.
    */
   public static IrisFinalShaderProgram fromGraphicsLink(String programName,
@@ -62,7 +62,7 @@ public final class IrisFinalShaderProgram {
   }
 
   /**
-   * Captures the exact final graphics sources accepted by Iris 26.2
+   * Captures the exact final graphics sources accepted by Iris 1.8.x
    * {@code ProgramBuilder.begin}.
    */
   public static IrisFinalShaderProgram fromProgramBuilderGraphics(
@@ -76,7 +76,7 @@ public final class IrisFinalShaderProgram {
   }
 
   /**
-   * Captures the exact final compute source accepted by Iris 26.2
+   * Captures the exact final compute source accepted by Iris 1.8.x
    * {@code ProgramBuilder.beginCompute}.
    */
   public static IrisFinalShaderProgram fromProgramBuilderCompute(

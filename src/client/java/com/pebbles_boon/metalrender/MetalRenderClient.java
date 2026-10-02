@@ -21,14 +21,15 @@ import com.pebbles_boon.metalrender.sodium.backend.MeshShaderBackend;
 import com.pebbles_boon.metalrender.sodium.backend.SodiumMetalInterface;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import java.nio.file.Path;
-import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.fabricmc.loader.api.FabricLoader;
+import net.neoforged.fml.ModList;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.common.NeoForge;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
 
-public class MetalRenderClient implements ClientModInitializer {
+@Mod("complemetal")
+public class MetalRenderClient {
   private static final int FPS_PRIORITY_SIMULATION_DISTANCE = 5;
   private static final SimulationDistanceOverride SIMULATION_DISTANCE_OVERRIDE =
       new SimulationDistanceOverride(FPS_PRIORITY_SIMULATION_DISTANCE);
@@ -58,17 +59,23 @@ public class MetalRenderClient implements ClientModInitializer {
   private static volatile InitState initState = InitState.NOT_TRIED;
   private static volatile String initFailure;
   private static boolean terminalShutdown;
+  private static boolean shutdownHookInstalled;
   private static int displayTargetPollTicks;
   private static int lastConfiguredTargetFrameRate = -1;
 
-  @Override
-  public void onInitializeClient() {
+  public MetalRenderClient() {
+    instance = this;
+    NeoForge.EVENT_BUS.addListener(this::onClientTick);
+    installShutdownHook();
+    initializeClient();
+  }
+
+  private void initializeClient() {
     if (StartupBlocker.shouldBlockStartup()) {
       return;
     }
-    instance = this;
     terminalShutdown = false;
-    MetalLogger.info("metalrender ready");
+    MetalLogger.info("metalrender ready (NeoForge 1.21.1)");
     startIrisTranslationIfEnabled();
     config = MetalRenderConfig.load();
     cfgWasOn = config != null && config.enableMetalRendering;
@@ -81,30 +88,29 @@ public class MetalRenderClient implements ClientModInitializer {
     if (!config.enableMetalRendering) {
       MetalLogger.info("metalrender off");
     }
-
-    ClientTickEvents.START_CLIENT_TICK.register(client -> {
-      var mc = Minecraft.getInstance();
-      if (!debugEntryStatusSet && mc != null) {
-        MetalDebugEntry.show(mc);
-        debugEntryStatusSet = true;
-      }
-      if (cfgSyncPending) {
-        cfgSyncPending = false;
-        syncCfg(mc);
-      }
-      pollDisplayLifecycle(mc);
-      applyDeferredRuntimeChanges(mc);
-      requestDisplayTargetRefreshIfNeeded();
-      applyFpsPriorityMode(mc);
-      syncCfg(mc);
-      if (config != null && config.enableMetalRendering && renderer == null &&
-          mc != null && initState == InitState.NOT_TRIED) {
-        initMetal(mc);
-      }
-    });
-    ClientLifecycleEvents.CLIENT_STOPPING.register(
-        client -> shutdownForClientExit());
   }
+
+  private void onClientTick(ClientTickEvent.Post event) {
+    Minecraft mc = Minecraft.getInstance();
+    if (!debugEntryStatusSet && mc != null) {
+      MetalDebugEntry.show(mc);
+      debugEntryStatusSet = true;
+    }
+    if (cfgSyncPending) {
+      cfgSyncPending = false;
+      syncCfg(mc);
+    }
+    pollDisplayLifecycle(mc);
+    applyDeferredRuntimeChanges(mc);
+    requestDisplayTargetRefreshIfNeeded();
+    applyFpsPriorityMode(mc);
+    syncCfg(mc);
+    if (config != null && config.enableMetalRendering && renderer == null &&
+        mc != null && initState == InitState.NOT_TRIED) {
+      initMetal(mc);
+    }
+  }
+
 
   public static void requestDeferredApply(boolean requestCfgSync,
       boolean refreshLevelRenderer,
@@ -288,7 +294,7 @@ public class MetalRenderClient implements ClientModInitializer {
       return;
     }
     try {
-      mc.execute(() -> mc.gui.setScreen(new MetalRenderSettingsScreen(mc.gui.screen())));
+      mc.execute(() -> mc.setScreen(new MetalRenderSettingsScreen(mc.screen)));
       MetalLogger.info("settings screen opened");
     } catch (Exception e) {
       MetalLogger.warn("settings screen open failed: %s", e.getMessage());
@@ -419,7 +425,7 @@ public class MetalRenderClient implements ClientModInitializer {
   }
 
   public static boolean isSodiumLoaded() {
-    return FabricLoader.getInstance().isModLoaded("sodium");
+    return ModList.get().isLoaded("sodium");
   }
 
   public static InitState getInitState() {
@@ -477,24 +483,21 @@ public class MetalRenderClient implements ClientModInitializer {
   /**
    * Rebuilds Minecraft's chunk renderer without leaving its ViewArea null.
    *
-   * <p>In 26.2 {@code resetLevelRenderData()} is a teardown-only method. It
+   * <p>In Minecraft 1.21.1 {@code resetLevelRenderData()} is a teardown-only method. It
    * releases the current ViewArea and SectionRenderDispatcher but does not
    * recreate either one, so calling it from a live client crashes the next
    * render frame. {@code invalidateCompiledGeometry(...)} performs the paired
    * teardown and reconstruction used by Minecraft itself.</p>
    */
   public static boolean rebuildLevelRenderer(Minecraft mc) {
-    if (mc == null || mc.level == null || mc.levelRenderer == null
-        || mc.options == null || mc.gameRenderer == null) {
+    if (mc == null || mc.level == null || mc.levelRenderer == null) {
       return false;
     }
     try {
-      mc.levelRenderer.invalidateCompiledGeometry(mc.level, mc.options,
-          mc.gameRenderer.mainCamera(), mc.getBlockColors());
-      return mc.levelRenderer.viewArea() != null;
+      mc.levelRenderer.allChanged();
+      return true;
     } catch (Throwable error) {
-      MetalLogger.warn("level renderer rebuild failed: %s",
-          error.getMessage());
+      MetalLogger.warn("level renderer rebuild failed: %s", error.getMessage());
       return false;
     }
   }
@@ -529,7 +532,7 @@ public class MetalRenderClient implements ClientModInitializer {
       }
     } catch (UnsatisfiedLinkError oldNative) {
       MetalLogger.warn(
-          "native runtime configuration API unavailable; rebuild the 26.2 dylib");
+          "native runtime configuration API unavailable; rebuild the 1.21.1 native payload");
       if (config.requireMetal4) {
         initState = InitState.FAILED;
         initFailure =
@@ -613,7 +616,6 @@ public class MetalRenderClient implements ClientModInitializer {
       int cachedFramebufferHeight = minecraft.getWindow().getHeight();
       if (DisplayLifecycleTracker.synchronizeWindowGeometry(
           minecraft.getWindow())) {
-        minecraft.framebufferSizeChanged();
         MetalLogger.info(
             "synchronized missed GLFW geometry callbacks: window=%dx%d->%dx%d framebuffer=%dx%d->%dx%d",
             cachedWindowWidth, cachedWindowHeight,
@@ -699,6 +701,16 @@ public class MetalRenderClient implements ClientModInitializer {
     DisplayPresentationTracker.reset();
   }
 
+  private static synchronized void installShutdownHook() {
+    if (shutdownHookInstalled) {
+      return;
+    }
+    shutdownHookInstalled = true;
+    Runtime.getRuntime().addShutdownHook(
+        new Thread(MetalRenderClient::shutdownForClientExit,
+            "complemetal-shutdown"));
+  }
+
   private static void shutdownForClientExit() {
     if (terminalShutdown) {
       return;
@@ -720,11 +732,14 @@ public class MetalRenderClient implements ClientModInitializer {
   }
 
   private static void startIrisTranslationIfEnabled() {
+    if (!IrisCompatibility.isIrisLoaded()) {
+      return;
+    }
     try {
       String configuredRoot = System.getProperty(
           "metalrender.experimental.irisMetalCacheRoot");
       Path cacheRoot = configuredRoot == null || configuredRoot.isBlank()
-          ? FabricLoader.getInstance().getGameDir()
+          ? net.neoforged.fml.loading.FMLPaths.GAMEDIR.get()
               .resolve(".cache").resolve("metalrender")
           : Path.of(configuredRoot);
       if (IrisTranslationCoordinator.startIfEnabled(cacheRoot)) {

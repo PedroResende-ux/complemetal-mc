@@ -1,6 +1,5 @@
 package com.pebbles_boon.metalrender.particle;
 
-import com.mojang.blaze3d.opengl.GlTexture;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.backend.MetalRenderer;
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
@@ -23,9 +22,10 @@ import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.core.BlockPos;
-import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.phys.AABB;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 import org.lwjgl.opengl.GL11;
@@ -125,18 +125,19 @@ public class MetalParticleRenderer {
       Frustum frustum, Camera camera, float delta) {
     if (!active || particles == null)
       return false;
-    double camX = camera.position().x;
-    double camY = camera.position().y;
-    double camZ = camera.position().z;
+    var cameraPosition = camera.getPosition();
+    double camX = cameraPosition.x;
+    double camY = cameraPosition.y;
+    double camZ = cameraPosition.z;
 
     ClientLevel world = null;
     int camLight = 0x00F000F0;
     Minecraft mc = Minecraft.getInstance();
     if (mc != null && mc.level != null) {
       world = mc.level;
-      scratchPos.set((int) Math.floor(camera.position().x),
-          (int) Math.floor(camera.position().y),
-          (int) Math.floor(camera.position().z));
+      scratchPos.set((int) Math.floor(cameraPosition.x),
+          (int) Math.floor(cameraPosition.y),
+          (int) Math.floor(cameraPosition.z));
       var lights = world.getChunkSource().getLightEngine();
       int blockLev = lights.getLayerListener(LightLayer.BLOCK).getLightValue(scratchPos);
       int skyLev = lights.getLayerListener(LightLayer.SKY).getLightValue(scratchPos);
@@ -147,8 +148,10 @@ public class MetalParticleRenderer {
       if (p == null)
         continue;
       ParticleAccessor pa = (ParticleAccessor) p;
-      if (!frustum.pointInFrustum(pa.metalrender$getX(),
-          pa.metalrender$getY(), pa.metalrender$getZ())) {
+      if (frustum != null && !frustum.isVisible(new AABB(
+          pa.metalrender$getX() - 0.25D, pa.metalrender$getY() - 0.25D,
+          pa.metalrender$getZ() - 0.25D, pa.metalrender$getX() + 0.25D,
+          pa.metalrender$getY() + 0.25D, pa.metalrender$getZ() + 0.25D))) {
         continue;
       }
       if (!(p instanceof SingleQuadParticle bp))
@@ -322,12 +325,12 @@ public class MetalParticleRenderer {
     Minecraft mc = Minecraft.getInstance();
     if (mc == null)
       return;
-    Camera camera = mc.gameRenderer.mainCamera();
+    Camera camera = mc.gameRenderer.getMainCamera();
     if (camera == null)
       return;
     Quaternionf camRot = camera.rotation();
     int currentGlTexId = -1;
-    Identifier currentAtlasId = null;
+    ResourceLocation currentAtlasId = null;
     int batchStartVertex = 0;
     int batchVertexCount = 0;
     for (int _pi = 0; _pi < count; _pi++) {
@@ -457,7 +460,7 @@ public class MetalParticleRenderer {
     vtxCount++;
   }
 
-  private long getOrCreateMetalTexture(int glTextureId, Identifier atlasId) {
+  private long getOrCreateMetalTexture(int glTextureId, ResourceLocation atlasId) {
     if (glTextureId == 0 || device == 0)
       return 0;
     boolean inBounds = glTextureId >= 0 && glTextureId < TEXTURE_CACHE_SIZE;
@@ -521,7 +524,7 @@ public class MetalParticleRenderer {
   }
 
   private boolean shouldRefreshTexture(long cached, int lastUpload,
-      Identifier atlasId) {
+      ResourceLocation atlasId) {
     if (cached == TEXTURE_UNCACHED || lastUpload < 0) {
       return true;
     }
@@ -531,7 +534,7 @@ public class MetalParticleRenderer {
     return frameCount - lastUpload >= ATLAS_REFRESH_FRAMES;
   }
 
-  private int getGlTextureIdForAtlas(Identifier atlasId) {
+  private int getGlTextureIdForAtlas(ResourceLocation atlasId) {
     try {
       Minecraft mc = Minecraft.getInstance();
       if (mc == null)
@@ -539,10 +542,7 @@ public class MetalParticleRenderer {
       AbstractTexture tex = mc.getTextureManager().getTexture(atlasId);
       if (tex == null)
         return 0;
-      var gpuTex = tex.getTexture();
-      if (gpuTex instanceof GlTexture glTex) {
-        return glTex.glId();
-      }
+      return tex.getId();
     } catch (Exception e) {
     }
     return 0;
@@ -612,13 +612,13 @@ public class MetalParticleRenderer {
     float zRotation;
     float minU, maxU, minV, maxV;
     int light;
-    Identifier atlasId;
+    ResourceLocation atlasId;
   }
 
   private static class ParticleDrawCommand {
     int startVertex;
     int vertexCount;
     int glTextureId;
-    Identifier atlasId;
+    ResourceLocation atlasId;
   }
 }

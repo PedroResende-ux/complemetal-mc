@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: complemetal-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     runs-on: macos-26
@@ -15,16 +19,16 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Set up Java 25
-        uses: actions/setup-java@v4
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: "25"
+          java-version: "21"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Ensure the offline Metal compiler is installed
         run: |
@@ -34,18 +38,30 @@ jobs:
           xcrun --sdk macosx metal --version
           xcrun --sdk macosx --find metallib
 
+      - name: Check NeoForge 1.21.1 port hygiene
+        run: bash ./scripts/check_neoforge_port_hygiene.sh
+
       - name: Compile, test, package, and verify
         env:
           MACOSX_DEPLOYMENT_TARGET: "14.0"
+          METALRENDER_IRIS_TRANSLATION_SMOKE: "1"
         run: ./gradlew --no-daemon clean test check build releaseCheck
 
       - name: Smoke-test packaged native payload
-        run: ./scripts/smoke_release_payload.sh
+        run: |
+          java -version
+          javac -version
+          javac_version="$(javac -version 2>&1 | awk '{print $2}' | cut -d. -f1)"
+          if [[ "$javac_version" != "21" ]]; then
+            echo "Smoke test requires javac 21, found $javac_version" >&2
+            exit 1
+          fi
+          ./scripts/smoke_release_payload.sh
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: metalrender-mc26.2
+          name: complemetal-mc1.21.1-neoforge
           path: |
             build/libs/*.jar
             !build/libs/*-sources.jar

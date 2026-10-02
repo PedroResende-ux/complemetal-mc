@@ -1,143 +1,212 @@
 package com.pebbles_boon.metalrender.sodium.mixins;
 
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
-import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.backend.MetalRenderer;
-import com.pebbles_boon.metalrender.compat.IrisCompatibility;
-import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import com.pebbles_boon.metalrender.render.CapturedMatrices;
 import com.pebbles_boon.metalrender.render.MetalRenderHookState;
-import com.pebbles_boon.metalrender.render.MetalWorldFrameGate;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
-import net.minecraft.client.renderer.state.level.CameraRenderState;
-import net.minecraft.world.phys.Vec3;
+import net.minecraft.client.renderer.LightTexture;
 import org.joml.Matrix4f;
-import org.joml.Matrix4fc;
-import org.joml.Vector4f;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+/**
+ * Minecraft 1.21.1 frame boundary for Complemetal.
+ *
+ * <p>The Metal frame starts at the beginning of LevelRenderer.renderLevel().
+ * When fast terrain replacement is active, presentation happens immediately
+ * after the vanilla/Sodium cutout terrain layer and before entities are drawn.
+ * The depth buffer is restored from Metal at that same point.</p>
+ */
 @Mixin(LevelRenderer.class)
-public class WorldRendererBlitMixin {
-  @Unique
-  private final Matrix4f metalrender$projection = new Matrix4f();
-  @Unique
-  private final Matrix4f metalrender$modelView = new Matrix4f();
+public abstract class WorldRendererBlitMixin {
   @Unique
   private boolean metalrender$frameActive;
-  @Unique
-  private int metalrender$beginFrameCount;
-  @Unique
-  private int metalrender$endFrameCount;
 
-  @Inject(method = "render", at = @At("HEAD"), require = 1)
+  @Unique
+  private boolean metalrender$frameEnded;
+
+  @Inject(method = "renderLevel", at = @At("HEAD"), require = 0)
   private void metalrender$beginWorldFrame(
-      GraphicsResourceAllocator allocator, DeltaTracker tickCounter,
-      boolean renderBlockOutline, CameraRenderState cameraRenderState,
-      Matrix4fc positionMatrix, GpuBufferSlice fogBuffer, Vector4f fogColor,
-      boolean renderEntityOutline, CallbackInfo ci) {
+      DeltaTracker deltaTracker,
+      boolean renderBlockOutline,
+      Camera camera,
+      GameRenderer gameRenderer,
+      LightTexture lightTexture,
+      Matrix4f positionMatrix,
+      Matrix4f projectionMatrix,
+      CallbackInfo ci) {
     MetalRenderHookState.beginFrameAttempt();
     metalrender$frameActive = false;
-    if (!MetalRenderHookState.isGraphicsBackendSupported() ||
-        !MetalRenderClient.isEnabled()) {
+    metalrender$frameEnded = false;
+
+    if (!MetalRenderHookState.isGraphicsBackendSupported()
+        || !MetalRenderClient.isEnabled()) {
       return;
     }
-    boolean irisCompatibilityMode =
-        IrisCompatibility.requiresShaderCompatibilityMode();
-    if (irisCompatibilityMode) {
-      MetalRenderer renderer = MetalRenderClient.getRenderer();
-      if (renderer != null && renderer.getHandle() != 0) {
-        NativeBridge.nRecycleUnpresentedFrames(renderer.getHandle());
-      }
-      return;
-    }
+
     MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
-    if (worldRenderer == null ||
-        !MetalWorldFrameGate.canEncode(
-            worldRenderer.metalActive(),
-            irisCompatibilityMode,
-            worldRenderer.isIrisCompatibilityPaused())) {
+    MetalRenderer renderer = MetalRenderClient.getRenderer();
+    if (worldRenderer == null || renderer == null
+        || renderer.getHandle() == 0
+        || !worldRenderer.metalActive()
+        || worldRenderer.isIrisCompatibilityPaused()) {
       return;
     }
+
     try {
-      MetalRenderer renderer = MetalRenderClient.getRenderer();
-      if (renderer == null || renderer.getHandle() == 0) {
-        return;
-      }
-      // A ready frame left at the start of the next LevelRenderer frame missed
-      // its presentation opportunity. Recycle it whether safe hybrid mode,
-      // screenshot suppression, or a transient blit failure caused the miss.
-      // In-flight and OpenGL-bound surfaces remain protected.
-      NativeBridge.nRecycleUnpresentedFrames(renderer.getHandle());
-      Minecraft mc = Minecraft.getInstance();
-      Camera camera = mc.gameRenderer.mainCamera();
-      if (camera == null || camera.position() == null) {
-        return;
-      }
-      float tickDelta = tickCounter.getGameTimeDeltaPartialTick(true);
-      if (cameraRenderState != null &&
-          cameraRenderState.projectionMatrix != null) {
-        metalrender$projection.set(cameraRenderState.projectionMatrix);
-      } else {
-        metalrender$projection.set(positionMatrix);
-      }
-      Vec3 camPos = (cameraRenderState != null && cameraRenderState.pos != null)
-          ? cameraRenderState.pos
-          : camera.position();
-      if (cameraRenderState != null &&
-          cameraRenderState.viewRotationMatrix != null) {
-        metalrender$modelView.set(cameraRenderState.viewRotationMatrix);
-      } else {
-        metalrender$modelView.identity();
-        metalrender$modelView.rotateX((float) Math.toRadians(camera.xRot()));
-        metalrender$modelView.rotateY(
-            (float) Math.toRadians(camera.yRot() + 180.0f));
-      }
-      CapturedMatrices.capture(metalrender$projection, metalrender$modelView,
-          camPos.x, camPos.y, camPos.z);
-      worldRenderer.beginFrame(camera, tickDelta, metalrender$projection,
-          metalrender$modelView);
+      float tickDelta = deltaTracker.getGameTimeDeltaPartialTick(true);
+      var cameraPosition = camera.getPosition();
+      CapturedMatrices.capture(projectionMatrix, positionMatrix,
+          cameraPosition.x, cameraPosition.y, cameraPosition.z);
+
+      worldRenderer.beginFrame(camera, tickDelta,
+          projectionMatrix, positionMatrix);
+
       if (renderer.frameCtx() == 0) {
         MetalRenderHookState.failOpen("begin-frame-context", null);
         return;
       }
-      com.pebbles_boon.metalrender.performance.MetalRenderProfiler.getInstance().startRender();
+
       MetalRenderHookState.markFramePrepared();
       metalrender$frameActive = true;
-      metalrender$beginFrameCount++;
-      if (metalrender$beginFrameCount <= 3) {
-        MetalLogger.info("[blitmix] begin hook #%d",
-            metalrender$beginFrameCount);
+    } catch (Throwable error) {
+      MetalRenderHookState.failOpen("world-frame-encode", error);
+    }
+  }
+
+  @Inject(method = "renderLevel",
+      at = @At(value = "INVOKE",
+          target = "Lnet/minecraft/client/renderer/LevelRenderer;renderSectionLayer(Lnet/minecraft/client/renderer/RenderType;DDDLorg/joml/Matrix4f;Lorg/joml/Matrix4f;)V",
+          ordinal = 2,
+          shift = At.Shift.AFTER),
+      require = 0)
+  private void metalrender$presentBeforeEntities(
+      DeltaTracker deltaTracker,
+      boolean renderBlockOutline,
+      Camera camera,
+      GameRenderer gameRenderer,
+      LightTexture lightTexture,
+      Matrix4f positionMatrix,
+      Matrix4f projectionMatrix,
+      CallbackInfo ci) {
+    metalrender$presentTerrainBeforeEntities();
+  }
+
+  /**
+   * Secondary 1.21.1 presentation boundary. The exact renderSectionLayer
+   * ordinal is intentionally retained above for the normal path, but Sodium,
+   * NeoForge or another renderer mixin can change that call ordering. The
+   * first renderEntity invocation is an unambiguous semantic boundary before
+   * entity rendering and therefore keeps terrain presentation fail-safe.
+   */
+  @Inject(method = "renderEntity", at = @At("HEAD"), require = 0)
+  private void metalrender$presentBeforeFirstEntity(
+      net.minecraft.world.entity.Entity entity,
+      double camX,
+      double camY,
+      double camZ,
+      float partialTick,
+      com.mojang.blaze3d.vertex.PoseStack poseStack,
+      net.minecraft.client.renderer.MultiBufferSource bufferSource,
+      CallbackInfo ci) {
+    metalrender$presentTerrainBeforeEntities();
+  }
+
+  private void metalrender$presentTerrainBeforeEntities() {
+    if (!metalrender$frameActive || metalrender$frameEnded) {
+      return;
+    }
+
+    // When the experimental terrain replacement is disabled, retain the
+    // upstream frame lifetime. Nothing is presented into the vanilla buffer.
+    var config = MetalRenderClient.getConfig();
+    if (config == null || !config.enableFastTerrainReplacement) {
+      return;
+    }
+
+    try {
+      MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
+      Minecraft mc = Minecraft.getInstance();
+      if (worldRenderer == null || !worldRenderer.metalActive()
+          || mc == null || mc.getWindow() == null) {
+        MetalRenderHookState.failOpen(
+            "world-renderer-missing-before-entities", null);
+        worldRenderer = null;
+        return;
       }
+
+      // The Sodium terrain mixin has already verified that this Metal frame
+      // has usable geometry. End native encoding before transferring ownership
+      // back to the Minecraft OpenGL framebuffer.
       worldRenderer.endFrame();
+      metalrender$frameEnded = true;
       MetalRenderHookState.markFrameFinished();
-      metalrender$frameActive = false;
-      com.pebbles_boon.metalrender.performance.MetalRenderProfiler.getInstance().endRender();
-      metalrender$endFrameCount++;
-      if (metalrender$endFrameCount <= 3) {
-        MetalLogger.info("[blitmix] encoded hook #%d",
-            metalrender$endFrameCount);
+
+      if (!MetalRenderHookState.canPresentFrame()) {
+        return;
       }
-    } catch (Throwable e) {
-      if (metalrender$frameActive) {
-        try {
-          com.pebbles_boon.metalrender.performance.MetalRenderProfiler
-              .getInstance().endRender();
-        } catch (Throwable ignored) {
-        }
+
+      if (!worldRenderer.forceBlitNow()) {
+        MetalRenderHookState.markPresentationAttemptFailed(
+            "terrain-presentation-before-entities", null);
+        return;
       }
+
+      // Keep vanilla entities/block entities depth-tested against Metal terrain.
+      // This is a compatibility path; the readback cost is avoided completely
+      // when fast terrain replacement is not active.
+      worldRenderer.forceBlitDepthNow(
+          mc.getWindow().getWidth(), mc.getWindow().getHeight());
+      MetalRenderHookState.markPresentationSucceeded();
+    } catch (Throwable error) {
+      MetalLogger.warn("1.21.1 terrain presentation before entities failed: %s",
+          error.getMessage());
+      MetalRenderHookState.failOpen(
+          "terrain-presentation-before-entities", error);
+      metalrender$frameEnded = true;
       metalrender$frameActive = false;
-      MetalRenderHookState.failOpen("world-frame-encode", e);
-      MetalLogger.error("[blitmix] frame encode fail: %s", e.getMessage());
+    }
+  }
+
+  @Inject(method = "renderLevel", at = @At("RETURN"), require = 0)
+  private void metalrender$finishWorldFrameFallback(
+      DeltaTracker deltaTracker,
+      boolean renderBlockOutline,
+      Camera camera,
+      GameRenderer gameRenderer,
+      LightTexture lightTexture,
+      Matrix4f positionMatrix,
+      Matrix4f projectionMatrix,
+      CallbackInfo ci) {
+    if (!metalrender$frameActive || metalrender$frameEnded) {
+      return;
+    }
+
+    try {
+      MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
+      if (worldRenderer != null && worldRenderer.metalActive()) {
+        worldRenderer.endFrame();
+        MetalRenderHookState.markFrameFinished();
+      } else {
+        MetalRenderHookState.failOpen("world-renderer-missing-at-end", null);
+      }
+    } catch (Throwable error) {
+      MetalLogger.warn("1.21.1 world-frame cleanup failed: %s",
+          error.getMessage());
+      MetalRenderHookState.failOpen("world-frame-cleanup", error);
+    } finally {
+      metalrender$frameEnded = true;
+      metalrender$frameActive = false;
     }
   }
 }

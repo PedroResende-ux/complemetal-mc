@@ -11,6 +11,40 @@ final class IrisGlResourceBindingTrackerTest {
   private static final int GL_TEXTURE_BUFFER = 0x8C2A;
 
   @Test
+  void deletingProgramDropsItsResourceMetadataAndCurrentSelection() {
+    IrisGlResourceBindingTracker tracker =
+        new IrisGlResourceBindingTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerProgram(18);
+    tracker.uniformLocation(18, "uValue", 7);
+    tracker.useProgram(18);
+    assertNotNull(tracker.snapshot());
+
+    tracker.deleteProgram(18);
+
+    assertEquals(null, tracker.snapshot());
+  }
+
+  @Test
+  void contextResetDropsOldProgramMetadata() {
+    IrisGlResourceBindingTracker tracker =
+        new IrisGlResourceBindingTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerProgram(17);
+    tracker.uniformLocation(17, "oldUniform", 4);
+    tracker.useProgram(17);
+    assertNotNull(tracker.snapshot());
+
+    tracker.initializeOpenGlDefaults();
+    tracker.registerProgram(17);
+    tracker.useProgram(17);
+
+    var snapshot = tracker.snapshot();
+    assertNotNull(snapshot);
+    assertEquals(Map.of(), snapshot.uniformLocations());
+  }
+
+  @Test
   void keepsTextureTargetsIndependentOnTheSameUnit() {
     IrisGlResourceBindingTracker tracker =
         new IrisGlResourceBindingTracker();
@@ -71,6 +105,53 @@ final class IrisGlResourceBindingTrackerTest {
     assertEquals(0, snapshot.textureUnits().get(0).texture());
     assertEquals(0, snapshot.textureUnits().get(1).texture());
     assertEquals(false, snapshot.textureBuffers().containsKey(61));
+  }
+
+  @Test
+  void deletingBufferClearsIndexedAndTextureBufferBindings() {
+    IrisGlResourceBindingTracker tracker =
+        new IrisGlResourceBindingTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerProgram(11);
+    tracker.useProgram(11);
+
+    tracker.bindBufferBase(
+        IrisGlResourceBindingTracker.GL_SHADER_STORAGE_BUFFER, 3, 73);
+    tracker.bindBufferBase(
+        IrisGlResourceBindingTracker.GL_UNIFORM_BUFFER, 4, 73);
+    tracker.bindTextureToUnit(GL_TEXTURE_BUFFER, 0, 81);
+    tracker.texBuffer(GL_TEXTURE_BUFFER, 0x822E, 73);
+
+    tracker.deleteBuffer(73);
+
+    IrisGlResourceBindingSnapshot snapshot = tracker.snapshot();
+    assertNotNull(snapshot);
+    assertEquals(0,
+        snapshot.indexedBuffers().size());
+    assertEquals(0, snapshot.textureBuffers().size());
+  }
+
+  @Test
+  void deletingSamplerClearsEveryTextureUnitSamplerBinding() {
+    IrisGlResourceBindingTracker tracker =
+        new IrisGlResourceBindingTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerProgram(12);
+    tracker.useProgram(12);
+    tracker.bindTextureToUnit(IrisGlResourceBindingTracker.GL_TEXTURE_2D, 0, 101);
+    tracker.bindTextureToUnit(IrisGlResourceBindingTracker.GL_TEXTURE_2D, 1, 102);
+    tracker.bindTextureToUnit(IrisGlResourceBindingTracker.GL_TEXTURE_2D, 2, 103);
+    tracker.bindSamplerToUnit(0, 91);
+    tracker.bindSamplerToUnit(1, 91);
+    tracker.bindSamplerToUnit(2, 92);
+
+    tracker.deleteSampler(91);
+
+    IrisGlResourceBindingSnapshot snapshot = tracker.snapshot();
+    assertNotNull(snapshot);
+    assertEquals(0, snapshot.textureUnits().get(0).sampler());
+    assertEquals(0, snapshot.textureUnits().get(1).sampler());
+    assertEquals(92, snapshot.textureUnits().get(2).sampler());
   }
 
   @Test

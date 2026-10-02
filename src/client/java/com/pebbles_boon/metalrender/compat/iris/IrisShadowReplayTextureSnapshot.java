@@ -155,7 +155,15 @@ public record IrisShadowReplayTextureSnapshot(
           && !requiredTextureNames.contains(binding.texture())) {
         continue;
       }
-      if (binding.texture() <= 0 || references.containsKey(binding.texture())) {
+      if (binding.texture() <= 0) {
+        continue;
+      }
+      TextureReference existingReference = references.get(binding.texture());
+      if (existingReference != null) {
+        if (existingReference.mipLevel() != binding.level()
+            || existingReference.layer() != binding.layer()) {
+          blockers.add("mixed-texture-subresource-snapshot-unavailable");
+        }
         continue;
       }
       if (binding.layered()) {

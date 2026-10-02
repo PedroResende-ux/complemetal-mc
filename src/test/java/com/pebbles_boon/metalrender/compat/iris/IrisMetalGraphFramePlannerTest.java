@@ -28,6 +28,27 @@ final class IrisMetalGraphFramePlannerTest {
   }
 
   @Test
+  void detectsRepeatedFormatsBeforeBlitAttachmentPairing() {
+    IrisRenderGraph.Resource first = new IrisRenderGraph.Resource(0,
+        IrisRenderGraph.ResourceKind.TEXTURE, "rgba8-unorm", 1,
+        16, 16, 1, 1);
+    IrisRenderGraph.Resource second = new IrisRenderGraph.Resource(1,
+        IrisRenderGraph.ResourceKind.TEXTURE, "rgba8-unorm", 1,
+        16, 16, 1, 1);
+    IrisRenderGraph.Resource distinct = new IrisRenderGraph.Resource(2,
+        IrisRenderGraph.ResourceKind.TEXTURE, "rgba16-float", 1,
+        16, 16, 1, 1);
+
+    IrisRenderExecutionPlan plan = graphOnlyPlan(
+        List.of(first, second, distinct));
+
+    assertTrue(IrisMetalGraphFramePlanner.hasRepeatedFormat(plan,
+        List.of(0, 1)));
+    assertFalse(IrisMetalGraphFramePlanner.hasRepeatedFormat(plan,
+        List.of(0, 2)));
+  }
+
+  @Test
   void acceptsMatchingInitialTextureAcrossIndependentGenerationDomains() {
     IrisGlTextureMirror mirror = new IrisGlTextureMirror(4, 1_024, 1_024);
     assertTrue(mirror.define(31, "rgba8-unorm", 4, 2, 1, 1, 4));
@@ -43,6 +64,40 @@ final class IrisMetalGraphFramePlannerTest {
 
     assertNotEquals(object.generation(), snapshot.generation());
     assertTrue(IrisMetalGraphFramePlanner.initialTextureSnapshotCompatible(
+        snapshot, resource));
+  }
+
+  @Test
+  void acceptsInitialSnapshotAtValidNonzeroMip() {
+    IrisGlTextureMirror mirror = new IrisGlTextureMirror(4, 1_024, 1_024);
+    assertTrue(mirror.define(32, "rgba8-unorm", 8, 8, 1, 3, 3));
+    assertTrue(mirror.write(32, 2, 0, 0, 0, 2, 2, 2,
+        ByteBuffer.allocate(16)));
+    IrisGlTextureMirror.TextureSnapshot snapshot = mirror.snapshot(32,
+        mirror.generation(32), 2, 0).orElseThrow();
+    IrisRenderGraph.Resource resource = new IrisRenderGraph.Resource(0,
+        IrisRenderGraph.ResourceKind.TEXTURE, "rgba8-unorm", 1,
+        8, 8, 1, 3);
+
+    assertEquals(2, snapshot.mipLevel());
+    assertEquals(2, snapshot.width());
+    assertEquals(2, snapshot.height());
+    assertTrue(IrisMetalGraphFramePlanner.initialTextureSnapshotCompatible(
+        snapshot, resource));
+  }
+
+  @Test
+  void rejectsInitialSnapshotWithWrongMipExtent() {
+    IrisGlTextureMirror.TextureSnapshot snapshot =
+        IrisGlTextureMirror.TextureSnapshot.fromReadback(33, 7,
+            new IrisGlTextureMirror.TextureMetadata(
+                "rgba8-unorm", 3, 3, 1, 4, 7), 0, 2,
+            new byte[36]);
+    IrisRenderGraph.Resource resource = new IrisRenderGraph.Resource(0,
+        IrisRenderGraph.ResourceKind.TEXTURE, "rgba8-unorm", 1,
+        8, 8, 1, 3);
+
+    assertFalse(IrisMetalGraphFramePlanner.initialTextureSnapshotCompatible(
         snapshot, resource));
   }
 
@@ -68,6 +123,17 @@ final class IrisMetalGraphFramePlannerTest {
         texture, Set.of(713)));
     assertTrue(IrisMetalGraphFramePlanner.initialTextureSnapshotRequired(
         texture, Set.of(724)));
+  }
+
+  @Test
+  void requiresInitialSnapshotForReflectedStorageImageTexture() {
+    ResourceHandle texture = new ResourceHandle(ResourceKind.TEXTURE,
+        724, 3, 9);
+
+    assertTrue(IrisMetalGraphFramePlanner.initialTextureSnapshotRequired(
+        texture, Set.of(), Set.of(724)));
+    assertFalse(IrisMetalGraphFramePlanner.initialTextureSnapshotRequired(
+        texture, Set.of(713), Set.of(713)));
   }
 
   @Test
@@ -204,4 +270,23 @@ final class IrisMetalGraphFramePlannerTest {
     assertEquals("graph-frame-transfer-source-uninitialized",
         unsupported.reason());
   }
+  private static IrisRenderExecutionPlan graphOnlyPlan(
+      List<IrisRenderGraph.Resource> resources) {
+    ResourceHandle handle = new ResourceHandle(ResourceKind.TEXTURE,
+        9001, 1, 1);
+    IrisRenderGraph.ResourceUse write = new IrisRenderGraph.ResourceUse(0,
+        IrisRenderGraph.Access.WRITE);
+    IrisRenderGraph.Node node = new IrisRenderGraph.Node(0,
+        IrisRenderGraph.NodeKind.CLEAR, IrisRenderGraph.Phase.FINAL,
+        "0".repeat(64), "0".repeat(64), 0, List.of(write));
+    IrisRenderGraph graph = new IrisRenderGraph(resources,
+        List.of(node), List.of());
+    return new IrisRenderExecutionPlan(graph,
+        List.of(new IrisRenderExecutionPlan.ClearStep(0, 0,
+            IrisRenderGraph.Phase.FINAL,
+            IrisClearCommand.colorFloat(handle, 0,
+                0.0F, 0.0F, 0.0F, 1.0F, Optional.empty()),
+            List.of(write))));
+  }
+
 }

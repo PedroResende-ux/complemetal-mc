@@ -49,7 +49,7 @@ import org.lwjgl.util.spvc.SpvcMslShaderInterfaceVar2;
 import org.lwjgl.util.spvc.SpvcReflectedResource;
 
 /**
- * Preferred in-process translator using Minecraft 26.2's LWJGL 3.4.1
+ * Preferred in-process translator using Minecraft 1.21.1's LWJGL 3.3.3
  * shaderc and SPIRV-Cross bindings.
  *
  * <p>The default factory is execution-disabled. Enabling requires constructing
@@ -58,7 +58,7 @@ import org.lwjgl.util.spvc.SpvcReflectedResource;
  */
 public final class LwjglShadercSpvcBackend
     implements IrisShaderTranslatorBackend {
-  public static final String BACKEND_ID = "lwjgl-shaderc-spvc-3.4.1";
+  public static final String BACKEND_ID = "lwjgl-shaderc-spvc-3.3.3";
   private static final String SHADERC_CLASS =
       "org.lwjgl.util.shaderc.Shaderc";
   private static final String SPVC_CLASS = "org.lwjgl.util.spvc.Spvc";
@@ -83,7 +83,7 @@ public final class LwjglShadercSpvcBackend
 
   @Override
   public IrisTranslationProfile profile() {
-    return IrisTranslationProfile.LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS;
+    return IrisTranslationProfile.LWJGL_3_3_3_METAL_3_ARGUMENT_BUFFERS;
   }
 
   @Override

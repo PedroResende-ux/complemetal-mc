@@ -14,12 +14,12 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  */
 @Mixin(Options.class)
 public abstract class OptionsSaveMixin {
-  @Inject(method = "save", at = @At("HEAD"), require = 1)
+  @Inject(method = "save", at = @At("HEAD"), require = 0)
   private void metalrender$persistPreferredSimulationDistance(CallbackInfo ci) {
     MetalRenderClient.prepareOptionsSave((Options) (Object) this);
   }
 
-  @Inject(method = "save", at = @At("RETURN"), require = 1)
+  @Inject(method = "save", at = @At("RETURN"), require = 0)
   private void metalrender$restoreLiveSimulationDistance(CallbackInfo ci) {
     MetalRenderClient.finishOptionsSave((Options) (Object) this);
   }

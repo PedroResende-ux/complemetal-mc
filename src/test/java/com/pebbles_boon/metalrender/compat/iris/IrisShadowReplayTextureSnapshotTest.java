@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingSnapshot.ImageUnitBinding;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingSnapshot.TextureUnitBinding;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingSnapshot.TextureBufferBinding;
 import java.nio.ByteBuffer;
@@ -111,6 +112,34 @@ final class IrisShadowReplayTextureSnapshotTest {
     assertFalse(IrisShadowReplayTextureSnapshot.upgradeRetainedResident(
         retained, 24, inline, inline, wrongGeneration));
     assertEquals(inline, retained.get(24));
+  }
+
+  @Test
+  void rejectsSameTextureReferencedAtDifferentSamplerAndImageSubresources() {
+    IrisGlTextureMirror mirror = new IrisGlTextureMirror(4, 256, 128);
+    assertTrue(mirror.define(25, "rgba8-unorm", 4, 4, 1, 2, 4));
+    byte[] level0 = new byte[64];
+    byte[] level1 = new byte[16];
+    assertTrue(mirror.write(25, 0, 0, 0, 0, 4, 4, 4,
+        ByteBuffer.wrap(level0)));
+    assertTrue(mirror.write(25, 1, 0, 0, 0, 2, 2, 2,
+        ByteBuffer.wrap(level1)));
+    long generation = mirror.generation(25);
+
+    IrisGlResourceBindingSnapshot resources =
+        new IrisGlResourceBindingSnapshot(1,
+            Map.of(), Map.of(), Map.of(), Map.of(),
+            Map.of(0, new TextureUnitBinding(0x0DE1, 25, 0, generation)),
+            Map.of(), Map.of(0, new ImageUnitBinding(
+                25, 1, false, 0, 0x88B8, 0x8058, generation)),
+            Map.of());
+
+    IrisShadowReplayTextureSnapshot snapshot =
+        IrisShadowReplayTextureSnapshot.capture(resources, mirror);
+
+    assertFalse(snapshot.complete());
+    assertTrue(snapshot.blockers().contains(
+        "mixed-texture-subresource-snapshot-unavailable"));
   }
 
   @Test

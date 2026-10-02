@@ -4,6 +4,12 @@
 
 # Complemetal
 
+> **Development branch note — `neoforge-1.21.1-port`**
+>
+> This branch is the active Minecraft 1.21.1 NeoForge port. It targets NeoForge 21.1.252, Sodium 0.6.13, Iris 1.8.12, and Java 21 on Apple Silicon. The stable-release documentation below describes the upstream 0.4.1 Fabric/Minecraft 26.2 release and is retained for project lineage; the branch-specific build and verification instructions later in this file apply to this port.
+>
+> The port keeps the native Metal runtime and experimental Iris translation/Metal 4 graph work behind validation and fail-open gates. A failed Metal or Iris integration must leave the vanilla/Iris OpenGL path usable.
+
 [GitHub release](https://github.com/daniiarkg/complemetal-mc/releases/tag/v0.4.1%2Bmc26.2)
 · [Modrinth](https://modrinth.com/mod/complemetal)
 · [Architecture graphs](docs/ARCHITECTURE_GRAPH.md)
@@ -147,6 +153,62 @@ Development checks:
   testExactJarQaValidators
 ./gradlew --no-daemon runClientGameTest
 ```
+
+### NeoForge 1.21.1 Iris development branch
+
+The `neoforge-1.21.1-port` branch targets Minecraft 1.21.1 with NeoForge
+21.1.252, Sodium 0.6.13, and Iris 1.8.12. Its Iris mixin configuration now
+registers the 1.21.1 Sodium terrain-program hook together with the OpenGL
+state/resource interception layer used by the experimental Metal graph.
+
+For a reproducible local graph-validation run, use:
+
+```bash
+./gradlew --no-daemon -PirisGraph runClient
+```
+
+For the Complementary Reimagined target workload, the acceptance baseline is
+**Complementary Reimagined r5.2.2**, the release explicitly listed for Minecraft
+1.21–1.21.1. The same validated experimental path is available through a
+dedicated shortcut:
+
+```bash
+./gradlew --no-daemon -Pcomplementary runClient
+```
+
+This profile enables capture, GLSL -> SPIR-V -> MSL translation, Metal pipeline
+compilation, resource mirroring, parity capture, and graph execution. It does
+**not** enable automatic Metal ownership; Iris/OpenGL remains the visible
+fallback until the parity/ownership gates are satisfied.
+
+The translator acceptance smoke includes a Complementary-style workload covering
+legacy GLSL compatibility syntax, interpolated varyings, framebuffer MRT output,
+texture fetch/LOD and derivative operations, and shader image access. Run it on
+an Apple Silicon macOS environment with the LWJGL shaderc/SPIRV-Cross natives
+available:
+
+```bash
+METALRENDER_IRIS_TRANSLATION_SMOKE=1   ./gradlew --no-daemon test   --tests '*.IrisInProcessTranslationSmokeTest'
+```
+
+This enables shader capture/translation, Metal pipeline compilation, resource
+mirroring, visual-parity capture, and Metal graph execution while keeping
+full-frame OpenGL ownership disabled. To test the subsequent ownership gate:
+
+```bash
+./gradlew --no-daemon -PirisGraphOwnership runClient
+```
+
+`irisGraphOwnership` implies the graph prerequisites but does not bypass the
+runtime validation gate. Until the graph has established its required parity
+state, Iris/OpenGL remains the visible owner.
+
+A lighter shader-capture run remains available with:
+
+```bash
+./gradlew --no-daemon -PirisCapture runClient
+```
+
 
 Publishable native release build:
 

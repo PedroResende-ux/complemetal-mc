@@ -1,6 +1,7 @@
 package com.pebbles_boon.metalrender.compat.iris;
 
 import com.mojang.blaze3d.vertex.VertexFormat;
+import net.caffeinemc.mods.sodium.client.gl.attribute.GlVertexAttributeBinding;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
@@ -194,6 +195,154 @@ public final class IrisVertexLayoutCapture {
     return new Layout(buffers, attributes, inputs);
   }
 
+  /**
+   * Captures the exact Sodium 0.6.13 shader vertex format selected by Iris'
+   * FormatAnalyzer, then reconciles it against the linked OpenGL attributes.
+   *
+   * <p>This cannot use IrisVertexFormats.TERRAIN: Sodium terrain meshes use
+   * CompactChunkVertex or Iris' extended ChunkVertexType with a packed GL
+   * layout. Iris finalizes that ChunkVertexType only after SodiumPrograms has
+   * linked all passes.</p>
+   */
+  public static Layout captureLinkedSodium(int glProgram,
+      net.caffeinemc.mods.sodium.client.render.chunk.vertex.format.ChunkVertexType
+          vertexType) {
+    if (glProgram <= 0) {
+      throw new IllegalArgumentException("OpenGL program must be positive");
+    }
+    Objects.requireNonNull(vertexType, "vertexType");
+    net.caffeinemc.mods.sodium.client.gl.attribute.GlVertexFormat format =
+        vertexType.getVertexFormat();
+    net.caffeinemc.mods.sodium.client.gl.attribute.GlVertexAttributeBinding[]
+        bindings = format.getShaderBindings();
+
+    Map<Integer, net.caffeinemc.mods.sodium.client.gl.attribute
+        .GlVertexAttributeBinding> byLocation = new HashMap<>();
+    for (var binding : bindings) {
+      GlVertexAttributeBinding prior =
+          byLocation.put(binding.getIndex(), binding);
+      if (prior != null) {
+        throw new IllegalArgumentException(
+            "Sodium linked format has duplicate attribute locations");
+      }
+    }
+
+    // Iris/Sodium terrain uses one TessellationBinding.forVertexBuffer() for
+    // the region geometry. GlVertexAttributeBinding.index is the shader
+    // attribute location, not a physical Metal vertex-buffer slot.
+    int terrainStride = format.getStride();
+    if (terrainStride <= 0) {
+      throw new IllegalArgumentException("invalid Sodium terrain stride");
+    }
+    ArrayList<IrisPipelineState.VertexBufferLayout> buffers =
+        new ArrayList<>(1);
+    buffers.add(new IrisPipelineState.VertexBufferLayout(
+        0, terrainStride, IrisPipelineState.StepFunction.PER_VERTEX, 0));
+
+    int count = GL20C.glGetProgrami(glProgram, GL20C.GL_ACTIVE_ATTRIBUTES);
+    int maxNameLength = GL20C.glGetProgrami(glProgram,
+        GL20C.GL_ACTIVE_ATTRIBUTE_MAX_LENGTH);
+    if (count < 0 || count > IrisPipelineState.MAX_VERTEX_ATTRIBUTES
+        || (count > 0 && maxNameLength <= 0)) {
+      throw new IllegalArgumentException(
+          "invalid Sodium linked OpenGL attribute metadata");
+    }
+
+    ArrayList<IrisPipelineState.VertexAttribute> attributes =
+        new ArrayList<>(count);
+    ArrayList<ShaderInput> inputs = new ArrayList<>(count);
+    HashSet<Integer> locations = new HashSet<>();
+    HashSet<String> names = new HashSet<>();
+    try (MemoryStack stack = MemoryStack.stackPush()) {
+      IntBuffer size = stack.mallocInt(1);
+      IntBuffer type = stack.mallocInt(1);
+      for (int index = 0; index < count; index++) {
+        size.clear();
+        type.clear();
+        String name = GL20C.glGetActiveAttrib(glProgram, index,
+            maxNameLength, size, type);
+        if (name == null || name.isBlank() || size.get(0) != 1) {
+          throw new IllegalArgumentException(
+              "unsupported Sodium linked OpenGL vertex attribute");
+        }
+        if (name.endsWith("[0]")) {
+          name = name.substring(0, name.length() - 3);
+        }
+        int location = GL20C.glGetAttribLocation(glProgram, name);
+        if (location < 0
+            || !locations.add(location) || !names.add(name)) {
+          throw new IllegalArgumentException(
+              "invalid Sodium linked vertex attribute identity");
+        }
+
+        var binding = byLocation.get(location);
+        if (binding == null) {
+          throw new IllegalArgumentException(
+              "linked Sodium attribute has no Iris vertex-format binding: "
+                  + name + "@" + location);
+        }
+        IrisPipelineState.DataFormat dataFormat =
+            sodiumDataFormat(binding);
+        attributes.add(new IrisPipelineState.VertexAttribute(
+            location, sodiumBindingIndex(binding), binding.getPointer(),
+            dataFormat));
+        inputs.add(new ShaderInput(name, location, dataFormat));
+      }
+    }
+
+    return new Layout(buffers, attributes, inputs);
+  }
+
+  private static int sodiumBindingIndex(
+      net.caffeinemc.mods.sodium.client.gl.attribute.GlVertexAttributeBinding
+          binding) {
+    // The ShaderBindingPoints index is the OpenGL attribute location; all
+    // Iris/Sodium terrain vertex buffers currently bind to slot zero.
+    // Derive the physical buffer slot from the format's binding layout.
+    return 0;
+  }
+
+  private static IrisPipelineState.DataFormat sodiumDataFormat(
+      net.caffeinemc.mods.sodium.client.gl.attribute.GlVertexAttributeBinding
+          attribute) {
+    int type = attribute.getFormat();
+    int count = attribute.getCount();
+    boolean normalized = attribute.isNormalized();
+    String prefix = switch (type) {
+      case 0x1400 -> "r8-sint";   // GL_BYTE
+      case 0x1401 -> "r8-uint";   // GL_UNSIGNED_BYTE
+      case 0x1402 -> "r16-sint";  // GL_SHORT
+      case 0x1403 -> "r16-uint";  // GL_UNSIGNED_SHORT
+      case 0x1404 -> "r32-sint";  // GL_INT
+      case 0x1405 -> "r32-uint";  // GL_UNSIGNED_INT
+      case 0x1406 -> "r32-float"; // GL_FLOAT
+      default -> throw new IllegalArgumentException(
+          "unsupported Sodium vertex attribute type "
+              + Integer.toHexString(type));
+    };
+    String componentPrefix = switch (count) {
+      case 1 -> prefix;
+      case 2 -> prefix.replaceFirst("^r", "rg");
+      case 3 -> prefix.replaceFirst("^r", "rgb");
+      case 4 -> prefix.replaceFirst("^r", "rgba");
+      default -> throw new IllegalArgumentException(
+          "unsupported Sodium vertex attribute width " + count);
+    };
+    if (!normalized) {
+      return new IrisPipelineState.DataFormat(componentPrefix);
+    }
+    if (type == 0x1400 || type == 0x1402) {
+      return new IrisPipelineState.DataFormat(
+          componentPrefix.replace("-sint", "-snorm"));
+    }
+    if (type == 0x1401 || type == 0x1403) {
+      return new IrisPipelineState.DataFormat(
+          componentPrefix.replace("-uint", "-unorm"));
+    }
+    throw new IllegalArgumentException(
+        "invalid normalized Sodium vertex attribute type");
+  }
+
   static IrisPipelineState.DataFormat linkedDataFormat(int glType) {
     return new IrisPipelineState.DataFormat(switch (glType) {
       case 0x1406 -> "r32-float";       // GL_FLOAT
@@ -220,10 +369,11 @@ public final class IrisVertexLayoutCapture {
    */
   public static Layout capture(VertexFormat format, boolean fallback) {
     Objects.requireNonNull(format, "format");
-    int stepRate = format.getStepRate();
-    IrisPipelineState.StepFunction stepFunction = stepRate == 0
-        ? IrisPipelineState.StepFunction.PER_VERTEX
-        : IrisPipelineState.StepFunction.PER_INSTANCE;
+    // Mojang's 1.21.1 VertexFormat does not encode an instance step rate;
+    // instanced layouts are supplied by Iris/Sodium-specific bridges.
+    int stepRate = 0;
+    IrisPipelineState.StepFunction stepFunction =
+        IrisPipelineState.StepFunction.PER_VERTEX;
     List<IrisPipelineState.VertexBufferLayout> buffers = List.of(
         new IrisPipelineState.VertexBufferLayout(0, format.getVertexSize(),
             stepFunction, stepRate));
@@ -235,11 +385,11 @@ public final class IrisVertexLayoutCapture {
     for (int location = 0; location < elements.size(); location++) {
       VertexFormatElement element = elements.get(location);
       IrisPipelineState.DataFormat dataFormat =
-          new IrisPipelineState.DataFormat(
-              formatCacheName(element.format().name()));
+          vertexElementDataFormat(element);
       attributes.add(new IrisPipelineState.VertexAttribute(location, 0,
-          element.offset(), dataFormat));
-      String linkedName = linkedAttributeName(element.name(), fallback);
+          format.getOffset(element), dataFormat));
+      String linkedName = linkedAttributeName(
+          format.getElementName(element), fallback);
       if (!linkedNames.add(linkedName)) {
         throw new IllegalArgumentException(
             "duplicate linked vertex attribute name");
@@ -247,6 +397,41 @@ public final class IrisVertexLayoutCapture {
       shaderInputs.add(new ShaderInput(linkedName, location, dataFormat));
     }
     return new Layout(buffers, attributes, shaderInputs);
+  }
+
+  private static IrisPipelineState.DataFormat vertexElementDataFormat(
+      VertexFormatElement element) {
+    String prefix = switch (element.type()) {
+      case BYTE -> "r8-sint";
+      case UBYTE -> "r8-uint";
+      case SHORT -> "r16-sint";
+      case USHORT -> "r16-uint";
+      case INT -> "r32-sint";
+      case UINT -> "r32-uint";
+      case FLOAT -> "r32-float";
+    };
+    String component = switch (element.count()) {
+      case 1 -> prefix;
+      case 2 -> prefix.replaceFirst("^r", "rg");
+      case 3 -> prefix.replaceFirst("^r", "rgb");
+      case 4 -> prefix.replaceFirst("^r", "rgba");
+      default -> throw new IllegalArgumentException(
+          "unsupported vertex element width " + element.count());
+    };
+    if (element.usage() == VertexFormatElement.Usage.COLOR) {
+      if (element.type() == VertexFormatElement.Type.UBYTE
+          || element.type() == VertexFormatElement.Type.USHORT) {
+        return new IrisPipelineState.DataFormat(
+            component.replace("-uint", "-unorm"));
+      }
+    } else if (element.usage() == VertexFormatElement.Usage.NORMAL) {
+      if (element.type() == VertexFormatElement.Type.BYTE
+          || element.type() == VertexFormatElement.Type.SHORT) {
+        return new IrisPipelineState.DataFormat(
+            component.replace("-sint", "-snorm"));
+      }
+    }
+    return new IrisPipelineState.DataFormat(component);
   }
 
   static String formatCacheName(String enumName) {

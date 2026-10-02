@@ -44,6 +44,7 @@ public final class IrisGlResourceBindingTracker {
   public synchronized void initializeOpenGlDefaults() {
     currentProgram = 0;
     activeTextureUnit = 0;
+    programs.clear();
     textureUnits.clear();
     textureBuffers.clear();
     imageUnits.clear();
@@ -228,6 +229,18 @@ public final class IrisGlResourceBindingTracker {
         .sampler = sampler;
   }
 
+  /** Mirrors glDeleteSamplers unbinding them from every texture unit. */
+  public synchronized void deleteSampler(int sampler) {
+    if (sampler <= 0) {
+      return;
+    }
+    for (MutableTextureUnit unit : textureUnits.values()) {
+      if (unit.sampler == sampler) {
+        unit.sampler = 0;
+      }
+    }
+  }
+
   /** Mirrors glDeleteTextures unbinding and prevents reused names leaking. */
   public synchronized void deleteTexture(int texture) {
     if (texture <= 0) {
@@ -239,6 +252,17 @@ public final class IrisGlResourceBindingTracker {
     textureBuffers.remove(texture);
     imageUnits.entrySet().removeIf(
         entry -> entry.getValue().texture() == texture);
+  }
+
+  /** Mirrors deletion of a GL buffer from every indexed binding table. */
+  public synchronized void deleteBuffer(int buffer) {
+    if (buffer <= 0) {
+      return;
+    }
+    indexedBuffers.entrySet().removeIf(
+        entry -> entry.getValue().buffer() == buffer);
+    textureBuffers.entrySet().removeIf(
+        entry -> entry.getValue().buffer() == buffer);
   }
 
   public synchronized TextureUnitBinding activeTextureBinding() {

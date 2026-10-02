@@ -1,6 +1,9 @@
+// 1.21.1 port: native Metal/Iris compile gates run on macOS arm64 CI.
 plugins {
-    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+    id 'java-library'
     id 'maven-publish'
+    id 'net.neoforged.moddev' version '2.0.148'
+    id 'idea'
 }
 
 group = project.maven_group
@@ -11,17 +14,13 @@ base {
 }
 
 java {
-    toolchain.languageVersion = JavaLanguageVersion.of(25)
-    sourceCompatibility = JavaVersion.VERSION_25
-    targetCompatibility = JavaVersion.VERSION_25
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
     withSourcesJar()
 }
 
 repositories {
-    maven {
-        name = "Fabric"
-        url = "https://maven.fabricmc.net/"
-    }
     mavenCentral()
     maven {
         name = "Modrinth"
@@ -29,108 +28,90 @@ repositories {
     }
 }
 
+configurations {
+    runtimeClasspath.extendsFrom localRuntime
+}
+
 dependencies {
-    minecraft "com.mojang:minecraft:${minecraft_version}"
-    implementation "net.fabricmc:fabric-loader:${loader_version}"
-    implementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
+    implementation "net.neoforged:neoforge:${neoforge_version}"
+    // Minecraft 1.21.1 ships LWJGL 3.3.3. Keep the optional in-process
+    // shader translation bindings on the same ABI as the game.
+    compileOnly "org.lwjgl:lwjgl-shaderc:3.3.3"
+    compileOnly "org.lwjgl:lwjgl-spvc:3.3.3"
+    localRuntime "org.lwjgl:lwjgl-shaderc:3.3.3"
+    localRuntime "org.lwjgl:lwjgl-spvc:3.3.3"
+    localRuntime "org.lwjgl:lwjgl-shaderc:3.3.3:natives-macos-arm64"
+    localRuntime "org.lwjgl:lwjgl-spvc:3.3.3:natives-macos-arm64"
     compileOnly "maven.modrinth:sodium:${sodium_version}"
+    compileOnly "maven.modrinth:iris:${iris_version}"
+    localRuntime "maven.modrinth:sodium:${sodium_version}"
+    localRuntime "maven.modrinth:iris:${iris_version}"
 
     testImplementation platform("org.junit:junit-bom:${junit_version}")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
 
-loom {
-    splitEnvironmentSourceSets()
+sourceSets.main.java.srcDir("src/client/java")
 
-    mods {
-        "complemetal" {
-            sourceSet sourceSets.main
-            sourceSet sourceSets.client
-        }
-    }
+neoForge {
+    version = project.neoforge_version
+    validateAccessTransformers = true
 
     runs {
         client {
             client()
-            source sourceSets.client
-            vmArg "-Djava.library.path=${projectDir}/src/main/resources"
-            vmArg "--enable-native-access=ALL-UNNAMED"
-            if (project.hasProperty('zgc')) {
-                vmArg "-XX:+UseZGC"
-            } else {
-                vmArg "-XX:+UseG1GC"
+            systemProperty 'neoforge.enabledGameTestNamespaces', 'complemetal'
+            jvmArgument "-Djava.library.path=" + projectDir + "/src/main/resources"
+            jvmArgument "--enable-native-access=ALL-UNNAMED"
+            if (project.hasProperty('irisCapture')) {
+                jvmArgument "-Dmetalrender.experimental.irisMetalPipeline=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalTranslation=true"
             }
-            vmArg "-Xmx8g"
-            vmArg "-Xms2g"
-            vmArg "-XX:+AlwaysPreTouch"
-            
-            if (project.hasProperty('gl2metal')) {
-                vmArg "-Dmetalrender.gl2metal=true"
+            if (project.hasProperty('irisGraph')
+                || project.hasProperty('irisGraphOwnership')
+                || project.hasProperty('complementary')) {
+                jvmArgument "-Dmetalrender.experimental.irisMetalPipeline=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalTranslation=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalLibraryValidation=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalPipelineCompilation=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalShadowReplay=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalVisualParity=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalFinalCutover=false"
+                jvmArgument "-Dmetalrender.experimental.irisMetalGraphResources=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalGraphExecution=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalGraphOwnership=false"
             }
-            
-            ['state', 'drawcalls', 'buffers', 'textures', 'shaders', 'fbos', 'vaos', 'debug'].each { category ->
-                if (project.hasProperty("gl2metal.${category}")) {
-                    vmArg "-Dmetalrender.gl2metal.${category}=true"
-                }
+            if (project.hasProperty('irisGraphOwnership')) {
+                jvmArgument "-Dmetalrender.experimental.irisMetalGraphOwnership=true"
             }
+            jvmArgument "-Xmx8g"
+            jvmArgument "-Xms2g"
+            jvmArgument "-XX:+AlwaysPreTouch"
         }
     }
-}
 
-fabricApi {
-    configureTests {
-        createSourceSet = true
-        modId = "complemetal-tests"
-        enableGameTests = false
-        enableClientGameTests = true
-        clearRunDirectory = true
-        username = "ComplemetalQA"
+    mods {
+        complemetal {
+            sourceSet(sourceSets.main)
+        }
     }
 }
 
 sourceSets {
     test {
-        compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
-        runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
-    }
-    gametest {
-        compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
-        runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
     }
 }
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = "UTF-8"
-    options.release = 25
+    options.release = 21
 }
 
 tasks.withType(Test).configureEach {
     useJUnitPlatform()
-}
-
-tasks.named("runClientGameTest", JavaExec) {
-    def sanitizerRuntime = providers.environmentVariable(
-        "METALRENDER_DYLD_INSERT_LIBRARIES")
-    if (sanitizerRuntime.isPresent()) {
-        environment "DYLD_INSERT_LIBRARIES", sanitizerRuntime.get()
-    }
-    [
-        "metalrender.enabled",
-        "metalrender.feature.metal4",
-        "metalrender.gametest.baseline",
-        "metalrender.gametest.requireRetina",
-        "metalrender.gametest.iconify"
-    ].each { propertyName ->
-        def propertyValue = System.getProperty(propertyName)
-        if (propertyValue != null) {
-            systemProperty propertyName, propertyValue
-        }
-    }
-}
-
-tasks.named("compileTestJava") {
-    dependsOn tasks.named("compileClientJava")
 }
 
 tasks.withType(AbstractArchiveTask).configureEach {
@@ -142,7 +123,7 @@ processResources {
     inputs.property "version", project.version
     exclude "libmetalrender_debug_v2.dylib"
 
-    filesMatching("fabric.mod.json") {
+    filesMatching("META-INF/neoforge.mods.toml") {
         expand "version": project.version
     }
 }

@@ -1,6 +1,5 @@
 package com.pebbles_boon.metalrender.display;
 
-import com.mojang.blaze3d.platform.Monitor;
 import com.mojang.blaze3d.platform.Window;
 import com.pebbles_boon.metalrender.sodium.mixins.accessor.WindowAccessor;
 import java.nio.FloatBuffer;
@@ -159,7 +158,7 @@ public final class DisplayLifecycleTracker {
   }
 
   private static DisplayState capture(Window window) {
-    long handle = window.handle();
+    long handle = ((WindowAccessor) (Object) window).metalrender$getWindowHandle();
     float scaleX = 1.0F;
     float scaleY = 1.0F;
     if (handle != 0) {
@@ -175,13 +174,14 @@ public final class DisplayLifecycleTracker {
         }
       }
     }
-    Monitor monitor = window.findBestMonitor();
-    long monitorHandle = monitor == null ? 0 : monitor.monitor();
+    long monitorHandle = handle == 0 ? 0 : GLFW.glfwGetWindowMonitor(handle);
     String monitorName = boundedMonitorName(
-        monitor == null ? "unavailable" : monitor.monitorName());
+        monitorHandle == 0 ? "windowed" : GLFW.glfwGetMonitorName(monitorHandle));
     int refreshRate = window.getRefreshRate();
-    if (refreshRate <= 0 && monitor != null && monitor.currentMode() != null) {
-      refreshRate = monitor.currentMode().getRefreshRate();
+    GLFWVidMode currentMode = monitorHandle == 0
+        ? null : GLFW.glfwGetVideoMode(monitorHandle);
+    if (refreshRate <= 0 && currentMode != null) {
+      refreshRate = currentMode.refreshRate();
     }
     boolean visible = handle != 0
         && GLFW.glfwGetWindowAttrib(handle, GLFW.GLFW_VISIBLE)
@@ -193,14 +193,17 @@ public final class DisplayLifecycleTracker {
         monitorHandle, monitorName, window.getX(), window.getY(),
         window.getScreenWidth(), window.getScreenHeight(), window.getWidth(),
         window.getHeight(), scaleX, scaleY, Math.max(0, refreshRate),
-        window.isFullscreen(), visible, window.isIconified(),
-        window.isFocused());
+        window.isFullscreen(), visible,
+        handle != 0 && GLFW.glfwGetWindowAttrib(handle, GLFW.GLFW_ICONIFIED)
+            == GLFW.GLFW_TRUE,
+        handle != 0 && GLFW.glfwGetWindowAttrib(handle, GLFW.GLFW_FOCUSED)
+            == GLFW.GLFW_TRUE);
   }
 
   /** Repairs missed GLFW window/backing callbacks before lifecycle analysis. */
   public static boolean synchronizeWindowGeometry(Window window) {
     Objects.requireNonNull(window, "window");
-    long handle = window.handle();
+    long handle = ((WindowAccessor) (Object) window).metalrender$getWindowHandle();
     if (handle == 0) {
       return false;
     }

@@ -28,7 +28,7 @@ tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/metalrender-smoke.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 mkdir -p "$tmp_dir/classes" "$tmp_dir/empty-native-path" "$tmp_dir/home"
 
-javac --release 25 \
+javac --release 21 \
   -cp "$jar_path" \
   -d "$tmp_dir/classes" \
   "$project_dir/scripts/ReleasePayloadSmoke.java"

@@ -1,7 +1,7 @@
 package com.pebbles_boon.metalrender.compat.iris.mixin;
 
-import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import com.mojang.blaze3d.vertex.VertexFormatElement;
 import com.pebbles_boon.metalrender.compat.iris.IrisPipelineStateCapture;
 import com.pebbles_boon.metalrender.compat.iris.IrisShaderCapture;
 import org.spongepowered.asm.mixin.Final;
@@ -19,8 +19,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  *
  * <p>Iris links this program directly with LWJGL, bypassing both
  * {@code ShaderCreator.link} and {@code ProgramBuilder}. The vertex layout
- * below is the exact interleaved DH 3.2.0 terrain ABI: u16x4 position at byte
- * 0, normalized u8x4 color at byte 8, and u8x4 Iris metadata at byte 12.</p>
+ * below matches the interleaved LOD attributes that Iris binds for its
+ * 1.21.1 Distant Horizons terrain program: u16x4 position at byte 0,
+ * normalized u8x4 color at byte 8, and u8x4 Iris metadata at byte 12.</p>
  */
 @Pseudo
 @Mixin(targets = "net.irisshaders.iris.compat.dh.IrisLodRenderProgram",
@@ -28,11 +29,25 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class IrisDhLodRenderProgramMixin {
   @Unique
   private static final VertexFormat METALRENDER_DH_LOD_VERTEX_FORMAT =
-      VertexFormat.builder(0)
-          .addAttribute("vPosition", GpuFormat.RGBA16_UINT)
-          .addAttribute("iris_color", GpuFormat.RGBA8_UNORM)
-          .addAttribute("irisExtra", GpuFormat.RGBA8_UINT)
+      VertexFormat.builder()
+          .add("vPosition", metalrender$element(
+              VertexFormatElement.Type.USHORT,
+              VertexFormatElement.Usage.POSITION, 4))
+          .add("iris_color", metalrender$element(
+              VertexFormatElement.Type.UBYTE,
+              VertexFormatElement.Usage.COLOR, 4))
+          .add("irisExtra", metalrender$element(
+              VertexFormatElement.Type.UBYTE,
+              VertexFormatElement.Usage.GENERIC, 4))
           .build();
+
+  @Unique
+  private static VertexFormatElement metalrender$element(
+      VertexFormatElement.Type type, VertexFormatElement.Usage usage,
+      int count) {
+    return VertexFormatElement.register(
+        VertexFormatElement.findNextId(), 0, type, usage, count);
+  }
 
   @Shadow
   @Final

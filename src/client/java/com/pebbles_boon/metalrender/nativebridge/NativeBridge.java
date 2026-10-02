@@ -282,7 +282,7 @@ public final class NativeBridge {
   private static String implementationVersion() {
     String version = NativeBridge.class.getPackage().getImplementationVersion();
     if (version == null || version.isBlank()) {
-      version = fabricMetadataVersion();
+      version = neoforgeMetadataVersion();
     }
     if (version == null || version.isBlank()) {
       version = System.getProperty("metalrender.version", "development");
@@ -291,44 +291,28 @@ public final class NativeBridge {
   }
 
   /**
-   * Fabric's Knot class loader does not always expose JAR package manifest
-   * attributes through {@link Package}. Resolve the same version from loader
-   * metadata without adding a hard Fabric runtime dependency to the standalone
-   * packaged-payload smoke test.
+   * NeoForge does not always expose JAR package manifest attributes through
+   * {@link Package}. Resolve the same version from loader metadata without
+   * making the JNI/source-parity task compile against the NeoForge classes.
    */
-  private static String fabricMetadataVersion() {
+  private static String neoforgeMetadataVersion() {
     try {
-      ClassLoader classLoader = NativeBridge.class.getClassLoader();
-      Class<?> loaderType = Class.forName(
-          "net.fabricmc.loader.api.FabricLoader", false, classLoader);
-      Object loader = loaderType.getMethod("getInstance").invoke(null);
-      java.lang.reflect.Method getModContainer = loaderType
-          .getMethod("getModContainer", String.class);
-      Object containerResult = getModContainer.invoke(loader, "complemetal");
-      Optional<?> container = containerResult instanceof Optional<?> optional
-          ? optional : Optional.empty();
-      if (container.isEmpty()) {
-        Object legacyResult = getModContainer.invoke(loader, "metalrender");
-        container = legacyResult instanceof Optional<?> optional
-            ? optional : Optional.empty();
-      }
-      if (container.isEmpty()) {
+      Class<?> modListClass = Class.forName("net.neoforged.fml.ModList");
+      Object modList = modListClass.getMethod("get").invoke(null);
+      Object optionalContainer = modListClass
+          .getMethod("getModContainerById", String.class)
+          .invoke(modList, "complemetal");
+      if (!(optionalContainer instanceof Optional<?> optional)
+          || optional.isEmpty()) {
         return null;
       }
-      Class<?> containerType = Class.forName(
-          "net.fabricmc.loader.api.ModContainer", false, classLoader);
-      Object metadata = containerType.getMethod("getMetadata")
-          .invoke(container.orElseThrow());
-      Class<?> metadataType = Class.forName(
-          "net.fabricmc.loader.api.metadata.ModMetadata", false, classLoader);
-      Object semanticVersion = metadataType.getMethod("getVersion")
-          .invoke(metadata);
-      Class<?> versionType = Class.forName(
-          "net.fabricmc.loader.api.Version", false, classLoader);
-      Object friendly = versionType.getMethod("getFriendlyString")
-          .invoke(semanticVersion);
-      return friendly instanceof String value ? value : null;
-    } catch (ReflectiveOperationException | LinkageError ignored) {
+      Object container = optional.get();
+      Object modInfo = container.getClass().getMethod("getModInfo")
+          .invoke(container);
+      Object version = modInfo.getClass().getMethod("getVersion")
+          .invoke(modInfo);
+      return version == null ? null : version.toString();
+    } catch (Throwable ignored) {
       return null;
     }
   }

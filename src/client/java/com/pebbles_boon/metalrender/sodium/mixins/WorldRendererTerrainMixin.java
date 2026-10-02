@@ -1,51 +1,62 @@
 package com.pebbles_boon.metalrender.sodium.mixins;
 
-import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
-import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
-import com.mojang.blaze3d.textures.GpuSampler;
 import com.pebbles_boon.metalrender.MetalRenderClient;
+import com.pebbles_boon.metalrender.compat.IrisCompatibility;
+import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.render.MetalRenderHookState;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
-import net.minecraft.client.renderer.LevelRenderer;
-import net.minecraft.client.renderer.chunk.ChunkSectionLayerGroup;
-import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
+import net.caffeinemc.mods.sodium.client.gl.device.CommandList;
+import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
+import net.caffeinemc.mods.sodium.client.render.chunk.DefaultChunkRenderer;
+import net.caffeinemc.mods.sodium.client.render.chunk.lists.ChunkRenderListIterable;
+import net.caffeinemc.mods.sodium.client.render.chunk.terrain.TerrainRenderPass;
+import net.caffeinemc.mods.sodium.client.render.viewport.CameraTransform;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-@Mixin(LevelRenderer.class)
-public class WorldRendererTerrainMixin {
-  @WrapOperation(method = "lambda$addMainPass$0", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/chunk/"
-      + "ChunkSectionsToRender;renderGroup(Lnet/minecraft/"
-      + "client/renderer/chunk/ChunkSectionLayerGroup;Lcom/"
-      + "mojang/blaze3d/textures/GpuSampler;)V"), require = 2, allow = 2)
-  private void metalrender$replaceTerrainGroups(ChunkSectionsToRender sections,
-      ChunkSectionLayerGroup group,
-      GpuSampler sampler, Operation<Void> original) {
-    boolean replaceOpaque =
-        group == ChunkSectionLayerGroup.OPAQUE &&
-        MetalRenderHookState.canReplaceTerrain();
-    if (!replaceOpaque) {
-      original.call(sections, group, sampler);
-    }
-    if (group != ChunkSectionLayerGroup.OPAQUE ||
-        !MetalRenderHookState.canPresentFrame()) {
-      return;
-    }
-
+/**
+ * Sodium 0.6.13 / Minecraft 1.21.1 terrain cutover.
+ *
+ * <p>Voxy's 1.21.1 NeoForge integration confirms this exact
+ * DefaultChunkRenderer.render(...) signature for Sodium 0.6.13. Complemetal
+ * keeps its own Metal terrain encoder and suppresses the corresponding Sodium
+ * terrain draw only after that Metal frame has real visible geometry.</p>
+ */
+@Mixin(value = DefaultChunkRenderer.class, remap = false)
+public abstract class WorldRendererTerrainMixin {
+  @Inject(method = "render", at = @At("HEAD"),
+      cancellable = true, require = 0)
+  private void metalrender$replaceSodiumTerrain(
+      ChunkRenderMatrices matrices,
+      CommandList commandList,
+      ChunkRenderListIterable renderLists,
+      TerrainRenderPass renderPass,
+      CameraTransform camera,
+      CallbackInfo ci) {
+    MetalRenderConfig config = MetalRenderClient.getConfig();
     MetalWorldRenderer worldRenderer = MetalRenderClient.getWorldRenderer();
-    if (worldRenderer == null || !worldRenderer.metalActive()) {
+
+    if (config == null
+        || !config.enableFastTerrainReplacement
+        || !MetalRenderClient.isEnabled()
+        || worldRenderer == null
+        || !worldRenderer.metalActive()
+        || worldRenderer.isIrisCompatibilityPaused()
+        || IrisCompatibility.requiresShaderCompatibilityMode()) {
       return;
     }
-    try {
-      if (worldRenderer.forceBlitNow()) {
-        MetalRenderHookState.markPresentationSucceeded();
-      } else {
-        MetalRenderHookState.markPresentationAttemptFailed(
-            "opaque-pass-composite", null);
-      }
-    } catch (Throwable error) {
-      MetalRenderHookState.markPresentationAttemptFailed(
-          "opaque-pass-composite", error);
+
+    if (!MetalRenderHookState.isFramePrepared()
+        || worldRenderer.getLastDrawnChunkCount() <= 0
+        || !MetalRenderHookState.canReplaceTerrainDuringFrame()) {
+      return;
     }
+
+    // Complemetal's native terrain encoder emits the complete visible terrain
+    // set in one Metal pass, including the fluid geometry it has captured.
+    // Leaving any Sodium terrain pass active would double-draw/overdraw it.
+    ci.cancel();
   }
 }

@@ -1856,8 +1856,9 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     if (!pending.replaySamplers().complete()) {
       addDistinct(blockers, "graph-frame-sampler-capture-incomplete");
     }
-    if (!pending.dynamicState().completeFor(
-        IrisGlStateSnapshot.Operation.DRAW)) {
+    IrisGlStateSnapshot.Operation operation =
+        pending.snapshot().operation();
+    if (!pending.dynamicState().completeFor(operation)) {
       addDistinct(blockers, "graph-frame-dynamic-state-incomplete");
     }
     if (!supportedReplayCommand(pending.command())) {
@@ -2710,8 +2711,9 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
       IrisPipelineStateCapture.PendingState pending) {
     Objects.requireNonNull(pending, "pending");
     OwnershipFrame frame = ownershipFrame;
-    if (frame == null || frame.contextGeneration
-        != pipelineStateCapture.tracker().contextGeneration()) {
+    if (frame == null || !renderGraphCapture.hasActiveFrame()
+        || frame.contextGeneration
+            != pipelineStateCapture.tracker().contextGeneration()) {
       return false;
     }
     IrisRenderGraph.Phase phase = IrisRenderGraphCapture.global()
@@ -2797,7 +2799,7 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
 
   private boolean suppressFullGraphOperationInternal() {
     OwnershipFrame frame = ownershipFrame;
-    if (frame == null) {
+    if (frame == null || !renderGraphCapture.hasActiveFrame()) {
       return false;
     }
     frame.commandsSuppressed++;
@@ -2807,11 +2809,16 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
 
   private boolean suppressUnsupportedFullGraphDrawInternal(String reason) {
     OwnershipFrame frame = ownershipFrame;
-    if (frame == null) {
+    if (frame == null || !renderGraphCapture.hasActiveFrame()) {
       return false;
     }
+    String normalized = BoundedReasonSet.normalizeReason(reason);
     frame.degraded = true;
-    frame.lastFailure = BoundedReasonSet.normalizeReason(reason);
+    frame.lastFailure = normalized;
+    // The original GL operation is being suppressed, so the graph being
+    // captured for the following presentation must not be accepted as a
+    // complete replay if this operation had no Metal representation.
+    renderGraphCapture.markUnsupportedFullReplayOperation(normalized);
     frame.commandsSuppressed++;
     fullGraphOwnershipCommandsSuppressed.incrementAndGet();
     return true;
@@ -3483,6 +3490,23 @@ public final class IrisTranslationCoordinator implements AutoCloseable {
     }
     if (command instanceof IrisExecutionCommand.MultiDrawIndexed indexed) {
       return indexed.indexElementBytes() != 1;
+    }
+    if (command instanceof IrisExecutionCommand.IndirectDraw indirect) {
+      if (indirect.primitiveMode() == IrisPrimitiveExpansion.GL_LINE_LOOP
+          || indirect.primitiveMode() == IrisPrimitiveExpansion.GL_TRIANGLE_FAN
+          || indirect.indexElementBytes() == 1) {
+        return false;
+      }
+      return indirect.indexElementBytes() == 0
+          ? indirect.drawCount() == 1
+          : indirect.indexElementBytes() == 2
+              || indirect.indexElementBytes() == 4;
+    }
+    if (command instanceof IrisExecutionCommand.Dispatch dispatch) {
+      return dispatch.groupsX() > 0 && dispatch.groupsY() > 0
+          && dispatch.groupsZ() > 0
+          && dispatch.localSizeX() > 0 && dispatch.localSizeY() > 0
+          && dispatch.localSizeZ() > 0;
     }
     return false;
   }

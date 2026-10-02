@@ -3,6 +3,8 @@ package com.pebbles_boon.metalrender.compat.iris;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -16,7 +18,7 @@ import java.util.TreeSet;
 /** Strict, bounded JNI packet for one offscreen Metal shadow draw. */
 public final class IrisMetalShadowReplayPacketEncoder {
   public static final int MAGIC = 0x4d525837; // MRX8 (stable magic)
-  public static final int SCHEMA = 8;
+  public static final int SCHEMA = 9;
   public static final int MAX_PACKET_BYTES = 384 * 1024 * 1024;
   public static final int MAX_TARGET_EXTENT = 4_096;
 
@@ -107,11 +109,14 @@ public final class IrisMetalShadowReplayPacketEncoder {
         || targetHeight <= 0 || targetHeight > MAX_TARGET_EXTENT) {
       throw new IllegalArgumentException("invalid shadow replay target");
     }
+    boolean compute = vertexLayout.state().pass().kind()
+        == IrisPipelineState.PassKind.COMPUTE;
+    IrisGlStateSnapshot.Operation operation = compute
+        ? IrisGlStateSnapshot.Operation.DISPATCH
+        : IrisGlStateSnapshot.Operation.DRAW;
     if (!buffers.drawComplete() || !textures.captureEnabled()
-        || !arguments.complete()
-        || !dynamic.completeFor(IrisGlStateSnapshot.Operation.DRAW)
-        || vertexLayout.state().pass().kind()
-            == IrisPipelineState.PassKind.COMPUTE) {
+        || !arguments.complete() || !dynamic.completeFor(operation)
+        || compute && !(command instanceof IrisExecutionCommand.Dispatch)) {
       throw new IllegalArgumentException("incomplete shadow replay packet");
     }
     try {
@@ -121,8 +126,8 @@ public final class IrisMetalShadowReplayPacketEncoder {
       out.writeInt(SCHEMA);
       out.writeInt(targetWidth);
       out.writeInt(targetHeight);
-      putDynamic(out, dynamic);
-      putCommand(out, command);
+      putDynamic(out, dynamic, compute);
+      putCommand(out, command, buffers);
       BufferPacketLayout bufferPacket = bufferPacketLayout(buffers,
           arguments);
       putBuffers(out, buffers, vertexLayout, bufferPacket,
@@ -143,7 +148,13 @@ public final class IrisMetalShadowReplayPacketEncoder {
   }
 
   private static void putDynamic(DataOutputStream out,
-      IrisDynamicDrawState dynamic) throws IOException {
+      IrisDynamicDrawState dynamic, boolean compute) throws IOException {
+    if (compute) {
+      putRect(out, new IrisDynamicDrawState.Rect(0, 0, 1, 1));
+      out.writeBoolean(false);
+      putRect(out, new IrisDynamicDrawState.Rect(0, 0, 0, 0));
+      return;
+    }
     putRect(out, dynamic.viewport().value());
     boolean scissor = dynamic.scissorEnabled().value();
     out.writeBoolean(scissor);
@@ -160,7 +171,8 @@ public final class IrisMetalShadowReplayPacketEncoder {
   }
 
   private static void putCommand(DataOutputStream out,
-      IrisExecutionCommand command) throws IOException {
+      IrisExecutionCommand command,
+      IrisShadowReplayBufferSnapshot buffers) throws IOException {
     if (command instanceof IrisExecutionCommand.DrawArrays draw) {
       out.writeInt(1);
       out.writeInt(draw.primitiveMode());
@@ -184,6 +196,16 @@ public final class IrisMetalShadowReplayPacketEncoder {
       out.writeInt(draw.baseInstance());
       return;
     }
+    if (command instanceof IrisExecutionCommand.Dispatch dispatch) {
+      out.writeInt(4);
+      out.writeInt(dispatch.groupsX());
+      out.writeInt(dispatch.groupsY());
+      out.writeInt(dispatch.groupsZ());
+      out.writeInt(dispatch.localSizeX());
+      out.writeInt(dispatch.localSizeY());
+      out.writeInt(dispatch.localSizeZ());
+      return;
+    }
     if (command instanceof IrisExecutionCommand.MultiDrawIndexed draw) {
       if (draw.indexElementBytes() == 1) {
         throw new IllegalArgumentException("uint8 indices need expansion");
@@ -202,7 +224,107 @@ public final class IrisMetalShadowReplayPacketEncoder {
       }
       return;
     }
+    if (command instanceof IrisExecutionCommand.IndirectDraw indirect) {
+      putIndirectCommand(out, indirect, buffers);
+      return;
+    }
     throw new IllegalArgumentException("unsupported shadow draw command");
+  }
+
+  /**
+   * Lowers GL indirect draw arguments into the direct/multi-draw packet ABI.
+   * The replay protocol intentionally has no indirect-buffer execution path,
+   * so the conversion happens from the immutable draw-time CPU snapshot.
+   *
+   * <p>Indexed indirect commands map naturally to MultiDrawIndexed. Array
+   * indirect is representable only for a single command because the packet ABI
+   * has no MultiDrawArrays form.  The native replay ABI also has one common
+   * instance/baseInstance pair for MultiDrawIndexed, so indexed indirect is
+   * accepted only for the ordinary instanceCount=1, baseInstance=0 case.</p>
+   */
+  private static void putIndirectCommand(DataOutputStream out,
+      IrisExecutionCommand.IndirectDraw draw,
+      IrisShadowReplayBufferSnapshot buffers) throws IOException {
+    IrisShadowReplayBufferSnapshot.BufferRef reference = buffers.indirectArguments()
+        .orElseThrow(() -> new IllegalArgumentException(
+            "indirect draw arguments snapshot unavailable"));
+    int imageId = reference.imageId();
+    if (imageId < 0 || imageId >= buffers.images().size()) {
+      throw new IllegalArgumentException("indirect draw arguments image invalid");
+    }
+    IrisShadowReplayBufferSnapshot.BufferImage image = buffers.images().get(imageId);
+    int elementBytes = draw.indexElementBytes();
+    int commandBytes = elementBytes == 0 ? 16 : 20;
+    long requiredBytes = Math.multiplyExact((long) draw.drawCount(),
+        commandBytes);
+    if (image.byteLength() < requiredBytes || image.ownedBytes().length <
+        requiredBytes) {
+      throw new IllegalArgumentException(
+          "indirect draw arguments snapshot truncated");
+    }
+    ByteBuffer data = ByteBuffer.wrap(image.ownedBytes())
+        .order(ByteOrder.LITTLE_ENDIAN);
+
+    if (elementBytes == 0) {
+      if (draw.drawCount() != 1) {
+        throw new IllegalArgumentException(
+            "multi-draw-array indirect lowering unavailable");
+      }
+      int vertexCount = readUnsignedIntAsInt(data, "indirect vertex count");
+      int instanceCount = readUnsignedIntAsInt(data, "indirect instance count");
+      int firstVertex = readUnsignedIntAsInt(data, "indirect first vertex");
+      int baseInstance = readUnsignedIntAsInt(data, "indirect base instance");
+      out.writeInt(1);
+      out.writeInt(draw.primitiveMode());
+      out.writeInt(firstVertex);
+      out.writeInt(vertexCount);
+      out.writeInt(instanceCount);
+      out.writeInt(baseInstance);
+      return;
+    }
+
+    if (elementBytes != 2 && elementBytes != 4) {
+      throw new IllegalArgumentException(
+          "uint8 indices need expansion for indirect draw");
+    }
+
+    long[] offsets = new long[draw.drawCount()];
+    int[] counts = new int[draw.drawCount()];
+    int[] bases = new int[draw.drawCount()];
+    for (int index = 0; index < draw.drawCount(); index++) {
+      int count = readUnsignedIntAsInt(data, "indirect index count");
+      int instanceCount =
+          readUnsignedIntAsInt(data, "indirect instance count");
+      long firstIndex = Integer.toUnsignedLong(data.getInt());
+      int baseVertex = data.getInt();
+      int baseInstance =
+          readUnsignedIntAsInt(data, "indirect base instance");
+      if (instanceCount != 1 || baseInstance != 0) {
+        throw new IllegalArgumentException(
+            "indirect indexed draw needs instanceCount=1 and baseInstance=0");
+      }
+      offsets[index] = Math.multiplyExact(firstIndex, (long) elementBytes);
+      counts[index] = count;
+      bases[index] = baseVertex;
+    }
+
+    out.writeInt(3);
+    out.writeInt(draw.primitiveMode());
+    out.writeInt(elementBytes);
+    out.writeInt(offsets.length);
+    for (int index = 0; index < offsets.length; index++) {
+      out.writeLong(offsets[index]);
+      out.writeInt(counts[index]);
+      out.writeInt(bases[index]);
+    }
+  }
+
+  private static int readUnsignedIntAsInt(ByteBuffer data, String label) {
+    long value = Integer.toUnsignedLong(data.getInt());
+    if (value > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException(label + " exceeds signed packet range");
+    }
+    return (int) value;
   }
 
   private static void putBuffers(DataOutputStream out,
@@ -252,9 +374,15 @@ public final class IrisMetalShadowReplayPacketEncoder {
     arguments.stages().stream()
         .flatMap(stage -> stage.arguments().stream())
         .map(IrisShadowReplayArgumentTable.BoundArgument::value)
-        .filter(IrisShadowReplayArgumentTable.TextureImage.class::isInstance)
-        .map(IrisShadowReplayArgumentTable.TextureImage.class::cast)
-        .map(IrisShadowReplayArgumentTable.TextureImage::glTexture)
+        .flatMap(value -> {
+          if (value instanceof IrisShadowReplayArgumentTable.TextureImage image) {
+            return java.util.stream.Stream.of(image.glTexture());
+          }
+          if (value instanceof IrisShadowReplayArgumentTable.StorageTextureImage image) {
+            return java.util.stream.Stream.of(image.glTexture());
+          }
+          return java.util.stream.Stream.empty();
+        })
         .forEach(requiredNames::add);
     if (!requiredNames.containsAll(externalTextureNames)
         || !requiredNames.containsAll(externalTextureIndices.keySet())) {
@@ -349,6 +477,9 @@ public final class IrisMetalShadowReplayPacketEncoder {
       out.writeInt(image.internalFormat());
     } else if (value instanceof IrisShadowReplayArgumentTable.TextureImage image) {
       out.writeInt(3);
+      out.writeInt(image.glTexture());
+    } else if (value instanceof IrisShadowReplayArgumentTable.StorageTextureImage image) {
+      out.writeInt(8);
       out.writeInt(image.glTexture());
     } else if (value instanceof IrisShadowReplayArgumentTable.CanonicalZeroTexture) {
       out.writeInt(4);

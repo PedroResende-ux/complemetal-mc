@@ -50,6 +50,18 @@ public abstract class IrisRenderSystemMixin {
     IrisRenderGraphCapture.global().legacyClearColor(red, green, blue, alpha);
   }
 
+  @Inject(method = "clearDepth", at = @At("HEAD"), require = 0,
+      remap = false)
+  private static void metalrender$clearDepth(double depth, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().legacyClearDepth(depth);
+  }
+
+  @Inject(method = "clearStencil", at = @At("HEAD"), require = 0,
+      remap = false)
+  private static void metalrender$clearStencil(int stencil, CallbackInfo ci) {
+    IrisRenderGraphCapture.global().legacyClearStencil(stencil);
+  }
+
   @Inject(method = "vertexAttrib4f", at = @At("RETURN"), require = 0,
       remap = false)
   private static void metalrender$genericVertexAttribute(int location,
@@ -70,19 +82,33 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$bufferData(int target, float[] values,
       int usage, CallbackInfo ci) {
     if (!com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
-        .isEnabled() || values == null || values.length == 0
-        || values.length > Integer.MAX_VALUE / Float.BYTES) {
+        .isEnabled()) {
       return;
     }
     int buffer = metalrender$vertices().boundBuffer(target);
+    if (buffer <= 0) {
+      return;
+    }
+    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
+        com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
+    if (values == null || values.length == 0) {
+      mirror.delete(buffer);
+      return;
+    }
+    if (values.length > Integer.MAX_VALUE / Float.BYTES) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-upload-size-invalid");
+      mirror.delete(buffer);
+      return;
+    }
     int bytes = values.length * Float.BYTES;
     ByteBuffer encoded = ByteBuffer.allocate(bytes)
         .order(ByteOrder.nativeOrder());
     encoded.asFloatBuffer().put(values);
-    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
-        com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
-    if (mirror.allocate(buffer, bytes)) {
-      mirror.write(buffer, bytes, 0, bytes, encoded);
+    if (!mirror.allocate(buffer, bytes)
+        || !mirror.write(buffer, bytes, 0, bytes, encoded)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-upload-mirror-rejected");
     }
   }
 
@@ -91,19 +117,33 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$bufferStorage(int target, float[] values,
       int flags, CallbackInfoReturnable<Integer> callback) {
     if (!com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
-        .isEnabled() || values == null || values.length == 0
-        || values.length > Integer.MAX_VALUE / Float.BYTES) {
+        .isEnabled()) {
       return;
     }
     int buffer = callback.getReturnValue();
+    if (buffer <= 0) {
+      return;
+    }
+    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
+        com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
+    if (values == null || values.length == 0) {
+      mirror.delete(buffer);
+      return;
+    }
+    if (values.length > Integer.MAX_VALUE / Float.BYTES) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-storage-size-invalid");
+      mirror.delete(buffer);
+      return;
+    }
     int bytes = values.length * Float.BYTES;
     ByteBuffer encoded = ByteBuffer.allocate(bytes)
         .order(ByteOrder.nativeOrder());
     encoded.asFloatBuffer().put(values);
-    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
-        com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
-    if (mirror.allocate(buffer, bytes)) {
-      mirror.write(buffer, bytes, 0, bytes, encoded);
+    if (!mirror.allocate(buffer, bytes)
+        || !mirror.write(buffer, bytes, 0, bytes, encoded)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-storage-mirror-rejected");
     }
   }
 
@@ -113,8 +153,13 @@ public abstract class IrisRenderSystemMixin {
       int flags, CallbackInfo ci) {
     if (com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
         .isEnabled()) {
-      com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global()
-          .allocate(metalrender$vertices().boundBuffer(target), size);
+      int buffer = metalrender$vertices().boundBuffer(target);
+      if (buffer > 0
+          && !com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
+              .global().allocate(buffer, size)) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-buffer-storage-allocation-rejected");
+      }
     }
   }
 
@@ -122,6 +167,7 @@ public abstract class IrisRenderSystemMixin {
       remap = false)
   private static void metalrender$deleteBuffer(int buffer, CallbackInfo ci) {
     metalrender$vertices().deleteBuffer(buffer);
+    metalrender$resources().deleteBuffer(buffer);
     com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global()
         .delete(buffer);
   }
@@ -130,8 +176,9 @@ public abstract class IrisRenderSystemMixin {
       remap = false, cancellable = true)
   private static void metalrender$memoryBarrier(int barriers,
       CallbackInfo ci) {
-    IrisRenderGraphCapture.global().memoryBarrier(barriers);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global().memoryBarrier(barriers);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -142,10 +189,12 @@ public abstract class IrisRenderSystemMixin {
       int sourceX0, int sourceY0, int sourceX1, int sourceY1,
       int destinationX0, int destinationY0, int destinationX1,
       int destinationY1, int mask, int filter, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().blitFramebuffer(source, destination,
-        sourceX0, sourceY0, sourceX1, sourceY1, destinationX0,
-        destinationY0, destinationX1, destinationY1, mask, filter);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global().blitFramebuffer(
+        source, destination, sourceX0, sourceY0, sourceX1, sourceY1,
+        destinationX0, destinationY0, destinationX1, destinationY1, mask,
+        filter);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -155,11 +204,12 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$copyTexImage2D(int target, int level,
       int internalFormat, int x, int y, int width, int height, int border,
       CallbackInfo ci) {
-    IrisRenderGraphCapture.global().copyBoundTexture(target, level,
-        internalFormat, x, y, width, height, border,
+    boolean captured = IrisRenderGraphCapture.global().copyBoundTexture(
+        target, level, internalFormat, x, y, width, height, border,
         org.lwjgl.opengl.GL11C.glGetInteger(
             org.lwjgl.opengl.GL11C.GL_READ_BUFFER));
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -169,11 +219,13 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$copyTexSubImage2D(int destination,
       int target, int level, int destinationX, int destinationY, int sourceX,
       int sourceY, int width, int height, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().copyTexture(destination, target, level,
-        destinationX, destinationY, sourceX, sourceY, width, height,
+    boolean captured = IrisRenderGraphCapture.global().copyTexture(
+        destination, target, level, destinationX, destinationY, sourceX,
+        sourceY, width, height,
         org.lwjgl.opengl.GL11C.glGetInteger(
             org.lwjgl.opengl.GL11C.GL_READ_BUFFER));
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -182,8 +234,10 @@ public abstract class IrisRenderSystemMixin {
       remap = false, cancellable = true)
   private static void metalrender$generateMipmaps(int texture, int target,
       CallbackInfo ci) {
-    IrisRenderGraphCapture.global().generateMipmaps(texture, target);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global().generateMipmaps(
+        texture, target);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -192,9 +246,10 @@ public abstract class IrisRenderSystemMixin {
       remap = false, cancellable = true)
   private static void metalrender$clearBufferFloat(int framebuffer,
       int buffer, int drawBuffer, float[] values, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().clearNamedFramebufferFloat(framebuffer,
-        buffer, drawBuffer, values);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global()
+        .clearNamedFramebufferFloat(framebuffer, buffer, drawBuffer, values);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -203,9 +258,11 @@ public abstract class IrisRenderSystemMixin {
       remap = false, cancellable = true)
   private static void metalrender$clearBufferSignedInt(int framebuffer,
       int buffer, int drawBuffer, int[] values, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().clearNamedFramebufferSignedInt(
-        framebuffer, buffer, drawBuffer, values);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global()
+        .clearNamedFramebufferSignedInt(
+            framebuffer, buffer, drawBuffer, values);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
@@ -214,21 +271,28 @@ public abstract class IrisRenderSystemMixin {
       remap = false, cancellable = true)
   private static void metalrender$clearBufferUnsignedInt(int framebuffer,
       int buffer, int drawBuffer, int[] values, CallbackInfo ci) {
-    IrisRenderGraphCapture.global().clearNamedFramebufferUnsignedInt(
-        framebuffer, buffer, drawBuffer, values);
-    if (IrisTranslationCoordinator.suppressFullGraphOperation()) {
+    boolean captured = IrisRenderGraphCapture.global()
+        .clearNamedFramebufferUnsignedInt(
+            framebuffer, buffer, drawBuffer, values);
+    if (captured
+        && IrisTranslationCoordinator.suppressFullGraphOperation()) {
       ci.cancel();
     }
   }
 
-  @Inject(method = "clearBufferSubData", at = @At("HEAD"), require = 0,
-      remap = false, cancellable = true)
+  @Inject(method = "clearBufferSubData", at = @At("RETURN"), require = 0,
+      remap = false)
   private static void metalrender$clearBufferSubData(int target,
       int internalFormat, long offset, long size, int format, int type,
       int[] values, CallbackInfo ci) {
-    if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
-        "graph-ownership-buffer-clear-unimplemented")) {
-      ci.cancel();
+    int buffer = metalrender$vertices().boundBuffer(target);
+    if (buffer <= 0 || size <= 0) {
+      return;
+    }
+    if (!com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global()
+        .clearZero(buffer, offset, size, internalFormat, format, type, values)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-clear-format-unsupported");
     }
   }
 
@@ -253,19 +317,127 @@ public abstract class IrisRenderSystemMixin {
           .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
       metalrender$state().defineTexture(texture, cacheFormat, 1,
           width, height, 1, Math.max(1, level + 1));
-      if (com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
-          .isEnabled()) {
+      if (IrisGlTextureMirror.isEnabled()) {
         int bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat)
             .orElse(0);
-        if (bytesPerPixel > 0 && IrisGlTextureMirror.global().define(texture,
-            cacheFormat, width, height, 1, Math.max(1, level + 1),
-            bytesPerPixel) && pixels != null
+        boolean defined = bytesPerPixel > 0
+            && IrisGlTextureMirror.global().define(texture, cacheFormat,
+                width, height, 1, Math.max(1, level + 1),
+                bytesPerPixel);
+        if (!defined) {
+          IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+              "graph-frame-dsa-texture-define-rejected");
+        } else if (pixels != null
             && IrisGlFormat.exactUploadBytesPerPixel(internalFormat, format,
                 type).orElse(0) == bytesPerPixel
             && ((long) width * bytesPerPixel) % 4 == 0) {
-          IrisGlTextureMirror.global().write(texture, level, 0, 0, 0,
-              width, height, width, pixels);
+          if (!IrisGlTextureMirror.global().write(texture, level, 0, 0, 0,
+              width, height, width, pixels)) {
+            IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+                "graph-frame-dsa-texture-upload-rejected");
+          }
+        } else if (pixels != null) {
+          IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+              "graph-frame-dsa-texture-upload-format-unsupported");
         }
+      }
+    }
+  }
+
+  @Inject(method = "texImage1D", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$texImage1D(int texture, int target,
+      int level, int internalFormat, int width, int border, int format,
+      int type, ByteBuffer pixels, CallbackInfo ci) {
+    if (!IrisGlTextureMirror.isEnabled()
+        || texture <= 0 || level < 0 || width <= 0) {
+      return;
+    }
+    int bytesPerPixel = IrisGlFormat.exactUploadBytesPerPixel(
+        internalFormat, format, type).orElse(0);
+    if (bytesPerPixel <= 0) {
+      bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat).orElse(0);
+    }
+    if (bytesPerPixel <= 0) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-dsa-texture1d-format-unsupported");
+      return;
+    }
+    String cacheFormat = IrisGlFormat.cacheName(internalFormat)
+        .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
+    if (!IrisGlTextureMirror.global().define(texture, cacheFormat, width, 1,
+        1, Math.max(1, level + 1), bytesPerPixel)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-dsa-texture1d-define-rejected");
+      return;
+    }
+    if (pixels != null && level == 0
+        && pixels.remaining() >= width * bytesPerPixel) {
+      if (!IrisGlTextureMirror.global().write(texture, level, 0, 0, 0,
+          width, 1, width, pixels)) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-dsa-texture1d-upload-rejected");
+      }
+    }
+  }
+
+  @Inject(method = "texImage3D", at = @At("RETURN"), require = 0,
+      remap = false)
+  private static void metalrender$texImage3D(int texture, int target,
+      int level, int internalFormat, int width, int height, int depth,
+      int border, int format, int type, ByteBuffer pixels,
+      CallbackInfo ci) {
+    // The mirror models layered textures. Keep genuine GL_TEXTURE_3D storage
+    // fail-closed; GL_TEXTURE_2D_ARRAY and cube-map arrays remain layer-safe.
+    if (!IrisGlTextureMirror.isEnabled() || target == 0x806F) {
+      return;
+    }
+    if (texture <= 0 || level < 0 || width <= 0 || height <= 0
+        || depth <= 0) {
+      return;
+    }
+    int bytesPerPixel = IrisGlFormat.exactUploadBytesPerPixel(
+        internalFormat, format, type).orElse(0);
+    if (bytesPerPixel <= 0) {
+      bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat).orElse(0);
+    }
+    if (bytesPerPixel <= 0) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-dsa-texture1d-format-unsupported");
+      return;
+    }
+    String cacheFormat = IrisGlFormat.cacheName(internalFormat)
+        .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
+    if (!IrisGlTextureMirror.global().define(texture, cacheFormat, width,
+        height, depth, Math.max(1, level + 1), bytesPerPixel)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-dsa-texture3d-define-rejected");
+      return;
+    }
+    if (pixels == null || level != 0) {
+      return;
+    }
+
+    long layerBytes = (long) width * height * bytesPerPixel;
+    if (layerBytes > Integer.MAX_VALUE
+        || layerBytes > pixels.remaining()) {
+      return;
+    }
+    for (int layer = 0; layer < depth; layer++) {
+      long start = (long) pixels.position() + layer * layerBytes;
+      if (start > Integer.MAX_VALUE
+          || start < 0
+          || start + layerBytes > (long) pixels.limit()) {
+        return;
+      }
+      ByteBuffer slice = pixels.duplicate();
+      slice.position(Math.toIntExact(start));
+      slice.limit(Math.toIntExact(start + layerBytes));
+      if (!IrisGlTextureMirror.global().write(texture, level, layer,
+          0, 0, width, height, width, slice.slice())) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-dsa-texture3d-upload-rejected");
+        return;
       }
     }
   }
@@ -377,6 +549,7 @@ public abstract class IrisRenderSystemMixin {
       remap = false)
   private static void metalrender$destroySampler(int sampler,
       CallbackInfo ci) {
+    metalrender$resources().deleteSampler(sampler);
     IrisGlSamplerMirror.global().deleteSampler(sampler);
   }
 
@@ -522,14 +695,25 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$dispatchCompute(int x, int y, int z,
       CallbackInfo ci) {
     try {
-      metalrender$capture().dispatch(
-          new IrisExecutionCommand.Dispatch(x, y, z));
+      boolean captured = metalrender$capture().dispatch(
+          metalrender$capture().captureDispatchCommand(x, y, z));
+      // A captured dispatch is replayed by the Metal graph executor. Do not
+      // also execute the original OpenGL dispatch while full graph ownership
+      // is active.
+      if (captured
+          && IrisTranslationCoordinator.suppressFullGraphOperation()) {
+        ci.cancel();
+      } else if (!captured
+          && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+              "graph-ownership-dispatch-program-unresolved")) {
+        ci.cancel();
+      }
     } catch (IllegalArgumentException error) {
       metalrender$capture().dispatch();
-    }
-    if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
-        "graph-ownership-compute-dispatch-unimplemented")) {
-      ci.cancel();
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-dispatch-capture-failed")) {
+        ci.cancel();
+      }
     }
   }
 
@@ -545,14 +729,22 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$dispatchComputeIndirect(long offset,
       CallbackInfo ci) {
     try {
-      metalrender$capture().dispatch(
-          new IrisExecutionCommand.IndirectDispatch(offset));
+      boolean captured = metalrender$capture().dispatch(
+          metalrender$capture().captureIndirectDispatchCommand(offset));
+      if (captured
+          && IrisTranslationCoordinator.suppressFullGraphOperation()) {
+        ci.cancel();
+      } else if (!captured
+          && IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+              "graph-ownership-indirect-dispatch-program-unresolved")) {
+        ci.cancel();
+      }
     } catch (IllegalArgumentException error) {
       metalrender$capture().dispatch();
-    }
-    if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
-        "graph-ownership-indirect-dispatch-unimplemented")) {
-      ci.cancel();
+      if (IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
+          "graph-ownership-indirect-dispatch-capture-failed")) {
+        ci.cancel();
+      }
     }
   }
 }

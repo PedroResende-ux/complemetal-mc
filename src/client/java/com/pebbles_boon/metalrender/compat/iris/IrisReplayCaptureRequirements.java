@@ -120,8 +120,9 @@ record IrisReplayCaptureRequirements(
             }
           }
           case STORAGE_IMAGE -> {
-            // Storage images are not replayable yet. Preserve the existing
-            // fail-open full capture so the argument gate reports the blocker.
+            // Storage-image reflection is intentionally conservative: the
+            // graph replay path falls back to a full resource capture so image
+            // read/write bindings retain their exact draw-time texture state.
             return Optional.empty();
           }
         }

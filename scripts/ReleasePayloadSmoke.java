@@ -842,7 +842,7 @@ public final class ReleasePayloadSmoke {
     ByteArrayOutputStream bytes = new ByteArrayOutputStream();
     DataOutputStream out = new DataOutputStream(bytes);
     out.writeInt(0x4d525837);
-    out.writeInt(8);
+    out.writeInt(9);
     out.writeInt(32);
     out.writeInt(32);
     out.writeInt(0);  // viewport x

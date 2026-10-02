@@ -41,6 +41,29 @@ public abstract class IrisFinalPassGraphMixin {
   @Redirect(method = "renderFinalPass", at = @At(value = "INVOKE",
       target = "Lorg/lwjgl/opengl/GL46C;glCopyTexSubImage2D(IIIIIIII)V"),
       require = 0, remap = false)
+  private void metalrender$copyTemporalHistory46(int target, int level,
+      int destinationX, int destinationY, int sourceX, int sourceY,
+      int width, int height) {
+    metalrender$copyTemporalHistory(target, level, destinationX, destinationY,
+        sourceX, sourceY, width, height);
+  }
+
+  /**
+   * Iris 1.21.1 can resolve the same legacy operation through GL11C instead
+   * of GL46C depending on the transformed call site. Keep both entry points
+   * under the same graph-capture/suppression path so temporal history cannot
+   * silently execute in OpenGL after Metal ownership is armed.
+   */
+  @Redirect(method = "renderFinalPass", at = @At(value = "INVOKE",
+      target = "Lorg/lwjgl/opengl/GL11C;glCopyTexSubImage2D(IIIIIIII)V"),
+      require = 0, remap = false)
+  private void metalrender$copyTemporalHistory11(int target, int level,
+      int destinationX, int destinationY, int sourceX, int sourceY,
+      int width, int height) {
+    metalrender$copyTemporalHistory(target, level, destinationX, destinationY,
+        sourceX, sourceY, width, height);
+  }
+
   private void metalrender$copyTemporalHistory(int target, int level,
       int destinationX, int destinationY, int sourceX, int sourceY,
       int width, int height) {
@@ -48,16 +71,18 @@ public abstract class IrisFinalPassGraphMixin {
         IrisGlResourceBindingTracker.global().activeTextureBinding(target);
     boolean suppress;
     if (destination != null && destination.texture() > 0) {
-      IrisRenderGraphCapture.global().copyTexture(destination.texture(),
-          target, level, destinationX, destinationY, sourceX, sourceY,
-          width, height, GL11C.glGetInteger(GL11C.GL_READ_BUFFER));
-      suppress = IrisTranslationCoordinator.suppressFullGraphOperation();
+      boolean captured = IrisRenderGraphCapture.global().copyTexture(
+          destination.texture(), target, level, destinationX, destinationY,
+          sourceX, sourceY, width, height,
+          GL11C.glGetInteger(GL11C.GL_READ_BUFFER));
+      suppress = captured
+          && IrisTranslationCoordinator.suppressFullGraphOperation();
     } else {
       suppress = IrisTranslationCoordinator.suppressUnsupportedFullGraphDraw(
           "graph-ownership-temporal-copy-destination-unavailable");
     }
     if (!suppress) {
-      GL46C.glCopyTexSubImage2D(target, level, destinationX, destinationY,
+      GL11C.glCopyTexSubImage2D(target, level, destinationX, destinationY,
           sourceX, sourceY, width, height);
     }
   }

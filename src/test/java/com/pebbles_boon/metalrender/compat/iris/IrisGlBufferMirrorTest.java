@@ -39,6 +39,49 @@ final class IrisGlBufferMirrorTest {
   }
 
   @Test
+  void mirrorsIrisShaderStorageZeroClearAndBumpsGeneration() {
+    IrisGlBufferMirror mirror = new IrisGlBufferMirror(4, 64, 32);
+    assertTrue(mirror.write(7, 16, 0, 16,
+        ByteBuffer.wrap(new byte[] {
+            1, 2, 3, 4, 5, 6, 7, 8,
+            9, 10, 11, 12, 13, 14, 15, 16
+        })));
+    long before = mirror.generation(7);
+
+    assertTrue(mirror.clearZero(7, 4, 8, 0x8229, 0x1903, 0x1400,
+        new int[] {0}));
+    long after = mirror.generation(7);
+    assertTrue(after > before);
+    assertFalse(mirror.snapshot(7, before, 0, 16).isPresent());
+    assertArrayEquals(new byte[] {
+        1, 2, 3, 4, 0, 0, 0, 0,
+        0, 0, 0, 0, 13, 14, 15, 16
+    }, mirror.snapshot(7, after, 0, 16).orElseThrow().bytes());
+    assertFalse(mirror.clearZero(7, 0, 4, 0x8229, 0x1903, 0x1405,
+        new int[] {0}));
+  }
+
+  @Test
+  void subdataWritePreservesUnchangedBytesAndInvalidatesGeneration() {
+    IrisGlBufferMirror mirror = new IrisGlBufferMirror(4, 64, 32);
+    assertTrue(mirror.write(11, 16, 0, 16,
+        ByteBuffer.wrap(new byte[] {
+            1, 2, 3, 4, 5, 6, 7, 8,
+            9, 10, 11, 12, 13, 14, 15, 16
+        })));
+    long before = mirror.generation(11);
+    assertTrue(mirror.write(11, 16, 4, 4,
+        ByteBuffer.wrap(new byte[] {40, 41, 42, 43})));
+    long after = mirror.generation(11);
+    assertTrue(after > before);
+    assertFalse(mirror.snapshot(11, before, 0, 16).isPresent());
+    assertArrayEquals(new byte[] {
+        1, 2, 3, 4, 40, 41, 42, 43,
+        9, 10, 11, 12, 13, 14, 15, 16
+    }, mirror.snapshot(11, after, 0, 16).orElseThrow().bytes());
+  }
+
+  @Test
   void evictionAndDeletionInvalidateSnapshots() {
     IrisGlBufferMirror mirror = new IrisGlBufferMirror(2, 16, 8);
     assertTrue(mirror.write(1, 8, 0, 8, ByteBuffer.allocate(8)));

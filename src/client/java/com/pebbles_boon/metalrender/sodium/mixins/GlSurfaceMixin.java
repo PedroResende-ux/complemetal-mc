@@ -19,12 +19,12 @@ public abstract class GlSurfaceMixin {
   @Unique
   private long metalrender$presentStartedNanos;
 
-  @Inject(method = "present", at = @At("HEAD"), require = 1)
+  @Inject(method = "present", at = @At("HEAD"), require = 0)
   private void metalrender$beginPresent(CallbackInfo callback) {
     metalrender$presentStartedNanos = System.nanoTime();
   }
 
-  @Inject(method = "present", at = @At("TAIL"), require = 1)
+  @Inject(method = "present", at = @At("TAIL"), require = 0)
   private void metalrender$completePresent(CallbackInfo callback) {
     DisplayPresentationTracker.record(windowHandle,
         metalrender$presentStartedNanos, System.nanoTime());

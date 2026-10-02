@@ -29,6 +29,72 @@ final class IrisRenderGraphCaptureTest {
   }
 
   @Test
+  void unsupportedBufferClearInvalidatesFullReplayWithoutDroppingOpenGlPath() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(
+        tracker);
+    capture.beginFrame();
+    assertTrue(capture.memoryBarrier(1));
+    capture.markUnsupportedFullReplayOperation(
+        "graph-frame-buffer-clear-unimplemented");
+    assertTrue(capture.hasActiveFrame());
+    capture.endFrame();
+    IrisRenderGraphCapture.PendingFrame frame = capture.poll().orElseThrow();
+    assertFalse(frame.fullReplayCaptured());
+  }
+
+  @Test
+  void activeFrameTracksWhetherGraphOperationsCanBeSuppressed() {
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(
+        new IrisGlStateTracker());
+    assertFalse(capture.hasActiveFrame());
+
+    capture.beginFrame();
+    assertTrue(capture.hasActiveFrame());
+
+    capture.endFrame();
+    assertFalse(capture.hasActiveFrame());
+  }
+
+  @Test
+  void unresolvedOperationDoesNotCountAsCapturedForSuppression() {
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(
+        new IrisGlStateTracker());
+    capture.beginFrame();
+
+    assertTrue(capture.memoryBarrier(1));
+    assertFalse(capture.generateMipmaps(999, GL_TEXTURE_2D));
+
+    capture.endFrame();
+    assertEquals(1, capture.poll().orElseThrow().events().size());
+  }
+
+  @Test
+  void overflowedFrameDoesNotReportResourceOperationsAsCaptured() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerFramebuffer(7);
+    tracker.defineTexture(70, "rgba8-unorm", 1, 32, 16, 1, 1);
+    tracker.defineTexture(71, "d32-float", 1, 32, 16, 1, 1);
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_READ_FRAMEBUFFER, 7);
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(tracker);
+    capture.beginFrame();
+    for (int index = 0;
+        index < IrisRenderGraphCapture.MAX_EVENTS_PER_FRAME; index++) {
+      assertTrue(capture.memoryBarrier(index));
+    }
+    assertFalse(capture.memoryBarrier(IrisRenderGraphCapture.MAX_EVENTS_PER_FRAME));
+    assertFalse(capture.hasActiveFrame());
+
+    assertFalse(capture.copyBoundTexture(GL_TEXTURE_2D, 0, 0,
+        0, 0, 1, 1, 0, 0));
+    assertFalse(capture.clearDepthTexture(71, 1.0, Optional.empty()));
+
+    capture.endFrame();
+    assertTrue(capture.poll().isEmpty());
+  }
+
+  @Test
   void fullReplayReservationBypassesRegularFrameSamplingInterval() {
     AtomicLong now = new AtomicLong(1_000_000_000L);
     AtomicBoolean fullReplay = new AtomicBoolean();
@@ -184,6 +250,10 @@ final class IrisRenderGraphCaptureTest {
     tracker.registerFramebuffer(8);
     tracker.defineTexture(70, "rgba16-float", 1, 1280, 720, 1, 1);
     tracker.defineTexture(80, "rgba16-float", 1, 1280, 720, 1, 1);
+    tracker.drawBuffersForFramebuffer(7,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0);
+    tracker.drawBuffersForFramebuffer(8,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0);
     assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
         IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 70, 0));
     assertTrue(tracker.framebufferTexture2DForFramebuffer(8,
@@ -232,19 +302,24 @@ final class IrisRenderGraphCaptureTest {
     capture.phase(IrisRenderGraph.Phase.COMPOSITE);
     capture.clearNamedFramebufferFloat(8, IrisClearCommand.GL_COLOR, 0,
         new float[] {0.25F, 0.5F, 0.75F, 1.0F});
+    capture.clearNamedFramebufferFloat(8, IrisClearCommand.GL_COLOR, 0,
+        new float[] {0.25F, 0.5F, 0.75F, 1.0F});
     capture.copyTexture(80, GL_TEXTURE_2D, 0, 4, 5, 6, 7, 8, 9,
         IrisGlStateTracker.GL_COLOR_ATTACHMENT0);
     capture.endFrame();
 
     List<IrisRenderGraphCapture.RawEvent> events = capture.poll()
         .orElseThrow().events();
-    assertEquals(2, events.size());
+    assertEquals(3, events.size());
     IrisRenderGraphCapture.RawClear clear =
         (IrisRenderGraphCapture.RawClear) events.get(0);
     assertEquals(8, clear.command().target().name());
     assertEquals(4, clear.command().rawValues().size());
+    IrisRenderGraphCapture.RawClear repeatedClear =
+        (IrisRenderGraphCapture.RawClear) events.get(1);
+    assertEquals(8, repeatedClear.command().target().name());
     IrisRenderGraphCapture.RawTransfer transfer =
-        (IrisRenderGraphCapture.RawTransfer) events.get(1);
+        (IrisRenderGraphCapture.RawTransfer) events.get(2);
     IrisTransferCommand.CopyTexSubImage2D copy =
         (IrisTransferCommand.CopyTexSubImage2D) transfer.command();
     assertEquals(7, copy.sourceFramebuffer().name());
@@ -252,6 +327,82 @@ final class IrisRenderGraphCaptureTest {
     assertEquals(80, copy.destinationTexture().name());
     assertEquals(4, copy.destinationX());
     assertEquals(9, copy.height());
+  }
+
+  @Test
+  void clampsLegacyColorAndDepthClearValuesLikeOpenGl() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerFramebuffer(7);
+    tracker.defineTexture(70, "rgba8-unorm", 1, 32, 16, 1, 1);
+    tracker.defineTexture(71, "d32-float", 1, 32, 16, 1, 1);
+    tracker.drawBuffersForFramebuffer(7,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0);
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_DRAW_FRAMEBUFFER, 7);
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 70, 0));
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
+        IrisGlStateTracker.GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 71, 0));
+
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(tracker);
+    capture.beginFrame();
+    capture.legacyClearColor(-1.0F, 0.25F, 2.0F, 1.5F);
+    capture.legacyClearDepth(-2.0D);
+    assertTrue(capture.legacyClearBoundFramebuffer(
+        GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
+    capture.endFrame();
+
+    List<IrisRenderGraphCapture.RawEvent> events = capture.poll()
+        .orElseThrow().events();
+    assertEquals(2, events.size());
+    IrisClearCommand color = ((IrisRenderGraphCapture.RawClear) events.get(0))
+        .command();
+    assertEquals(Integer.toUnsignedLong(Float.floatToRawIntBits(0.0F)),
+        color.rawValues().get(0));
+    assertEquals(Integer.toUnsignedLong(Float.floatToRawIntBits(0.25F)),
+        color.rawValues().get(1));
+    assertEquals(Integer.toUnsignedLong(Float.floatToRawIntBits(1.0F)),
+        color.rawValues().get(2));
+    assertEquals(Integer.toUnsignedLong(Float.floatToRawIntBits(1.0F)),
+        color.rawValues().get(3));
+    IrisClearCommand depth = ((IrisRenderGraphCapture.RawClear) events.get(1))
+        .command();
+    assertEquals(Double.doubleToRawLongBits(0.0D),
+        depth.rawValues().getFirst());
+  }
+
+  @Test
+  void capturesLegacyDepthAndStencilClearValues() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerFramebuffer(7);
+    tracker.defineTexture(71, "d32-float", 1, 64, 32, 1, 1);
+    tracker.defineTexture(72, "s8-uint", 1, 64, 32, 1, 1);
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
+        IrisGlStateTracker.GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 71, 0));
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
+        IrisGlStateTracker.GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 72, 0));
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_DRAW_FRAMEBUFFER, 7);
+
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(tracker);
+    capture.beginFrame();
+    capture.legacyClearDepth(0.375D);
+    capture.legacyClearStencil(173);
+    assertTrue(capture.legacyClearBoundFramebuffer(
+        GL_DEPTH_BUFFER_BIT | 0x00000400));
+    capture.endFrame();
+
+    List<IrisRenderGraphCapture.RawEvent> events = capture.poll()
+        .orElseThrow().events();
+    assertEquals(2, events.size());
+    IrisRenderGraphCapture.RawClear depth =
+        (IrisRenderGraphCapture.RawClear) events.get(0);
+    assertEquals(Double.doubleToRawLongBits(0.375D),
+        depth.command().rawValues().getFirst());
+    IrisRenderGraphCapture.RawClear stencil =
+        (IrisRenderGraphCapture.RawClear) events.get(1);
+    assertEquals(Integer.toUnsignedLong(173),
+        stencil.command().rawValues().getFirst());
   }
 
   @Test
@@ -289,6 +440,32 @@ final class IrisRenderGraphCaptureTest {
     assertEquals(71, depth.command().target().name());
     assertEquals(Double.doubleToRawLongBits(1.0),
         depth.command().rawValues().getFirst());
+  }
+
+  @Test
+  void partialLegacyClearIsNotEligibleForOpenGlSuppression() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerFramebuffer(9);
+    tracker.defineTexture(90, "rgba8-unorm", 1, 32, 16, 1, 1);
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(9,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 90, 0));
+    assertTrue(tracker.drawBuffersForFramebuffer(9,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0));
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_DRAW_FRAMEBUFFER, 9);
+
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(
+        tracker, () -> 1_000_000_000L, () -> false);
+    capture.beginFrame();
+    capture.legacyClearColor(0.0F, 0.0F, 0.0F, 1.0F);
+
+    assertFalse(capture.legacyClearBoundFramebuffer(
+        GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
+    capture.endFrame();
+
+    IrisRenderGraphCapture.PendingFrame frame =
+        capture.poll().orElseThrow();
+    assertEquals(1, frame.events().size());
   }
 
   @Test

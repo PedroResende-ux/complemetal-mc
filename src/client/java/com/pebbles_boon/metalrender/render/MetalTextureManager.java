@@ -1,20 +1,36 @@
 package com.pebbles_boon.metalrender.render;
 
-import com.mojang.blaze3d.buffers.GpuBuffer;
-import com.mojang.blaze3d.systems.CommandEncoder;
-import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.textures.GpuTexture;
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
 import com.pebbles_boon.metalrender.util.MetalLogger;
+import com.pebbles_boon.metalrender.sodium.mixins.accessor.AccessorLightTexture;
 import java.nio.ByteBuffer;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.LightTexture;
 import net.minecraft.client.renderer.texture.AbstractTexture;
+import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.neoforged.neoforge.common.NeoForge;
+import org.lwjgl.BufferUtils;
+import org.lwjgl.opengl.GL11C;
 
-public class MetalTextureManager {
-  private static final net.minecraft.resources.Identifier BLOCKS_ATLAS_ID = TextureAtlas.LOCATION_BLOCKS;
+/**
+ * Minecraft 1.21.1 texture bridge.
+ *
+ * <p>The 26.2 implementation relies on Mojang's newer {@code GpuTexture} and
+ * fenced {@code GpuBuffer} readback APIs. Those APIs are not exposed the same
+ * way in 1.21.1. This implementation deliberately uses the older GL texture
+ * ID path that Minecraft 1.21.1 still exposes, reads RGBA pixels synchronously,
+ * and uploads the result into the native Metal texture.</p>
+ *
+ * <p>Readbacks are intentionally throttled because they are synchronization
+ * points. This is a compatibility bridge, not the final high-performance
+ * texture path.</p>
+ */
+public final class MetalTextureManager {
+  private static final net.minecraft.resources.ResourceLocation BLOCKS_ATLAS_ID =
+      TextureAtlas.LOCATION_BLOCKS;
+
   private final long deviceHandle;
   private long blockAtlasTexture;
   private long lightmapTexture;
@@ -25,14 +41,10 @@ public class MetalTextureManager {
   private int blockAtlasHeight;
   private int lightmapWidth;
   private int lightmapHeight;
-  private byte[] atlasUploadData = null;
-  private byte[] lightmapUploadData = null;
-  private boolean atlasReadbackPending;
-  private boolean lightmapReadbackPending;
-  private ReadbackRequest atlasReadbackRequest;
-  private ReadbackRequest lightmapReadbackRequest;
-  private long readbackGeneration;
-  private volatile long completedAtlasRevision;
+  private byte[] atlasUploadData;
+  private byte[] lightmapUploadData;
+  private long completedAtlasRevision;
+
   private static final AtomicLong ATLAS_DIRTY_REVISION =
       new AtomicLong(1L);
   public static volatile boolean atlasDirty = true;
@@ -41,23 +53,12 @@ public class MetalTextureManager {
   private static final long ATLAS_MIN_UPLOAD_INTERVAL_NS = 250_000_000L;
   private static final int LIGHTMAP_MIN_UPLOAD_INTERVAL = 2;
   private static final long LIGHTMAP_MIN_GAME_TIME_DELTA = 4L;
-  private int atlasFramesSinceUpload = 0;
+
+  private int atlasFramesSinceUpload;
   private long lastAtlasUploadNanos = Long.MIN_VALUE;
-  private int lightmapFramesSinceUpload = 0;
+  private int lightmapFramesSinceUpload;
   private long lastLightmapObservedGameTime = Long.MIN_VALUE;
   private long lastUploadedLightmapGameTime = Long.MIN_VALUE;
-
-  private static final class ReadbackRequest {
-    private final GpuBuffer buffer;
-    private final long generation;
-    private final AtomicBoolean finished = new AtomicBoolean();
-    private volatile boolean cancelled;
-
-    private ReadbackRequest(GpuBuffer buffer, long generation) {
-      this.buffer = buffer;
-      this.generation = generation;
-    }
-  }
 
   public static void markAtlasDirty() {
     ATLAS_DIRTY_REVISION.incrementAndGet();
@@ -74,55 +75,58 @@ public class MetalTextureManager {
 
   public void loadBlockAtlas() {
     try {
-      if (atlasReadbackPending) {
-        return;
-      }
       Minecraft mc = Minecraft.getInstance();
-      if (mc == null || mc.getTextureManager() == null)
+      if (mc == null || mc.getTextureManager() == null) {
         return;
-      AbstractTexture atlasTexture = mc.getTextureManager().getTexture(BLOCKS_ATLAS_ID);
-      if (atlasTexture == null) {
-        MetalLogger.info("atlas not ready");
-        blockAtlasLoaded = true;
+      }
+
+      AbstractTexture texture =
+          mc.getTextureManager().getTexture(BLOCKS_ATLAS_ID);
+      if (texture == null) {
         usingFallbackBlockAtlas = true;
+        blockAtlasLoaded = false;
         return;
       }
-      GpuTexture gpuTexture = atlasTexture.getTexture();
-      if (gpuTexture == null || gpuTexture.isClosed()) {
-        MetalLogger.info("atlas GPU texture unavailable");
-        blockAtlasLoaded = true;
+
+      int glTextureId = texture.getId();
+      int[] dimensions = queryTextureSize(glTextureId);
+      if (dimensions == null) {
         usingFallbackBlockAtlas = true;
+        blockAtlasLoaded = false;
         return;
       }
-      int width = gpuTexture.getWidth(0);
-      int height = gpuTexture.getHeight(0);
-      if (width <= 0 || height <= 0) {
-        MetalLogger.info("atlas bad dim %dx%d", width, height);
-        blockAtlasLoaded = true;
+
+      byte[] rgba = readTexturePixels(glTextureId, dimensions[0], dimensions[1]);
+      if (rgba == null) {
         usingFallbackBlockAtlas = true;
+        blockAtlasLoaded = false;
         return;
       }
-      if (!requestAtlasReadback(gpuTexture, width, height)) {
-        MetalLogger.error("atlas tex create fail");
-      }
-    } catch (Exception e) {
-      MetalLogger.error("atlas load fail: %s", e.getMessage());
-      blockAtlasLoaded = true;
+
+      installBlockAtlas(dimensions[0], dimensions[1], rgba);
+      blockAtlasLoaded = blockAtlasTexture != 0;
+      usingFallbackBlockAtlas = !blockAtlasLoaded;
+    } catch (Throwable error) {
+      blockAtlasLoaded = false;
       usingFallbackBlockAtlas = true;
+      MetalLogger.warn("1.21.1 block atlas readback failed: %s",
+          error.getMessage());
     }
   }
 
   public void updateBlockAtlas() {
-    if (blockAtlasTexture == 0 || usingFallbackBlockAtlas)
+    if (!blockAtlasLoaded || blockAtlasTexture == 0) {
       return;
-    if (!atlasDirty)
+    }
+    if (!atlasDirty) {
       return;
-    if (atlasReadbackPending)
-      return;
-    atlasFramesSinceUpload++;
+    }
 
-    if (atlasFramesSinceUpload < ATLAS_MIN_UPLOAD_INTERVAL)
+    atlasFramesSinceUpload++;
+    if (atlasFramesSinceUpload < ATLAS_MIN_UPLOAD_INTERVAL) {
       return;
+    }
+
     long now = System.nanoTime();
     if (lastAtlasUploadNanos != Long.MIN_VALUE &&
         now - lastAtlasUploadNanos < ATLAS_MIN_UPLOAD_INTERVAL_NS) {
@@ -132,47 +136,64 @@ public class MetalTextureManager {
 
     try {
       Minecraft mc = Minecraft.getInstance();
-      if (mc == null || mc.getTextureManager() == null)
+      if (mc == null || mc.getTextureManager() == null) {
         return;
-      AbstractTexture atlasTexture = mc.getTextureManager().getTexture(BLOCKS_ATLAS_ID);
-      if (atlasTexture == null)
-        return;
-      GpuTexture gpuTexture = atlasTexture.getTexture();
-      if (gpuTexture == null || gpuTexture.isClosed())
-        return;
-      int width = gpuTexture.getWidth(0);
-      int height = gpuTexture.getHeight(0);
-      if (width <= 0 || height <= 0)
-        return;
-      if (requestAtlasReadback(gpuTexture, width, height)) {
-        lastAtlasUploadNanos = now;
       }
-    } catch (Exception e) {
-      // Keep the dirty bit set so a transient GL/resource reload race retries
-      // later instead of permanently leaving Metal with a stale atlas.
+
+      AbstractTexture texture =
+          mc.getTextureManager().getTexture(BLOCKS_ATLAS_ID);
+      if (texture == null) {
+        return;
+      }
+
+      int glTextureId = texture.getId();
+      int[] dimensions = queryTextureSize(glTextureId);
+      if (dimensions == null) {
+        return;
+      }
+
+      byte[] rgba = readTexturePixels(glTextureId, dimensions[0], dimensions[1]);
+      if (rgba == null) {
+        return;
+      }
+
+      installBlockAtlas(dimensions[0], dimensions[1], rgba);
+      lastAtlasUploadNanos = now;
+    } catch (Throwable error) {
       atlasDirty = true;
-      MetalLogger.warn("atlas update failed: %s", e.getMessage());
+      MetalLogger.warn("1.21.1 block atlas update failed: %s",
+          error.getMessage());
     }
   }
 
   public void updateLightmap() {
-    if (lightmapTexture == 0)
-      return;
-    Minecraft mc = Minecraft.getInstance();
-    long gameTime = mc != null && mc.level != null ? mc.level.getGameTime()
-        : Long.MIN_VALUE;
-    if (gameTime == lastLightmapObservedGameTime)
-      return;
-    lastLightmapObservedGameTime = gameTime;
-    if (lastUploadedLightmapGameTime != Long.MIN_VALUE &&
-        gameTime != Long.MIN_VALUE &&
-        gameTime - lastUploadedLightmapGameTime < LIGHTMAP_MIN_GAME_TIME_DELTA) {
+    if (lightmapTexture == 0) {
       return;
     }
-    lightmapFramesSinceUpload++;
-    if (lightmapFramesSinceUpload < LIGHTMAP_MIN_UPLOAD_INTERVAL)
+
+    Minecraft mc = Minecraft.getInstance();
+    long gameTime = mc != null && mc.level != null
+        ? mc.level.getGameTime()
+        : Long.MIN_VALUE;
+
+    if (gameTime == lastLightmapObservedGameTime) {
       return;
+    }
+    lastLightmapObservedGameTime = gameTime;
+
+    if (lastUploadedLightmapGameTime != Long.MIN_VALUE &&
+        gameTime != Long.MIN_VALUE &&
+        gameTime - lastUploadedLightmapGameTime <
+            LIGHTMAP_MIN_GAME_TIME_DELTA) {
+      return;
+    }
+
+    lightmapFramesSinceUpload++;
+    if (lightmapFramesSinceUpload < LIGHTMAP_MIN_UPLOAD_INTERVAL) {
+      return;
+    }
     lightmapFramesSinceUpload = 0;
+
     uploadLightmap(gameTime);
   }
 
@@ -196,7 +217,8 @@ public class MetalTextureManager {
   }
 
   public boolean isAtlasReadbackPending() {
-    return atlasReadbackPending;
+    // The 1.21.1 bridge uses synchronous GL readback.
+    return false;
   }
 
   public long getCompletedAtlasRevision() {
@@ -213,163 +235,38 @@ public class MetalTextureManager {
 
   private boolean uploadLightmap(long gameTime) {
     try {
-      if (lightmapReadbackPending) {
-        return false;
-      }
       Minecraft mc = Minecraft.getInstance();
       if (mc == null || mc.gameRenderer == null) {
         return false;
       }
-      var lightmapView = mc.gameRenderer.levelLightmap();
-      if (lightmapView == null) {
+
+      LightTexture lightTexture = mc.gameRenderer.lightTexture();
+      if (!(lightTexture instanceof AccessorLightTexture accessor)) {
         return false;
       }
-      GpuTexture gpuTexture = lightmapView.texture();
-      if (gpuTexture == null || gpuTexture.isClosed()) {
+
+      DynamicTexture texture = accessor.complemetal$getLightTexture();
+      if (texture == null) {
         return false;
       }
-      int width = gpuTexture.getWidth(0);
-      int height = gpuTexture.getHeight(0);
-      if (width <= 0 || height <= 0) {
+
+      int glTextureId = texture.getId();
+      int[] dimensions = queryTextureSize(glTextureId);
+      if (dimensions == null) {
         return false;
       }
-      return requestLightmapReadback(
-          gpuTexture, width, height, gameTime);
-    } catch (Exception e) {
-      MetalLogger.error("lightmap load fail: %s", e.getMessage());
-      return false;
-    }
-  }
 
-  private boolean requestAtlasReadback(
-      GpuTexture texture, int width, int height) {
-    int dataSize = rgbaDataSize(width, height);
-    if (dataSize <= 0 || atlasReadbackPending) {
-      return false;
-    }
-    GpuBuffer buffer = RenderSystem.getDevice().createBuffer(
-        () -> "MetalRender block-atlas readback",
-        GpuBuffer.USAGE_MAP_READ | GpuBuffer.USAGE_COPY_DST,
-        dataSize);
-    ReadbackRequest request =
-        new ReadbackRequest(buffer, readbackGeneration);
-    atlasReadbackRequest = request;
-    atlasReadbackPending = true;
-    long dirtyRevision = ATLAS_DIRTY_REVISION.get();
-    try {
-      CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
-      encoder.copyTextureToBuffer(texture, buffer, 0,
-          () -> completeAtlasReadback(
-              request, width, height, dataSize, dirtyRevision),
-          0);
-      return true;
-    } catch (Throwable error) {
-      // copyTextureToBuffer may queue its fenced callback before surfacing a
-      // later GL error. Cancel publication and defer fallback cleanup to the
-      // same fence instead of deleting a PBO that the driver may still own.
-      request.cancelled = true;
-      queueFailedAtlasReadbackCleanup(request);
-      MetalLogger.warn("atlas readback request failed: %s",
-          error.getMessage());
-      return false;
-    }
-  }
-
-  private boolean requestLightmapReadback(
-      GpuTexture texture, int width, int height, long gameTime) {
-    int dataSize = rgbaDataSize(width, height);
-    if (dataSize <= 0 || lightmapReadbackPending) {
-      return false;
-    }
-    GpuBuffer buffer = RenderSystem.getDevice().createBuffer(
-        () -> "MetalRender lightmap readback",
-        GpuBuffer.USAGE_MAP_READ | GpuBuffer.USAGE_COPY_DST,
-        dataSize);
-    ReadbackRequest request =
-        new ReadbackRequest(buffer, readbackGeneration);
-    lightmapReadbackRequest = request;
-    lightmapReadbackPending = true;
-    try {
-      CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
-      encoder.copyTextureToBuffer(texture, buffer, 0,
-          () -> completeLightmapReadback(
-              request, width, height, dataSize, gameTime),
-          0);
-      return true;
-    } catch (Throwable error) {
-      request.cancelled = true;
-      queueFailedLightmapReadbackCleanup(request);
-      MetalLogger.warn("lightmap readback request failed: %s",
-          error.getMessage());
-      return false;
-    }
-  }
-
-  private void completeAtlasReadback(
-      ReadbackRequest request, int width, int height, int dataSize,
-      long dirtyRevision) {
-    try {
-      if (request.cancelled ||
-          request.generation != readbackGeneration) {
-        return;
+      byte[] rgba = readTexturePixels(
+          glTextureId, dimensions[0], dimensions[1]);
+      if (rgba == null) {
+        return false;
       }
-      if (atlasUploadData == null || atlasUploadData.length < dataSize) {
-        atlasUploadData = new byte[dataSize];
-      }
-      copyMappedBytes(request.buffer, atlasUploadData, dataSize);
-      if (blockAtlasTexture == 0 || width != blockAtlasWidth ||
-          height != blockAtlasHeight) {
+
+      if (lightmapTexture == 0 ||
+          dimensions[0] != lightmapWidth ||
+          dimensions[1] != lightmapHeight) {
         long newTexture = NativeBridge.nCreateTexture2D(
-            deviceHandle, width, height, atlasUploadData);
-        if (newTexture == 0) {
-          throw new IllegalStateException(
-              "native atlas texture creation returned zero");
-        }
-        if (blockAtlasTexture != 0 && blockAtlasTexture != newTexture) {
-          NativeBridge.nDestroyTexture2D(blockAtlasTexture);
-        }
-        blockAtlasTexture = newTexture;
-        blockAtlasWidth = width;
-        blockAtlasHeight = height;
-        MetalLogger.info("atlas ready: %dx%d h=%d",
-            width, height, newTexture);
-      } else {
-        if (!NativeBridge.nUpdateTexture2D(
-            blockAtlasTexture, width, height, atlasUploadData)) {
-          throw new IllegalStateException(
-              "native atlas texture update was not submitted");
-        }
-      }
-      blockAtlasLoaded = true;
-      usingFallbackBlockAtlas = false;
-      completedAtlasRevision = dirtyRevision;
-      atlasDirty = ATLAS_DIRTY_REVISION.get() != dirtyRevision;
-    } catch (Throwable error) {
-      atlasDirty = true;
-      MetalLogger.warn("atlas readback completion failed: %s",
-          error.getMessage());
-    } finally {
-      finishAtlasReadback(request);
-    }
-  }
-
-  private void completeLightmapReadback(
-      ReadbackRequest request, int width, int height, int dataSize,
-      long gameTime) {
-    try {
-      if (request.cancelled ||
-          request.generation != readbackGeneration) {
-        return;
-      }
-      if (lightmapUploadData == null ||
-          lightmapUploadData.length < dataSize) {
-        lightmapUploadData = new byte[dataSize];
-      }
-      copyMappedBytes(request.buffer, lightmapUploadData, dataSize);
-      if (lightmapTexture == 0 || width != lightmapWidth ||
-          height != lightmapHeight) {
-        long newTexture = NativeBridge.nCreateTexture2D(
-            deviceHandle, width, height, lightmapUploadData);
+            deviceHandle, dimensions[0], dimensions[1], rgba);
         if (newTexture == 0) {
           throw new IllegalStateException(
               "native lightmap texture creation returned zero");
@@ -378,104 +275,101 @@ public class MetalTextureManager {
           NativeBridge.nDestroyTexture2D(lightmapTexture);
         }
         lightmapTexture = newTexture;
-        lightmapWidth = width;
-        lightmapHeight = height;
-        MetalLogger.info("lightmap ready: %dx%d h=%d",
-            width, height, newTexture);
-      } else {
-        if (!NativeBridge.nUpdateTexture2D(
-            lightmapTexture, width, height, lightmapUploadData)) {
-          throw new IllegalStateException(
-              "native lightmap texture update was not submitted");
-        }
+        lightmapWidth = dimensions[0];
+        lightmapHeight = dimensions[1];
+      } else if (!NativeBridge.nUpdateTexture2D(
+          lightmapTexture, dimensions[0], dimensions[1], rgba)) {
+        throw new IllegalStateException(
+            "native lightmap texture update was not submitted");
       }
+
       lightmapLoaded = true;
       if (gameTime != Long.MIN_VALUE) {
         lastUploadedLightmapGameTime = gameTime;
       }
+      return true;
     } catch (Throwable error) {
-      MetalLogger.warn("lightmap readback completion failed: %s",
+      MetalLogger.warn("1.21.1 lightmap readback failed: %s",
           error.getMessage());
+      return false;
+    }
+  }
+
+  private void installBlockAtlas(int width, int height, byte[] rgba) {
+    if (blockAtlasTexture == 0 ||
+        width != blockAtlasWidth || height != blockAtlasHeight) {
+      long newTexture = NativeBridge.nCreateTexture2D(
+          deviceHandle, width, height, rgba);
+      if (newTexture == 0) {
+        throw new IllegalStateException(
+            "native block atlas texture creation returned zero");
+      }
+      if (blockAtlasTexture != 0 && blockAtlasTexture != newTexture) {
+        NativeBridge.nDestroyTexture2D(blockAtlasTexture);
+      }
+      blockAtlasTexture = newTexture;
+      blockAtlasWidth = width;
+      blockAtlasHeight = height;
+    } else if (!NativeBridge.nUpdateTexture2D(
+        blockAtlasTexture, width, height, rgba)) {
+      throw new IllegalStateException(
+          "native block atlas texture update was not submitted");
+    }
+
+    blockAtlasLoaded = true;
+    usingFallbackBlockAtlas = false;
+    completedAtlasRevision = ATLAS_DIRTY_REVISION.get();
+    atlasDirty = false;
+  }
+
+  private static int[] queryTextureSize(int glTextureId) {
+    if (glTextureId <= 0) {
+      return null;
+    }
+
+    int previousBinding =
+        GL11C.glGetInteger(GL11C.GL_TEXTURE_BINDING_2D);
+    try {
+      GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, glTextureId);
+      int width = GL11C.glGetTexLevelParameteri(
+          GL11C.GL_TEXTURE_2D, 0, GL11C.GL_TEXTURE_WIDTH);
+      int height = GL11C.glGetTexLevelParameteri(
+          GL11C.GL_TEXTURE_2D, 0, GL11C.GL_TEXTURE_HEIGHT);
+      if (width <= 0 || height <= 0) {
+        return null;
+      }
+      return new int[] {width, height};
     } finally {
-      finishLightmapReadback(request);
+      GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, previousBinding);
     }
   }
 
-  private static void copyMappedBytes(
-      GpuBuffer buffer, byte[] destination, int dataSize) {
-    try (var mapped = buffer.map(0, dataSize, true, false)) {
-      ByteBuffer source = mapped.data().duplicate();
-      source.position(0);
-      source.limit(dataSize);
-      source.get(destination, 0, dataSize);
+  private static byte[] readTexturePixels(
+      int glTextureId, int width, int height) {
+    long bytes = (long) width * (long) height * 4L;
+    if (bytes <= 0 || bytes > Integer.MAX_VALUE) {
+      return null;
     }
-  }
 
-  private static int rgbaDataSize(int width, int height) {
-    if (width <= 0 || height <= 0) {
-      return -1;
-    }
-    long pixels = (long) width * (long) height;
-    long bytes = pixels * 4L;
-    return bytes > Integer.MAX_VALUE ? -1 : (int) bytes;
-  }
-
-  private void queueFailedAtlasReadbackCleanup(ReadbackRequest request) {
+    int previousBinding =
+        GL11C.glGetInteger(GL11C.GL_TEXTURE_BINDING_2D);
+    ByteBuffer buffer = BufferUtils.createByteBuffer((int) bytes);
     try {
-      RenderSystem.queueFencedTask(() -> finishAtlasReadback(request));
-    } catch (Throwable cleanupError) {
-      // Ambiguous ownership is safer as a one-shot leak than an in-flight PBO
-      // deletion. destroy() invalidates the generation so no upload can occur.
-      readbackGeneration++;
-      MetalLogger.warn("atlas readback cleanup could not be fenced: %s",
-          cleanupError.getMessage());
-    }
-  }
-
-  private void queueFailedLightmapReadbackCleanup(ReadbackRequest request) {
-    try {
-      RenderSystem.queueFencedTask(() -> finishLightmapReadback(request));
-    } catch (Throwable cleanupError) {
-      readbackGeneration++;
-      MetalLogger.warn("lightmap readback cleanup could not be fenced: %s",
-          cleanupError.getMessage());
-    }
-  }
-
-  private void finishAtlasReadback(ReadbackRequest request) {
-    if (!request.finished.compareAndSet(false, true)) {
-      return;
-    }
-    if (atlasReadbackRequest == request) {
-      atlasReadbackRequest = null;
-      atlasReadbackPending = false;
-    }
-    if (!request.buffer.isClosed()) {
-      request.buffer.close();
-    }
-  }
-
-  private void finishLightmapReadback(ReadbackRequest request) {
-    if (!request.finished.compareAndSet(false, true)) {
-      return;
-    }
-    if (lightmapReadbackRequest == request) {
-      lightmapReadbackRequest = null;
-      lightmapReadbackPending = false;
-    }
-    if (!request.buffer.isClosed()) {
-      request.buffer.close();
+      GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, glTextureId);
+      GL11C.glPixelStorei(GL11C.GL_PACK_ALIGNMENT, 1);
+      GL11C.glGetTexImage(
+          GL11C.GL_TEXTURE_2D, 0,
+          GL11C.GL_RGBA, GL11C.GL_UNSIGNED_BYTE, buffer);
+      byte[] rgba = new byte[(int) bytes];
+      buffer.rewind();
+      buffer.get(rgba);
+      return rgba;
+    } finally {
+      GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, previousBinding);
     }
   }
 
   public void destroy() {
-    readbackGeneration++;
-    if (atlasReadbackRequest != null) {
-      atlasReadbackRequest.cancelled = true;
-    }
-    if (lightmapReadbackRequest != null) {
-      lightmapReadbackRequest.cancelled = true;
-    }
     if (blockAtlasTexture != 0) {
       NativeBridge.nDestroyTexture2D(blockAtlasTexture);
       blockAtlasTexture = 0;
@@ -484,6 +378,7 @@ public class MetalTextureManager {
       NativeBridge.nDestroyTexture2D(lightmapTexture);
       lightmapTexture = 0;
     }
+
     blockAtlasLoaded = false;
     lightmapLoaded = false;
     usingFallbackBlockAtlas = false;
@@ -491,12 +386,15 @@ public class MetalTextureManager {
     blockAtlasHeight = 0;
     lightmapWidth = 0;
     lightmapHeight = 0;
-    lastLightmapObservedGameTime = Long.MIN_VALUE;
-    lastUploadedLightmapGameTime = Long.MIN_VALUE;
     atlasUploadData = null;
     lightmapUploadData = null;
     atlasFramesSinceUpload = 0;
+    lightmapFramesSinceUpload = 0;
+    lastAtlasUploadNanos = Long.MIN_VALUE;
+    lastLightmapObservedGameTime = Long.MIN_VALUE;
+    lastUploadedLightmapGameTime = Long.MIN_VALUE;
     completedAtlasRevision = 0L;
     markAtlasDirty();
   }
+
 }

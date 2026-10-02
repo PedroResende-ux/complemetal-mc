@@ -3,6 +3,7 @@ package com.pebbles_boon.metalrender.compat.iris;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.IntBuffer;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -13,6 +14,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import org.lwjgl.opengl.GL20C;
+import org.lwjgl.opengl.GL43C;
+import org.lwjgl.system.MemoryStack;
 
 /**
  * Bounded render-thread capture bridge for unique Iris GL pipeline variants.
@@ -142,6 +146,179 @@ public final class IrisPipelineStateCapture {
         resolved.descriptor()));
   }
 
+  /**
+   * Captures any generation-safe direct GL execution command, including
+   * Sodium's multi-draw batch representation.
+   */
+  public Optional<PendingState> captureDrawDirect(
+      IrisExecutionCommand command) {
+    Objects.requireNonNull(command, "command");
+    int glProgram = currentGlProgram;
+    Optional<IrisProgramIdentityRegistry.Registration> registration =
+        identities.lookup(glProgram);
+    if (registration.isEmpty()) {
+      return Optional.empty();
+    }
+    IrisProgramIdentityRegistry.Registration resolved =
+        registration.orElseThrow();
+    drawsObserved.incrementAndGet();
+    IrisVertexInputBindings inputs =
+        IrisGlVertexArrayTracker.global().snapshot(resolved.descriptor());
+    PreparedDirectCapture prepared = prepareDirectCapture(command, inputs,
+        resolved.descriptor());
+    if (!(prepared.command() instanceof IrisExecutionCommand.Draw draw)) {
+      return Optional.empty();
+    }
+    return Optional.of(capture(resolved,
+        tracker.snapshotDraw(draw.primitiveMode()),
+        prepared.command(), prepared.vertexInputs()));
+  }
+
+  private PreparedDirectCapture prepareDirectCapture(
+      IrisExecutionCommand command, IrisVertexInputBindings inputs,
+      IrisProgramIdentityRegistry.ProgramDescriptor descriptor) {
+    if (!(command instanceof IrisExecutionCommand.MultiDrawIndexed multi)
+        || multi.source() != IrisExecutionCommand.Source.SODIUM_COMMAND_LIST) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+    if (!inputs.complete() || inputs.vertexBuffers().isEmpty()
+        || inputs.indexBuffer().isEmpty()) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    IrisPipelineState.VertexBufferLayout vertexLayout =
+        descriptor.vertexBuffers().stream()
+            .filter(layout -> layout.bufferIndex() == 0)
+            .findFirst().orElse(null);
+    IrisVertexInputBindings.BufferSlice vertexSlice =
+        inputs.vertexBuffers().stream()
+            .filter(slice -> slice.slot() == 0)
+            .findFirst().orElse(null);
+    IrisVertexInputBindings.BufferSlice indexSlice =
+        inputs.indexBuffer().orElse(null);
+    if (vertexLayout == null || vertexSlice == null || indexSlice == null
+        || vertexLayout.strideBytes() <= 0) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    long[] offsets = multi.indexOffsetsBytes();
+    int[] counts = multi.indexCounts();
+    int[] bases = multi.baseVertices();
+    int indexBytes = multi.indexElementBytes();
+    long minIndexOffset = Long.MAX_VALUE;
+    long maxIndexEnd = Long.MIN_VALUE;
+    for (int draw = 0; draw < offsets.length; draw++) {
+      long offset = offsets[draw];
+      long bytes = Math.multiplyExact((long) counts[draw], indexBytes);
+      long end = Math.addExact(offset, bytes);
+      if (offset < indexSlice.offsetBytes()
+          || end > Math.addExact(indexSlice.offsetBytes(),
+              indexSlice.lengthBytes())) {
+        return new PreparedDirectCapture(command, inputs);
+      }
+      if (bytes > 0) {
+        minIndexOffset = Math.min(minIndexOffset, offset);
+        maxIndexEnd = Math.max(maxIndexEnd, end);
+      }
+    }
+    if (minIndexOffset == Long.MAX_VALUE || maxIndexEnd <= minIndexOffset) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    long indexLength = maxIndexEnd - minIndexOffset;
+    Optional<IrisGlBufferMirror.BufferSnapshot> indexSnapshot =
+        IrisGlBufferMirror.global().snapshot(
+            indexSlice.glBuffer(), indexSlice.mirrorGeneration(),
+            minIndexOffset, indexLength);
+    if (indexSnapshot.isEmpty()) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    long minVertex = Long.MAX_VALUE;
+    long maxVertex = Long.MIN_VALUE;
+    byte[] indexBytesData = indexSnapshot.orElseThrow().ownedBytes();
+    ByteBuffer indexData = ByteBuffer.wrap(indexBytesData)
+        .order(ByteOrder.LITTLE_ENDIAN);
+    for (int draw = 0; draw < offsets.length; draw++) {
+      int count = counts[draw];
+      long relative = offsets[draw] - minIndexOffset;
+      for (int element = 0; element < count; element++) {
+        long byteOffset = relative + (long) element * indexBytes;
+        if (byteOffset < 0
+            || byteOffset > indexBytesData.length - indexBytes) {
+          return new PreparedDirectCapture(command, inputs);
+        }
+        long raw = switch (indexBytes) {
+          case 1 -> Byte.toUnsignedInt(
+              indexData.get(Math.toIntExact(byteOffset)));
+          case 2 -> Short.toUnsignedInt(
+              indexData.getShort(Math.toIntExact(byteOffset)));
+          case 4 -> Integer.toUnsignedLong(
+              indexData.getInt(Math.toIntExact(byteOffset)));
+          default -> throw new IllegalArgumentException(
+              "unsupported Sodium index width");
+        };
+        long vertex = raw + bases[draw];
+        if (vertex < 0) {
+          return new PreparedDirectCapture(command, inputs);
+        }
+        minVertex = Math.min(minVertex, vertex);
+        maxVertex = Math.max(maxVertex, vertex);
+      }
+    }
+    if (minVertex == Long.MAX_VALUE || maxVertex < minVertex) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    long stride = vertexLayout.strideBytes();
+    long vertexStart = Math.addExact(vertexSlice.offsetBytes(),
+        Math.multiplyExact(minVertex, stride));
+    long vertexEndExclusive = Math.addExact(
+        vertexSlice.offsetBytes(),
+        Math.multiplyExact(Math.addExact(maxVertex, 1), stride));
+    long vertexBufferEnd = Math.addExact(vertexSlice.offsetBytes(),
+        vertexSlice.lengthBytes());
+    if (vertexStart < vertexSlice.offsetBytes()
+        || vertexEndExclusive > vertexBufferEnd) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+
+    long[] rebasedOffsets = new long[offsets.length];
+    int[] rebasedBases = new int[bases.length];
+    long minBase = minVertex;
+    if (minBase < Integer.MIN_VALUE || minBase > Integer.MAX_VALUE) {
+      return new PreparedDirectCapture(command, inputs);
+    }
+    int rebase = Math.toIntExact(minBase);
+    for (int draw = 0; draw < offsets.length; draw++) {
+      rebasedOffsets[draw] = Math.subtractExact(offsets[draw],
+          minIndexOffset);
+      rebasedBases[draw] = Math.subtractExact(bases[draw], rebase);
+    }
+
+    IrisVertexInputBindings compactInputs =
+        new IrisVertexInputBindings(
+            List.of(new IrisVertexInputBindings.BufferSlice(
+                vertexSlice.slot(), vertexSlice.glBuffer(), vertexStart,
+                vertexEndExclusive - vertexStart,
+                vertexSlice.mirrorGeneration())),
+            Optional.of(new IrisVertexInputBindings.BufferSlice(
+                indexSlice.slot(), indexSlice.glBuffer(), minIndexOffset,
+                indexLength, indexSlice.mirrorGeneration())),
+            "");
+
+    IrisExecutionCommand.MultiDrawIndexed compactCommand =
+        new IrisExecutionCommand.MultiDrawIndexed(
+            multi.primitiveMode(), indexBytes, rebasedOffsets, counts,
+            rebasedBases, multi.source());
+    return new PreparedDirectCapture(compactCommand, compactInputs);
+  }
+
+  private record PreparedDirectCapture(
+      IrisExecutionCommand command,
+      IrisVertexInputBindings vertexInputs) {
+  }
+
   public void draw(IrisExecutionCommand.Draw command,
       IrisVertexInputBindings vertexInputBindings) {
     captureDraw(command, vertexInputBindings);
@@ -165,11 +342,61 @@ public final class IrisPipelineStateCapture {
         vertexInputBindings));
   }
 
-  public void dispatch() {
-    dispatch(new IrisExecutionCommand.UnknownDispatch());
+  public boolean dispatch() {
+    return dispatch(new IrisExecutionCommand.UnknownDispatch());
   }
 
-  public void dispatch(IrisExecutionCommand command) {
+  public IrisExecutionCommand.Dispatch captureIndirectDispatchCommand(
+      long offsetBytes) {
+    if (offsetBytes < 0) {
+      throw new IllegalArgumentException(
+          "negative indirect dispatch offset");
+    }
+    int buffer = org.lwjgl.opengl.GL43C.glGetInteger(
+        org.lwjgl.opengl.GL43C.GL_DISPATCH_INDIRECT_BUFFER);
+    if (buffer <= 0) {
+      throw new IllegalArgumentException(
+          "compute indirect buffer unavailable");
+    }
+    IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
+    long generation = mirror.generation(buffer);
+    if (generation <= 0 || offsetBytes > Integer.MAX_VALUE - 12L) {
+      throw new IllegalArgumentException(
+          "compute indirect buffer snapshot unavailable");
+    }
+    var snapshot = mirror.snapshot(buffer, generation, offsetBytes, 12)
+        .orElseThrow(() -> new IllegalArgumentException(
+            "compute indirect buffer snapshot unavailable"));
+    java.nio.ByteBuffer bytes = java.nio.ByteBuffer.wrap(snapshot.bytes())
+        .order(java.nio.ByteOrder.nativeOrder());
+    int groupsX = bytes.getInt();
+    int groupsY = bytes.getInt();
+    int groupsZ = bytes.getInt();
+    return captureDispatchCommand(groupsX, groupsY, groupsZ);
+  }
+
+  public IrisExecutionCommand.Dispatch captureDispatchCommand(
+      int groupsX, int groupsY, int groupsZ) {
+    int program = currentGlProgram;
+    if (program <= 0) {
+      throw new IllegalArgumentException("compute dispatch has no program");
+    }
+    try (MemoryStack stack = MemoryStack.stackPush()) {
+      IntBuffer workgroup = stack.mallocInt(3);
+      GL20C.glGetProgramiv(program, GL43C.GL_COMPUTE_WORK_GROUP_SIZE,
+          workgroup);
+      int localX = workgroup.get(0);
+      int localY = workgroup.get(1);
+      int localZ = workgroup.get(2);
+      return new IrisExecutionCommand.Dispatch(groupsX, groupsY, groupsZ,
+          localX, localY, localZ);
+    } catch (RuntimeException failure) {
+      throw new IllegalArgumentException(
+          "compute workgroup size unavailable", failure);
+    }
+  }
+
+  public boolean dispatch(IrisExecutionCommand command) {
     Objects.requireNonNull(command, "command");
     if (command instanceof IrisExecutionCommand.Draw) {
       throw new IllegalArgumentException("draw command used for dispatch");
@@ -178,11 +405,12 @@ public final class IrisPipelineStateCapture {
     Optional<IrisProgramIdentityRegistry.Registration> registration =
         identities.lookup(glProgram);
     if (registration.isEmpty()) {
-      return;
+      return false;
     }
     dispatchesObserved.incrementAndGet();
     capture(registration.orElseThrow(), tracker.snapshotDispatch(), command,
         IrisVertexInputBindings.complete(java.util.List.of(), null));
+    return true;
   }
 
   private PendingState capture(
@@ -194,12 +422,14 @@ public final class IrisPipelineStateCapture {
     IrisRenderGraph.Phase phase =
         IrisRenderGraphCapture.global().currentPhase();
     boolean draw = command instanceof IrisExecutionCommand.Draw;
+    boolean dispatch = command instanceof IrisExecutionCommand.Dispatch;
     boolean sampledReplay = IrisGlBufferMirror.isEnabled() && draw
         && IrisRenderGraphCapture.global().reserveShadowReplaySample();
     boolean cutoverReplay = IrisGlBufferMirror.isEnabled() && draw
         && IrisTranslationCoordinator.cutoverCaptureRequested(phase,
             registration, snapshot);
-    boolean graphReplay = IrisGlBufferMirror.isEnabled() && draw
+    boolean graphReplay = IrisGlBufferMirror.isEnabled()
+        && (draw || dispatch)
         && IrisRenderGraphCapture.global().captureFullGraphReplay();
     boolean captureReplay = sampledReplay || cutoverReplay || graphReplay;
     Optional<IrisReplayCaptureRequirements> captureRequirements =
@@ -218,7 +448,7 @@ public final class IrisPipelineStateCapture {
                 IrisGlBufferMirror.global(), registration.descriptor(),
                 IrisGlGenericAttributeTracker.global())
             : IrisShadowReplayBufferSnapshot.disabled();
-    if (captureReplay) {
+    if (captureReplay && draw) {
       IrisPrimitiveExpansion.Result expansion =
           IrisPrimitiveExpansion.expand(command, replayBuffers);
       command = expansion.command();
@@ -262,7 +492,11 @@ public final class IrisPipelineStateCapture {
         && !IrisTranslationCoordinator.fullGraphOwnershipCaptureActive()) {
       IrisVisualParityCapture.global().associate(pending, phase);
     }
-    IrisRenderGraphCapture.global().draw(pending);
+    if (command instanceof IrisExecutionCommand.Draw) {
+      IrisRenderGraphCapture.global().draw(pending);
+    } else {
+      IrisRenderGraphCapture.global().dispatch(pending);
+    }
     offer(pending);
     return pending;
   }

@@ -1,6 +1,5 @@
 package com.pebbles_boon.metalrender.render;
 
-import com.mojang.blaze3d.systems.RenderSystem;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.compat.IrisCompatibility;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
@@ -61,19 +60,9 @@ public final class MetalRenderHookState {
       return false;
     }
 
-    String backendDescription;
-    try {
-      var device = RenderSystem.tryGetDevice();
-      backendDescription = device == null || device.getDeviceInfo() == null
-          ? null
-          : device.getDeviceInfo().backendName();
-    } catch (Throwable error) {
-      return false;
-    }
-    if (backendDescription == null || backendDescription.isBlank()) {
-      return false;
-    }
-
+    // Minecraft 1.21.1 is OpenGL-only. The GpuDevice/backend abstraction
+    // used for this check was introduced by later Minecraft versions.
+    String backendDescription = "OpenGL";
     String normalized = backendDescription.toLowerCase(Locale.ROOT);
     graphicsBackendName = backendDescription;
     if (normalized.contains("vulkan") || normalized.contains(".vk.")) {
@@ -248,12 +237,30 @@ public final class MetalRenderHookState {
         stage, frameId, reason);
   }
 
-  public static boolean canReplaceTerrain() {
+  /** Returns true only during a prepared Metal world frame, before presentation. */
+  public static boolean isFramePrepared() {
+    return framePrepared && !framePresented;
+  }
+
+  /**
+   * Pre-presentation gate used by the Sodium 1.21.1 render-layer hook.
+   * Presentation itself cannot be required here because this hook runs before
+   * vanilla finishes the level render.
+   */
+  public static boolean canReplaceTerrainDuringFrame() {
     MetalRenderConfig config = MetalRenderClient.getConfig();
     return config != null && config.enableFastTerrainReplacement &&
         !IrisCompatibility.requiresShaderCompatibilityMode() &&
         screenshotFallbackFrames == 0 &&
-        isMetalFrameUsable() && presentationReady;
+        isMetalFrameUsable();
+  }
+
+  /**
+   * Post-presentation gate retained for code paths which intentionally require
+   * a completed Metal handoff.
+   */
+  public static boolean canReplaceTerrain() {
+    return canReplaceTerrainDuringFrame() && presentationReady;
   }
 
   public static boolean canReplaceEntities() {

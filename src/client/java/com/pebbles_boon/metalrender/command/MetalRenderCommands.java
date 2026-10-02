@@ -11,18 +11,21 @@ import com.pebbles_boon.metalrender.render.MetalRenderHookState;
 import com.pebbles_boon.metalrender.render.MetalWorldRenderer;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import net.minecraft.client.Minecraft;
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
-import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import com.mojang.brigadier.CommandDispatcher;
+import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
+import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.network.chat.Component;
 
 public final class MetalRenderCommands {
 
-    private static LiteralArgumentBuilder<FabricClientCommandSource> literal(String name) {
+    private static LiteralArgumentBuilder<CommandSourceStack> literal(String name) {
         return LiteralArgumentBuilder.literal(name);
     }
 
     public static void register() {
-        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+        // NeoForge owns the client command dispatcher; registration is event-driven.
+        net.neoforged.neoforge.common.NeoForge.EVENT_BUS.addListener((RegisterClientCommandsEvent event) -> {
+            CommandDispatcher<CommandSourceStack> dispatcher = event.getDispatcher();
             dispatcher.register(commandTree("complemetal"));
             dispatcher.register(commandTree("cm"));
             dispatcher.register(commandTree("metalrender"));
@@ -31,7 +34,7 @@ public final class MetalRenderCommands {
         MetalLogger.info("Complemetal client commands registered");
     }
 
-    private static LiteralArgumentBuilder<FabricClientCommandSource> commandTree(String root) {
+    private static LiteralArgumentBuilder<CommandSourceStack> commandTree(String root) {
         return literal(root)
                             .then(literal("help").executes(ctx -> {
                                 sendHelp(ctx.getSource());
@@ -45,21 +48,21 @@ public final class MetalRenderCommands {
 
                             .then(literal("cache")
                                     .then(literal("clear")
-                                      .requires(FabricClientCommandSource::attended)
+                                      .requires(source -> true)
                                       .executes(ctx -> {
                                         cacheClear(ctx.getSource());
                                         return 1;
                                     })))
 
                             .then(literal("reload")
-                              .requires(FabricClientCommandSource::attended)
+                              .requires(source -> true)
                               .executes(ctx -> {
                                 reloadWorld(ctx.getSource());
                                 return 1;
                             }))
 
                             .then(literal("restart")
-                              .requires(FabricClientCommandSource::attended)
+                              .requires(source -> true)
                               .executes(ctx -> {
                                 restart(ctx.getSource());
                                 return 1;
@@ -78,7 +81,7 @@ public final class MetalRenderCommands {
                                         return 1;
                                     }))
                                     .then(literal("reload")
-                                      .requires(FabricClientCommandSource::attended)
+                                      .requires(source -> true)
                                       .executes(ctx -> {
                                         boolean ok = MetalRenderClient.reloadConfig();
                                         msg(ctx.getSource(), ok
@@ -87,7 +90,7 @@ public final class MetalRenderCommands {
                                         return 1;
                                     }))
                                     .then(literal("reset")
-                                      .requires(FabricClientCommandSource::attended)
+                                      .requires(source -> true)
                                       .executes(ctx -> {
                                         resetConfig(ctx.getSource());
                                         return 1;
@@ -95,7 +98,7 @@ public final class MetalRenderCommands {
 
                             .then(literal("performance")
                                     .then(literal("reset")
-                                      .requires(FabricClientCommandSource::attended)
+                                      .requires(source -> true)
                                       .executes(ctx -> {
                                         MetalRenderConfig.setResolutionScale(1.0f);
                                         MetalRenderClient.requestDeferredApply(false, false, true);
@@ -119,14 +122,14 @@ public final class MetalRenderCommands {
                             });
     }
 
-    private static void msg(FabricClientCommandSource src, String text) {
+    private static void msg(CommandSourceStack src, String text) {
         Minecraft mc = Minecraft.getInstance();
         if (mc != null && mc.player != null) {
             mc.player.sendSystemMessage(Component.literal(text));
         }
     }
 
-    private static void sendHelp(FabricClientCommandSource src) {
+    private static void sendHelp(CommandSourceStack src) {
         msg(src, "§6§l--- Complemetal Commands ---");
         msg(src, "§e/complemetal status §7- Show renderer and backend status");
         msg(src, "§e/complemetal cache clear §7- Clear generated terrain meshes");
@@ -138,7 +141,7 @@ public final class MetalRenderCommands {
         msg(src, "§7Aliases: §e/cm, /metalrender, /mr");
     }
 
-    private static void openConfigScreen(FabricClientCommandSource src) {
+    private static void openConfigScreen(CommandSourceStack src) {
         try {
             Minecraft mc = Minecraft.getInstance();
             if (mc == null) {
@@ -152,7 +155,7 @@ public final class MetalRenderCommands {
         }
     }
 
-    private static void sendStatus(FabricClientCommandSource src) {
+    private static void sendStatus(CommandSourceStack src) {
         boolean available = MetalRenderClient.isMetalAvailable();
         MetalRenderConfig cfg = MetalRenderClient.getConfig();
         boolean enabled = cfg != null && cfg.enableMetalRendering;
@@ -442,7 +445,7 @@ public final class MetalRenderCommands {
         }
     }
 
-    private static void cacheClear(FabricClientCommandSource src) {
+    private static void cacheClear(CommandSourceStack src) {
         MetalWorldRenderer wr = MetalRenderClient.getWorldRenderer();
         if (wr != null) {
             wr.getChunkMesher().clearAllMeshes();
@@ -452,7 +455,7 @@ public final class MetalRenderCommands {
         }
     }
 
-    private static void reloadWorld(FabricClientCommandSource src) {
+    private static void reloadWorld(CommandSourceStack src) {
         try {
             Minecraft mc = Minecraft.getInstance();
             boolean vanillaRebuilt = MetalRenderClient.rebuildLevelRenderer(mc);
@@ -468,7 +471,7 @@ public final class MetalRenderCommands {
         }
     }
 
-    private static void restart(FabricClientCommandSource src) {
+    private static void restart(CommandSourceStack src) {
         try {
             boolean restarted = MetalRenderClient.restartRenderer(Minecraft.getInstance());
             msg(src, restarted
@@ -479,7 +482,7 @@ public final class MetalRenderCommands {
         }
     }
 
-    private static void resetConfig(FabricClientCommandSource src) {
+    private static void resetConfig(CommandSourceStack src) {
         MetalRenderClient.resetConfig();
         invalidateAllMeshes();
         msg(src, "§eComplemetal settings restored to defaults");

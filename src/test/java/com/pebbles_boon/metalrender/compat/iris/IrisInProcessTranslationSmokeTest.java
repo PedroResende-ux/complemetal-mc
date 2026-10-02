@@ -5,8 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import com.mojang.blaze3d.vertex.VertexFormatElement;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Set;
@@ -154,6 +154,79 @@ final class IrisInProcessTranslationSmokeTest {
   }
 
   @Test
+  void translatesComplementaryStyleMultiTargetAndImageWorkload()
+      throws Exception {
+    assumeEnabled();
+    LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
+        LwjglShadercSpvcBackend.ExecutionPolicy.EXPLICITLY_ENABLED);
+    assertTrue(backend.discover().available(), backend.discover().detail());
+
+    IrisFinalShaderProgram program =
+        IrisFinalShaderProgram.fromGraphicsLink("complementary-style",
+            """
+            #version 330 compatibility
+            noperspective out vec2 texCoord;
+            flat out vec3 sunVec;
+
+            void main() {
+              gl_Position = ftransform();
+              texCoord = (gl_TextureMatrix[0] * gl_MultiTexCoord0).xy;
+              sunVec = normalize(gl_NormalMatrix * gl_Normal);
+            }
+            """,
+            null, null, null,
+            """
+            #version 330 compatibility
+            noperspective in vec2 texCoord;
+            flat in vec3 sunVec;
+            uniform sampler2D colortex3;
+            uniform sampler2D depthtex1;
+            uniform float viewWidth;
+            uniform float viewHeight;
+            layout(binding = 7, rgba16f) uniform image2D voxel_img;
+
+            void main() {
+              ivec2 texelCoord = ivec2(
+                  texCoord * vec2(viewWidth, viewHeight));
+              vec4 color = textureLod(colortex3, texCoord, 0.0);
+              float depth = texelFetch(depthtex1, texelCoord, 0).r;
+              vec3 gradient = dFdx(color.rgb) + dFdy(color.rgb);
+              vec3 normal = normalize(vec3(gradient.xy, 1.0));
+              vec3 lighting = reflect(normalize(sunVec), normal);
+              color.rgb = mix(color.rgb, lighting, 0.125);
+              imageStore(voxel_img, texelCoord, vec4(color.rgb, depth));
+
+              gl_FragData[0] = color;
+              gl_FragData[1] = vec4(gradient, 1.0);
+            }
+            """);
+
+    IrisShaderTranslation translation = backend.translate(program);
+
+    assertStage(translation.stage(IrisShaderStage.VERTEX), "vertex");
+    assertStage(translation.stage(IrisShaderStage.FRAGMENT), "fragment");
+
+    IrisSpirvResourceLayout resources = reflect(
+        translation.stage(IrisShaderStage.FRAGMENT).spirv());
+    assertTrue(names(resources).contains("colortex3"),
+        names(resources).toString());
+    assertTrue(names(resources).contains("depthtex1"),
+        names(resources).toString());
+    assertTrue(names(resources).contains("voxel_img"),
+        names(resources).toString());
+
+    IrisMslArgumentLayoutReader.StageResult argumentLayout =
+        IrisMslArgumentLayoutReader.reflect(
+            IrisShaderStage.FRAGMENT,
+            translation.stage(IrisShaderStage.FRAGMENT).spirv());
+    assertTrue(argumentLayout instanceof IrisMslArgumentLayoutReader.StageComplete,
+        argumentLayout.toString());
+    String msl = translation.stage(IrisShaderStage.FRAGMENT).msl();
+    assertTrue(msl.contains("voxel_img"), msl);
+    assertTrue(msl.contains("[[buffer(0)]]"), msl);
+  }
+
+  @Test
   void mapsNormalizedStorageToRawIntegerMetalInput() throws Exception {
     assumeEnabled();
     LwjglShadercSpvcBackend backend = new LwjglShadercSpvcBackend(
@@ -167,8 +240,11 @@ final class IrisInProcessTranslationSmokeTest {
         """;
     IrisVertexLayoutCapture.Layout layout =
         IrisVertexLayoutCapture.resolveShaderInputFormats(vertex,
-            IrisVertexLayoutCapture.capture(VertexFormat.builder(0)
-                .addAttribute("a_LightAndData", GpuFormat.RGBA8_UNORM)
+            IrisVertexLayoutCapture.capture(VertexFormat.builder()
+                .add("a_LightAndData", VertexFormatElement.register(
+                    VertexFormatElement.findNextId(), 0,
+                    VertexFormatElement.Type.UBYTE,
+                    VertexFormatElement.Usage.COLOR, 4))
                 .build(), true));
     IrisFinalShaderProgram program =
         IrisFinalShaderProgram.fromGraphicsLink("normalized-integer-smoke",

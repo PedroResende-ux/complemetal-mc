@@ -6,7 +6,6 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 
 /** Bounded mirror of legacy GL VAO/VBO bindings used by direct Iris draws. */
 public final class IrisGlVertexArrayTracker {
@@ -20,9 +19,9 @@ public final class IrisGlVertexArrayTracker {
   private final LinkedHashMap<Integer, VertexArray> arrays =
       new LinkedHashMap<>(16, 0.75F, true);
   private final Map<Integer, Integer> targetBindings = new HashMap<>();
+  private final Map<Integer, MojangVertexBuffer> mojangVertexBuffers =
+      new HashMap<>();
   private int currentVertexArray;
-  private List<MojangVertexBuffer> mojangVertexBuffers;
-  private String mojangVertexBufferFailure = "";
 
   public static IrisGlVertexArrayTracker global() {
     return GLOBAL;
@@ -31,9 +30,8 @@ public final class IrisGlVertexArrayTracker {
   public synchronized void reset() {
     arrays.clear();
     targetBindings.clear();
+    mojangVertexBuffers.clear();
     currentVertexArray = 0;
-    mojangVertexBuffers = null;
-    mojangVertexBufferFailure = "";
     arrays.put(0, new VertexArray());
   }
 
@@ -42,38 +40,19 @@ public final class IrisGlVertexArrayTracker {
       return;
     }
     currentVertexArray = vertexArray;
-    mojangVertexBuffers = null;
-    mojangVertexBufferFailure = "";
     arrays.computeIfAbsent(vertexArray, ignored -> new VertexArray());
     trimArrays();
   }
 
-  /** Records modern vertex-buffer bindings applied by Mojang's VAO cache. */
-  public synchronized void bindMojangVertexBuffers(
-      List<MojangVertexBuffer> buffers) {
-    Objects.requireNonNull(buffers, "buffers");
-    java.util.ArrayList<MojangVertexBuffer> copied =
-        new java.util.ArrayList<>(buffers);
-    copied.sort(java.util.Comparator.comparingInt(MojangVertexBuffer::slot));
-    for (int index = 0; index < copied.size(); index++) {
-      if (copied.get(index).slot() != index) {
-        invalidateMojangVertexBuffers("mojang-vertex-buffer-slots-incomplete");
-        return;
-      }
+  public synchronized void deleteVertexArray(int vertexArray) {
+    if (vertexArray <= 0) {
+      return;
     }
-    mojangVertexBuffers = List.copyOf(copied);
-    mojangVertexBufferFailure = "";
-  }
-
-  /** Retains an exact reason when the modern VAO binding cannot be mirrored. */
-  public synchronized void invalidateMojangVertexBuffers(String reason) {
-    Objects.requireNonNull(reason, "reason");
-    if (reason.isBlank() || reason.length() > 96
-        || reason.indexOf('\n') >= 0 || reason.indexOf('\r') >= 0) {
-      throw new IllegalArgumentException("invalid Mojang VAO failure");
+    arrays.remove(vertexArray);
+    if (currentVertexArray == vertexArray) {
+      currentVertexArray = 0;
+      arrays.computeIfAbsent(0, ignored -> new VertexArray());
     }
-    mojangVertexBuffers = null;
-    mojangVertexBufferFailure = reason;
   }
 
   public synchronized void bindBuffer(int target, int buffer) {
@@ -93,6 +72,28 @@ public final class IrisGlVertexArrayTracker {
     return targetBindings.getOrDefault(target, 0);
   }
 
+  /**
+   * Mirrors the modern Minecraft vertex-buffer layout path used by 1.21.1.
+   * The binding is generation-qualified so deferred replay cannot accidentally
+   * consume a recycled GL name.
+   */
+  public synchronized void bindMojangVertexBuffers(
+      List<MojangVertexBuffer> buffers) {
+    mojangVertexBuffers.clear();
+    if (buffers == null) {
+      return;
+    }
+    for (MojangVertexBuffer buffer : buffers) {
+      if (buffer == null || buffer.slot < 0 || buffer.slot >= MAX_ATTRIBUTES
+          || buffer.glBuffer <= 0 || buffer.offsetBytes < 0
+          || buffer.lengthBytes <= 0 || buffer.mirrorGeneration < 0
+          || buffer.strideBytes < 0) {
+        continue;
+      }
+      mojangVertexBuffers.put(buffer.slot, buffer);
+    }
+  }
+
   public synchronized void vertexAttribute(int location, int size, int type,
       boolean normalized, int strideBytes, long offsetBytes,
       boolean integer) {
@@ -105,8 +106,6 @@ public final class IrisGlVertexArrayTracker {
       return;
     }
     VertexArray vertexArray = current();
-    mojangVertexBuffers = null;
-    mojangVertexBufferFailure = "";
     Attribute prior = vertexArray.attributes.get(location);
     boolean enabled = prior != null && prior.enabled;
     vertexArray.attributes.put(location, new Attribute(buffer, size, type,
@@ -128,6 +127,8 @@ public final class IrisGlVertexArrayTracker {
       return;
     }
     targetBindings.replaceAll((target, bound) -> bound == buffer ? 0 : bound);
+    mojangVertexBuffers.entrySet().removeIf(
+        entry -> entry.getValue().glBuffer() == buffer);
     for (VertexArray vertexArray : arrays.values()) {
       if (vertexArray.elementBuffer == buffer) {
         vertexArray.elementBuffer = 0;
@@ -135,15 +136,10 @@ public final class IrisGlVertexArrayTracker {
       vertexArray.attributes.entrySet().removeIf(
           entry -> entry.getValue().buffer == buffer);
     }
-    if (mojangVertexBuffers != null && mojangVertexBuffers.stream()
-        .anyMatch(vertex -> vertex.glBuffer() == buffer)) {
-      invalidateMojangVertexBuffers("mojang-vertex-buffer-deleted");
-    }
   }
 
   public synchronized IrisVertexInputBindings snapshot(
       IrisProgramIdentityRegistry.ProgramDescriptor descriptor) {
-    Objects.requireNonNull(descriptor, "descriptor");
     VertexArray vertexArray = current();
     IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
     List<VertexBufferLayout> physicalLayouts = descriptor.vertexBuffers()
@@ -151,15 +147,37 @@ public final class IrisGlVertexArrayTracker {
         .filter(layout -> layout.stepFunction()
             != IrisPipelineState.StepFunction.CONSTANT)
         .toList();
-    if (mojangVertexBuffers != null) {
-      return snapshotMojangBuffers(physicalLayouts, vertexArray);
-    }
-    if (!mojangVertexBufferFailure.isEmpty()) {
-      return IrisVertexInputBindings.unavailable(mojangVertexBufferFailure);
-    }
     java.util.ArrayList<IrisVertexInputBindings.BufferSlice> buffers =
         new java.util.ArrayList<>(physicalLayouts.size());
-    for (VertexBufferLayout layout : physicalLayouts) {
+    if (!mojangVertexBuffers.isEmpty()) {
+      for (VertexBufferLayout layout : physicalLayouts) {
+        MojangVertexBuffer binding =
+            mojangVertexBuffers.get(layout.bufferIndex());
+        if (binding == null
+            || binding.strideBytes != layout.strideBytes()) {
+          return IrisVertexInputBindings.unavailable(
+              "mojang-buffer-layout-mismatch");
+        }
+        long mirrorGeneration =
+            IrisGlBufferMirror.global().generation(binding.glBuffer);
+        long expectedGeneration = binding.mirrorGeneration;
+        if (mirrorGeneration <= 0 || expectedGeneration <= 0
+            || mirrorGeneration != expectedGeneration) {
+          return IrisVertexInputBindings.unavailable(
+              "mojang-buffer-generation-mismatch");
+        }
+        long size = IrisGlBufferMirror.global().size(binding.glBuffer);
+        if (size <= 0 || binding.offsetBytes >= size
+            || binding.lengthBytes > size - binding.offsetBytes) {
+          return IrisVertexInputBindings.unavailable(
+              "mojang-buffer-range-invalid");
+        }
+        buffers.add(new IrisVertexInputBindings.BufferSlice(
+            layout.bufferIndex(), binding.glBuffer, binding.offsetBytes,
+            binding.lengthBytes, expectedGeneration));
+      }
+    } else {
+      for (VertexBufferLayout layout : physicalLayouts) {
       List<VertexAttribute> required = descriptor.vertexAttributes().stream()
           .filter(attribute -> attribute.bufferIndex()
               == layout.bufferIndex())
@@ -197,6 +215,8 @@ public final class IrisGlVertexArrayTracker {
           layout.bufferIndex(), glBuffer, 0, size, generation));
     }
 
+    }
+
     IrisVertexInputBindings.BufferSlice index = null;
     if (vertexArray.elementBuffer > 0) {
       long size = mirror.size(vertexArray.elementBuffer);
@@ -216,49 +236,6 @@ public final class IrisGlVertexArrayTracker {
     }
   }
 
-  private IrisVertexInputBindings snapshotMojangBuffers(
-      List<VertexBufferLayout> physicalLayouts, VertexArray vertexArray) {
-    if (mojangVertexBuffers.size() != physicalLayouts.size()) {
-      return IrisVertexInputBindings.unavailable(
-          "mojang-vertex-buffer-count-mismatch");
-    }
-    java.util.ArrayList<IrisVertexInputBindings.BufferSlice> buffers =
-        new java.util.ArrayList<>(physicalLayouts.size());
-    for (int index = 0; index < physicalLayouts.size(); index++) {
-      VertexBufferLayout layout = physicalLayouts.get(index);
-      MojangVertexBuffer bound = mojangVertexBuffers.get(index);
-      if (layout.bufferIndex() != bound.slot()
-          || layout.strideBytes() != bound.strideBytes()) {
-        return IrisVertexInputBindings.unavailable(
-            "mojang-vertex-buffer-layout-mismatch");
-      }
-      buffers.add(new IrisVertexInputBindings.BufferSlice(bound.slot(),
-          bound.glBuffer(), bound.offsetBytes(), bound.lengthBytes(),
-          bound.mirrorGeneration()));
-    }
-    IrisVertexInputBindings.BufferSlice index = indexBuffer(vertexArray);
-    if (vertexArray.elementBuffer > 0 && index == null) {
-      return IrisVertexInputBindings.unavailable(
-          "vao-index-mirror-unavailable");
-    }
-    return IrisVertexInputBindings.complete(buffers, index);
-  }
-
-  private static IrisVertexInputBindings.BufferSlice indexBuffer(
-      VertexArray vertexArray) {
-    if (vertexArray.elementBuffer <= 0) {
-      return null;
-    }
-    IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
-    long size = mirror.size(vertexArray.elementBuffer);
-    long generation = mirror.generation(vertexArray.elementBuffer);
-    if (size <= 0 || generation <= 0) {
-      return null;
-    }
-    return new IrisVertexInputBindings.BufferSlice(0,
-        vertexArray.elementBuffer, 0, size, generation);
-  }
-
   private VertexArray current() {
     VertexArray vertexArray = arrays.computeIfAbsent(currentVertexArray,
         ignored -> new VertexArray());
@@ -276,6 +253,11 @@ public final class IrisGlVertexArrayTracker {
       }
       arrays.remove(victim);
     }
+  }
+
+  public record MojangVertexBuffer(int slot, int glBuffer,
+                                   long offsetBytes, long lengthBytes,
+                                   long mirrorGeneration, int strideBytes) {
   }
 
   private static final class VertexArray {
@@ -307,16 +289,4 @@ public final class IrisGlVertexArrayTracker {
     }
   }
 
-  /** One exact logical binding installed through {@code VertexArrayCache}. */
-  public record MojangVertexBuffer(int slot, int glBuffer, long offsetBytes,
-                                   long lengthBytes, long mirrorGeneration,
-                                   int strideBytes) {
-    public MojangVertexBuffer {
-      if (slot < 0 || slot >= IrisPipelineState.MAX_VERTEX_BUFFERS
-          || glBuffer <= 0 || offsetBytes < 0 || lengthBytes <= 0
-          || mirrorGeneration < 0 || strideBytes <= 0) {
-        throw new IllegalArgumentException("invalid Mojang vertex buffer");
-      }
-    }
-  }
 }

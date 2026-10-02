@@ -1,8 +1,5 @@
 package com.pebbles_boon.metalrender.render;
 
-import com.mojang.blaze3d.systems.CommandEncoder;
-import com.mojang.blaze3d.systems.RenderPass;
-import com.mojang.blaze3d.systems.RenderSystem;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.backend.MetalRenderer;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
@@ -27,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
+import com.mojang.blaze3d.systems.RenderSystem;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -459,8 +457,8 @@ public class MetalWorldRenderer {
     if (minecraft == null || minecraft.player == null) {
       return true;
     }
-    int playerChunkX = minecraft.player.chunkPosition().x();
-    int playerChunkZ = minecraft.player.chunkPosition().z();
+    int playerChunkX = minecraft.player.chunkPosition().x;
+    int playerChunkZ = minecraft.player.chunkPosition().z;
     it.unimi.dsi.fastutil.longs.LongIterator iterator =
         pendingBuildSet.iterator();
     while (iterator.hasNext()) {
@@ -550,9 +548,9 @@ public class MetalWorldRenderer {
               " fb=" + textureManager.isUsingFallbackBlockAtlas() +
               " m=" + chunkMesher.getMeshCount());
     }
-    Camera camera = mc.gameRenderer.mainCamera();
-    Vector3f camPos = new Vector3f((float) camera.position().x, (float) camera.position().y,
-        (float) camera.position().z);
+    Camera camera = mc.gameRenderer.getMainCamera();
+    Vector3f camPos = new Vector3f((float) camera.getPosition().x, (float) camera.getPosition().y,
+        (float) camera.getPosition().z);
     if (MetalRenderClient.getConfig().enableMetalRendering) {
       long t0 = System.nanoTime();
       int pruneInterval = chunkMesher.getMeshCount() > 3000 ? 120
@@ -711,8 +709,8 @@ public class MetalWorldRenderer {
     }
     projectionMatrix.set(projection);
     modelViewMatrix.set(modelView);
-    Vector3f camPos = new Vector3f((float) camera.position().x, (float) camera.position().y,
-        (float) camera.position().z);
+    Vector3f camPos = new Vector3f((float) camera.getPosition().x, (float) camera.getPosition().y,
+        (float) camera.getPosition().z);
 
     long cullStart = System.nanoTime();
     FrustumCuller latest = AsyncCullTask.getCurrentCull();
@@ -748,11 +746,11 @@ public class MetalWorldRenderer {
     metalProj.m32(0.5f * metalProj.m32() + 0.5f * metalProj.m33());
     renderer.setProjectionMatrix(metalProj);
     renderer.setModelViewMatrix(modelViewMatrix);
-    renderer.setCameraPosition(camera.position().x, camera.position().y,
-        camera.position().z);
+    renderer.setCameraPosition(camera.getPosition().x, camera.getPosition().y,
+        camera.getPosition().z);
     if (NativeBridge.isLibLoaded()) {
       NativeBridge.nSetRenderDistance(
-          Minecraft.getInstance().options.getEffectiveRenderDistance() * 16);
+          Minecraft.getInstance().options.renderDistance().get() * 16);
     }
     if (texturesReady) {
       long blockAtlas = textureManager.getBlockAtlasTexture();
@@ -855,34 +853,12 @@ public class MetalWorldRenderer {
     normalizePlane(out, 20);
   }
 
+  /**
+   * Minecraft 1.21.1 does not expose the newer camera attribute-probe API used
+   * by the newer implementation. Keep a neutral sky factor until a native 1.21.1
+   * light/sky capture path is added.
+   */
   private static float resolveSkyLightFactor(Camera camera, float tickDelta) {
-    if (camera == null || skyLightLookupFailed) {
-      return 1.0f;
-    }
-    Object attributeProbe = camera.attributeProbe();
-    if (attributeProbe == null) {
-      return 1.0f;
-    }
-    try {
-      java.lang.reflect.Field factorField = skyLightFactorField;
-      java.lang.reflect.Method getValueMethod = skyLightProbeGetValueMethod;
-      if (factorField == null || getValueMethod == null) {
-        Class<?> attributesClass = Class.forName(
-            "net.minecraft.world.attribute.EnvironmentAttributes");
-        factorField = attributesClass.getField("SKY_LIGHT_FACTOR");
-        getValueMethod = attributeProbe.getClass().getMethod(
-            "getValue", factorField.getType(), float.class);
-        skyLightFactorField = factorField;
-        skyLightProbeGetValueMethod = getValueMethod;
-      }
-      Object value = getValueMethod.invoke(attributeProbe,
-          factorField.get(null), tickDelta);
-      if (value instanceof Number number) {
-        return number.floatValue();
-      }
-    } catch (ReflectiveOperationException | RuntimeException ignored) {
-      skyLightLookupFailed = true;
-    }
     return 1.0f;
   }
 
@@ -931,10 +907,10 @@ public class MetalWorldRenderer {
         return;
       BlockHitResult hit = (BlockHitResult) mc.hitResult;
       BlockPos pos = hit.getBlockPos();
-      Camera cam = mc.gameRenderer.mainCamera();
-      float bx = (float) (pos.getX() - cam.position().x);
-      float by = (float) (pos.getY() - cam.position().y);
-      float bz = (float) (pos.getZ() - cam.position().z);
+      Camera cam = mc.gameRenderer.getMainCamera();
+      float bx = (float) (pos.getX() - cam.getPosition().x);
+      float by = (float) (pos.getY() - cam.getPosition().y);
+      float bz = (float) (pos.getZ() - cam.getPosition().z);
       float e = 0.002f;
       float x0 = bx - e, y0 = by - e, z0 = bz - e;
       float x1 = bx + 1 + e, y1 = by + 1 + e, z1 = bz + 1 + e;
@@ -1093,9 +1069,6 @@ public class MetalWorldRenderer {
     if (mc.player == null || mc.level == null) {
       return;
     }
-    if (mc.gui.overlay() != null) {
-      return;
-    }
     if (mc.player != null) {
       float yaw = mc.player.getYRot();
       float nextForwardX = (float) -Math.sin(Math.toRadians(yaw));
@@ -1117,8 +1090,8 @@ public class MetalWorldRenderer {
       scanForPendingChunks(mc);
     }
     if (mc.player != null && chunkMesher.getMeshCount() < maxMeshes) {
-      int playerChunkX = mc.player.chunkPosition().x();
-      int playerChunkZ = mc.player.chunkPosition().z();
+      int playerChunkX = mc.player.chunkPosition().x;
+      int playerChunkZ = mc.player.chunkPosition().z;
       int playerSectionY = mc.player.getBlockY() >> 4;
       boolean shouldSortTranslucent = translucencyTrigger.shouldReSort(
           new Vector3f((float) mc.player.getX(), (float) mc.player.getY(), (float) mc.player.getZ()),
@@ -1192,8 +1165,8 @@ public class MetalWorldRenderer {
     } else if (scanPressured) {
       closeRange = Math.min(closeRange, PRESSURED_CLOSE_SCAN_RANGE);
     }
-    int playerChunkX = mc.player.chunkPosition().x();
-    int playerChunkZ = mc.player.chunkPosition().z();
+    int playerChunkX = mc.player.chunkPosition().x;
+    int playerChunkZ = mc.player.chunkPosition().z;
     int playerSectionY = mc.player.getBlockY() >> 4;
     if (scanPressured && !coverageFillActive) {
       if (visibleBacklog < CHUNK_SCAN_SATURATED_THRESHOLD ||
@@ -1791,21 +1764,16 @@ public class MetalWorldRenderer {
       return false;
     }
     MetalRenderer renderer = MetalRenderClient.getRenderer();
-    if (renderer == null || !renderer.isAvailable())
+    if (renderer == null || !renderer.isAvailable()) {
       return false;
-    long handle = renderer.getHandle();
-    if (handle == 0)
-      return false;
-    Minecraft mc = Minecraft.getInstance();
-    if (mc != null && mc.gameRenderer.mainRenderTarget() != null) {
-      CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
-      try (RenderPass pass = encoder.createRenderPass(
-          () -> "metalrender_terrain_blit",
-          mc.gameRenderer.mainRenderTarget().getColorTextureView(),
-          java.util.Optional.empty())) {
-        return ioSurfaceBlitter.blit(handle);
-      }
     }
+    long handle = renderer.getHandle();
+    if (handle == 0) {
+      return false;
+    }
+    // 1.21.1 does not expose the newer RenderPass/CommandEncoder API used by
+    // the upstream branch. The IOSurface blitter already contains the native
+    // texture-to-window path and is loader/version independent.
     return ioSurfaceBlitter.blit(handle);
   }
 
@@ -1898,8 +1866,8 @@ public class MetalWorldRenderer {
     resetBulkUpdateRecoveryState();
     Minecraft mc = Minecraft.getInstance();
     if (mc != null && mc.player != null && mc.level != null) {
-      int playerChunkX = mc.player.chunkPosition().x();
-      int playerChunkZ = mc.player.chunkPosition().z();
+      int playerChunkX = mc.player.chunkPosition().x;
+      int playerChunkZ = mc.player.chunkPosition().z;
       int playerSectionY = mc.player.getBlockY() >> 4;
       int renderDist = mc.options.renderDistance().get();
       scanRingsInRange(mc.level, playerChunkX, playerChunkZ, playerSectionY, 0,
@@ -1952,10 +1920,10 @@ public class MetalWorldRenderer {
     boolean highPriorityChunk = shouldPrioritizeLoadedChunk(chunkX, chunkZ);
     Minecraft mc = Minecraft.getInstance();
     int playerChunkX = mc != null && mc.player != null
-        ? mc.player.chunkPosition().x()
+        ? mc.player.chunkPosition().x
         : Integer.MIN_VALUE;
     int playerChunkZ = mc != null && mc.player != null
-        ? mc.player.chunkPosition().z()
+        ? mc.player.chunkPosition().z
         : Integer.MIN_VALUE;
     int loadedChunkDistance = mc != null && mc.player != null
         ? Math.max(Math.abs(chunkX - playerChunkX),
@@ -2039,8 +2007,8 @@ public class MetalWorldRenderer {
     Minecraft mc = Minecraft.getInstance();
     if (mc == null || mc.player == null)
       return false;
-    int playerChunkX = mc.player.chunkPosition().x();
-    int playerChunkZ = mc.player.chunkPosition().z();
+    int playerChunkX = mc.player.chunkPosition().x;
+    int playerChunkZ = mc.player.chunkPosition().z;
     int dx = chunkX - playerChunkX;
     int dz = chunkZ - playerChunkZ;
     int chunkDistance = Math.max(Math.abs(dx), Math.abs(dz));

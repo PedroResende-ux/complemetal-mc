@@ -55,18 +55,105 @@ public record IrisMetalGraphResourcePlan(List<Allocation> allocations) {
           usage |= USAGE_SHADER_READ;
         }
         if (use.access().writes()) {
-          if (node.kind() == NodeKind.DRAW
-              || node.kind() == NodeKind.CLEAR) {
+          if (node.kind() == NodeKind.CLEAR) {
             usage |= USAGE_RENDER_TARGET;
           } else if (node.kind() == NodeKind.DISPATCH) {
             usage |= USAGE_SHADER_WRITE;
           } else if (node.kind().transfer()) {
             usage |= USAGE_TRANSFER_DESTINATION;
           }
+          // DRAW writes are classified below from the actual GL attachment
+          // list. A storage-image WRITE is also a ResourceUse.WRITE, but it
+          // must not acquire render-target usage merely because it happens
+          // inside a graphics pipeline.
         }
         usages[use.resourceId()] |= usage;
       }
     }
+    // Only actual framebuffer attachments need render-target usage.
+    // Graph resources written only through image units stay shader-writable
+    // without unnecessarily requesting attachment support from Metal.
+    for (IrisRenderExecutionPlan.Step step : plan.steps()) {
+      if (!(step instanceof IrisRenderExecutionPlan.PipelineStep pipeline)
+          || pipeline.kind() != NodeKind.DRAW) {
+        continue;
+      }
+      IrisGlStateSnapshot snapshot = pipeline.pending().snapshot();
+      for (IrisGlStateSnapshot.ColorTarget target
+          : snapshot.colorTargets()) {
+        if (target.attachment().isKnown()) {
+          target.attachment().value().ifPresent(attachment ->
+              markRenderTarget(plan, usages, attachment.texture()));
+        }
+      }
+      if (snapshot.depthAttachment().isKnown()) {
+        snapshot.depthAttachment().value().ifPresent(attachment ->
+            markRenderTarget(plan, usages, attachment.texture()));
+      }
+      if (snapshot.stencilAttachment().isKnown()) {
+        snapshot.stencilAttachment().value().ifPresent(attachment ->
+            markRenderTarget(plan, usages, attachment.texture()));
+      }
+    }
+
+    // A full-surface color MSAA blit is lowered to a Metal render-pass
+    // multisample resolve. Both sides therefore participate in render-pass
+    // attachment validation rather than using the ordinary transfer-copy
+    // usage path.
+    for (IrisRenderExecutionPlan.Step step : plan.steps()) {
+      if (!(step instanceof IrisRenderExecutionPlan.TransferStep transfer)
+          || !(transfer.command()
+              instanceof IrisTransferCommand.BlitFramebuffer blit)
+          || blit.mask() != IrisTransferCommand.GL_COLOR_BUFFER_BIT) {
+        continue;
+      }
+      boolean multisample = transfer.resources().stream()
+          .map(IrisRenderGraph.ResourceUse::resourceId)
+          .distinct()
+          .anyMatch(resourceId ->
+              plan.graph().resources().get(resourceId).sampleCount() > 1);
+      if (!multisample) {
+        continue;
+      }
+      for (IrisRenderGraph.ResourceUse use : transfer.resources()) {
+        int resourceId = use.resourceId();
+        if (resourceId >= 0 && resourceId < usages.length) {
+          usages[resourceId] |= USAGE_RENDER_TARGET;
+        }
+      }
+    }
+
+    // Graphics passes can write storage images without using them as
+    // framebuffer attachments. Mark those exact image-bound textures as
+    // shader-writable so their persistent Metal allocation is created with
+    // MTLTextureUsageShaderWrite.
+    for (IrisRenderExecutionPlan.Step step : plan.steps()) {
+      if (!(step instanceof IrisRenderExecutionPlan.PipelineStep pipeline)) {
+        continue;
+      }
+      IrisGlResourceBindingSnapshot bindings =
+          pipeline.pending().resourceBindings();
+      if (bindings == null) {
+        continue;
+      }
+      for (IrisGlResourceBindingSnapshot.ImageUnitBinding binding
+          : bindings.imageUnits().values()) {
+        if (binding.texture() <= 0 || binding.access() == 0x88B8) {
+          continue;
+        }
+        for (IrisRenderExecutionPlan.ResourceBinding resourceBinding
+            : plan.resourceBindings()) {
+          IrisGlStateSnapshot.ResourceHandle handle =
+              resourceBinding.handle();
+          if (handle.kind()
+              == IrisGlStateSnapshot.ResourceKind.TEXTURE
+              && handle.name() == binding.texture()) {
+            usages[resourceBinding.resourceId()] |= USAGE_SHADER_WRITE;
+          }
+        }
+      }
+    }
+
     // Mutable OpenGL textures are commonly defined with only level zero and
     // acquire the rest of their storage when glGenerateMipmap runs. The graph
     // snapshot therefore legitimately reports one level even though the
@@ -114,6 +201,22 @@ public record IrisMetalGraphResourcePlan(List<Allocation> allocations) {
     return allocations.isEmpty()
         ? new Unsupported("graph-has-no-metal-attachments")
         : new Complete(new IrisMetalGraphResourcePlan(allocations));
+  }
+
+  private static void markRenderTarget(
+      IrisRenderExecutionPlan plan, int[] usages,
+      IrisGlStateSnapshot.ResourceHandle handle) {
+    if (handle == null
+        || handle.kind() != IrisGlStateSnapshot.ResourceKind.TEXTURE) {
+      return;
+    }
+    for (IrisRenderExecutionPlan.ResourceBinding binding
+        : plan.resourceBindings()) {
+      if (binding.handle().equals(handle)) {
+        usages[binding.resourceId()] |= USAGE_RENDER_TARGET;
+        return;
+      }
+    }
   }
 
   static int fullMipChainLevels(int width, int height) {

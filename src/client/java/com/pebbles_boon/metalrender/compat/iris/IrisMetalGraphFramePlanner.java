@@ -188,47 +188,130 @@ public final class IrisMetalGraphFramePlanner {
 
       IrisRenderExecutionPlan.PipelineStep pipeline =
           (IrisRenderExecutionPlan.PipelineStep) step;
-      if (pipeline.kind() != IrisRenderGraph.NodeKind.DRAW) {
-        throw unsupported("graph-frame-dispatch-unimplemented");
+      boolean compute = pipeline.kind() == IrisRenderGraph.NodeKind.DISPATCH;
+      if (!compute && pipeline.kind() != IrisRenderGraph.NodeKind.DRAW) {
+        throw unsupported("graph-frame-pipeline-kind-unsupported");
       }
-      TargetExtent extent = targetExtent(plan, pipeline, tokensById);
+      TargetExtent extent = compute
+          ? new TargetExtent(1, 1)
+          : targetExtent(plan, pipeline, tokensById, idsByHandle);
       DrawResult resolvedResult = drawResolver.resolve(pipeline,
           extent.width(), extent.height());
       if (resolvedResult instanceof UnsupportedDraw blocked) {
         throw unsupported(blocked.reason());
       }
       ResolvedDraw resolved = ((CompleteDraw) resolvedResult).draw();
+
+      if (compute) {
+        if (!(pipeline.pending().command()
+            instanceof IrisExecutionCommand.Dispatch dispatch)) {
+          throw unsupported("graph-frame-compute-command-invalid");
+        }
+        List<ResourceUse> nodeUses = plan.graph().nodes()
+            .get(pipeline.nodeId()).resources();
+        Set<Integer> storageImageTextures = pipeline.pending()
+            .resourceBindings().imageUnits().values().stream()
+            .filter(binding -> binding.texture() > 0)
+            .map(IrisGlResourceBindingSnapshot.ImageUnitBinding::texture)
+            .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        Set<Integer> storageImageWriteTextures = pipeline.pending()
+            .resourceBindings().imageUnits().values().stream()
+            .filter(binding -> binding.texture() > 0
+                && binding.access() != 0x88B8)
+            .map(IrisGlResourceBindingSnapshot.ImageUnitBinding::texture)
+            .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        Map<Integer, IrisGlTextureMirror.TextureSnapshot> initialBootstraps =
+            initialTextureBootstraps(plan, pipeline, tokensById, initialized,
+                resolved.sampledTextureNames(), storageImageTextures);
+        Map<Integer, Integer> overrides = textureOverrides(plan, pipeline,
+            tokensById, idsByTextureName, initialized, Set.of(),
+            resolved.sampledTextureNames(), storageImageWriteTextures);
+        Map<Integer, Integer> externalBuffers = inputBuffers.register(
+            resolved.requiredBufferImages());
+        Map<Integer, Integer> externalTextures = inputTextures.register(
+            resolved.requiredTextures(), graphTextureInputExclusions(
+                overrides, initialBootstraps));
+        appendInitialTextureBootstraps(operations, initialBootstraps,
+            externalTextures);
+        initialBootstraps.keySet().forEach(resourceId -> {
+          initialized.add(resourceId);
+          written.add(resourceId);
+        });
+        List<Integer> graphResources = nodeUses.stream()
+            .filter(use -> tokensById.containsKey(use.resourceId()))
+            .map(ResourceUse::resourceId)
+            .distinct().sorted().toList();
+        operations.add(new IrisMetalGraphFramePacketEncoder.Compute(
+            resolved.pipelineKeySha256(),
+            resolved.replayPacket(overrides.keySet(), externalBuffers,
+                externalTextures),
+            dispatch.groupsX(), dispatch.groupsY(), dispatch.groupsZ(),
+            graphResources));
+        for (ResourceUse use : nodeUses) {
+          if (use.access().writes()) {
+            initialized.add(use.resourceId());
+            written.add(use.resourceId());
+          }
+        }
+        if (pipeline.nodeId() == diagnosticReadbackNode) {
+          break;
+        }
+        continue;
+      }
+
       DrawTargets targets = drawTargets(plan, pipeline, resolved.state(),
           tokensById, idsByHandle);
+      Set<Integer> storageImageTextures = pipeline.pending()
+          .resourceBindings().imageUnits().values().stream()
+          .filter(binding -> binding.texture() > 0)
+          .map(IrisGlResourceBindingSnapshot.ImageUnitBinding::texture)
+          .collect(java.util.stream.Collectors.toUnmodifiableSet());
+      Set<Integer> storageImageWriteTextures = pipeline.pending()
+          .resourceBindings().imageUnits().values().stream()
+          .filter(binding -> binding.texture() > 0
+              && binding.access() != 0x88B8)
+          .map(IrisGlResourceBindingSnapshot.ImageUnitBinding::texture)
+          .collect(java.util.stream.Collectors.toUnmodifiableSet());
+      Map<Integer, IrisGlTextureMirror.TextureSnapshot> initialBootstraps =
+          initialTextureBootstraps(plan, pipeline, tokensById, initialized,
+              resolved.sampledTextureNames(), storageImageTextures);
+      Map<Integer, Integer> overrides = textureOverrides(plan, pipeline,
+          tokensById, idsByTextureName, initialized, targets.allTargets(),
+          resolved.sampledTextureNames(), storageImageWriteTextures);
+      Map<Integer, Integer> externalBuffers = inputBuffers.register(
+          resolved.requiredBufferImages());
+      Map<Integer, Integer> externalTextures = inputTextures.register(
+          resolved.requiredTextures(), graphTextureInputExclusions(
+              overrides, initialBootstraps));
+      appendInitialTextureBootstraps(operations, initialBootstraps,
+          externalTextures);
+      initialBootstraps.keySet().forEach(resourceId -> {
+        initialized.add(resourceId);
+        written.add(resourceId);
+      });
       // A persistent graph attachment has no defined contents on its first
       // Metal frame, while MTL4 render passes below intentionally use Load to
-      // preserve pixels outside the draw.  Bootstrap each first-use target to
-      // deterministic GL-compatible defaults.  The graph remains validation
-      // only until visual parity passes, so temporal shader-pack resources can
-      // warm up without ever replacing the visible OpenGL frame.
+      // preserve pixels outside the draw. Bootstrap remaining first-use
+      // targets to deterministic GL-compatible defaults.
       for (Integer target : targets.allTargets().stream().sorted().toList()) {
         if (initialized.add(target)) {
           operations.add(bootstrapClearOperation(
-              plan.graph().resources().get(target), target));
+              plan.graph().resources().get(target), target,
+              targets.targetMipLevel(target)));
           written.add(target);
         }
       }
       validateDrawResourceRouting(plan, pipeline, tokensById, initialized,
           targets.allTargets(), handlesById,
-          resolved.sampledTextureNames());
-      Map<Integer, Integer> overrides = textureOverrides(plan, pipeline,
-          tokensById, idsByTextureName, initialized, targets.allTargets(),
-          resolved.sampledTextureNames());
-      Map<Integer, Integer> externalBuffers = inputBuffers.register(
-          resolved.requiredBufferImages());
-      Map<Integer, Integer> externalTextures = inputTextures.register(
-          resolved.requiredTextures(), overrides.keySet());
+          resolved.sampledTextureNames(), storageImageWriteTextures,
+          storageImageTextures);
       operations.add(new IrisMetalGraphFramePacketEncoder.Draw(
           resolved.pipelineKeySha256(),
           resolved.replayPacket(overrides.keySet(), externalBuffers,
               externalTextures),
           targets.colors(), targets.depthResourceId(),
-          targets.stencilResourceId(), overrides));
+          targets.depthMipLevel(), targets.stencilResourceId(),
+          targets.stencilMipLevel(), overrides));
       initialized.addAll(targets.allTargets());
       written.addAll(targets.allTargets());
       if ((pipeline.phase() == IrisRenderGraph.Phase.FINAL
@@ -350,31 +433,32 @@ public final class IrisMetalGraphFramePlanner {
   }
 
   private static IrisMetalGraphFramePacketEncoder.Clear
-      bootstrapClearOperation(Resource resource, int resourceId) {
+      bootstrapClearOperation(Resource resource, int resourceId,
+          int mipLevel) {
     String format = resource.format();
     if (depthFormat(format) && stencilFormat(format)) {
-      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId,
+      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId, mipLevel,
           IrisMetalGraphFramePacketEncoder.Aspect.DEPTH_STENCIL,
           IrisClearCommand.ValueKind.FLOAT32,
           List.of(Integer.toUnsignedLong(Float.floatToRawIntBits(1.0F)),
               0L), Optional.empty());
     }
     if (depthFormat(format)) {
-      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId,
+      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId, mipLevel,
           IrisMetalGraphFramePacketEncoder.Aspect.DEPTH,
           IrisClearCommand.ValueKind.FLOAT32,
           List.of(Integer.toUnsignedLong(Float.floatToRawIntBits(1.0F))),
           Optional.empty());
     }
     if (stencilFormat(format)) {
-      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId,
+      return new IrisMetalGraphFramePacketEncoder.Clear(resourceId, mipLevel,
           IrisMetalGraphFramePacketEncoder.Aspect.STENCIL,
           IrisClearCommand.ValueKind.SINT32, List.of(0L), Optional.empty());
     }
     if (!colorFormat(format)) {
       throw unsupported("graph-frame-bootstrap-format-unsupported");
     }
-    return new IrisMetalGraphFramePacketEncoder.Clear(resourceId,
+    return new IrisMetalGraphFramePacketEncoder.Clear(resourceId, mipLevel,
         IrisMetalGraphFramePacketEncoder.Aspect.COLOR,
         IrisClearCommand.ValueKind.FLOAT32,
         List.of(0L, 0L, 0L, 0L), Optional.empty());
@@ -438,6 +522,10 @@ public final class IrisMetalGraphFramePlanner {
     }
     ArrayList<IrisMetalGraphFramePacketEncoder.Operation> operations =
         new ArrayList<>();
+    if (hasRepeatedFormat(plan, sources)
+        || hasRepeatedFormat(plan, destinations)) {
+      throw unsupported("graph-frame-blit-routing-ambiguous");
+    }
     ArrayList<Integer> unmatched = new ArrayList<>(destinations);
     for (Integer source : sources) {
       Resource sourceResource = plan.graph().resources().get(source);
@@ -451,20 +539,47 @@ public final class IrisMetalGraphFramePlanner {
       if (!aspectIncluded(sourceResource.format(), blit.mask())) {
         continue;
       }
+      boolean multisampleResolve = sourceResource.sampleCount() != 1
+          || destinationResource.sampleCount() != 1;
+      if (multisampleResolve) {
+        if (blit.mask() != IrisTransferCommand.GL_COLOR_BUFFER_BIT
+            || sourceResource.sampleCount() <= 1
+            || destinationResource.sampleCount() != 1
+            || sourceResource.mipLevels() != 1
+            || destinationResource.mipLevels() != 1
+            || sourceResource.depthOrLayers() != 1
+            || destinationResource.depthOrLayers() != 1
+            || blit.sourceX0() != 0 || blit.sourceY0() != 0
+            || blit.destinationX0() != 0 || blit.destinationY0() != 0
+            || sourceWidth != sourceResource.width()
+            || sourceHeight != sourceResource.height()
+            || destinationWidth != destinationResource.width()
+            || destinationHeight != destinationResource.height()) {
+          throw unsupported("graph-frame-multisample-blit-unimplemented");
+        }
+      }
       operations.add(new IrisMetalGraphFramePacketEncoder.CopyTexture(source,
           destination, 0, 0, blit.sourceX0(), blit.sourceY0(),
           blit.destinationX0(), blit.destinationY0(), sourceWidth,
           sourceHeight));
       unmatched.remove(destination);
-      if (sourceResource.sampleCount() != 1
-          || destinationResource.sampleCount() != 1) {
-        throw unsupported("graph-frame-multisample-blit-unimplemented");
-      }
     }
     if (operations.isEmpty() || !unmatched.isEmpty()) {
       throw unsupported("graph-frame-blit-routing-ambiguous");
     }
     return List.copyOf(operations);
+  }
+
+  static boolean hasRepeatedFormat(
+      IrisRenderExecutionPlan plan, List<Integer> resourceIds) {
+    HashSet<String> formats = new HashSet<>();
+    for (Integer resourceId : resourceIds) {
+      String format = plan.graph().resources().get(resourceId).format();
+      if (!formats.add(format)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static IrisMetalGraphFramePacketEncoder.CopyTexture copyTexture(
@@ -497,21 +612,47 @@ public final class IrisMetalGraphFramePlanner {
 
   private static TargetExtent targetExtent(IrisRenderExecutionPlan plan,
       IrisRenderExecutionPlan.PipelineStep pipeline,
-      Map<Integer, Long> tokensById) {
+      Map<Integer, Long> tokensById,
+      Map<ResourceHandle, Integer> idsByHandle) {
     int width = 0;
     int height = 0;
     int samples = 0;
-    for (ResourceUse use : plan.graph().nodes().get(pipeline.nodeId())
-        .resources()) {
-      if (!use.access().writes() || !tokensById.containsKey(use.resourceId())) {
+    IrisGlStateSnapshot snapshot = pipeline.pending().snapshot();
+    ArrayList<IrisGlStateSnapshot.TextureAttachment> attachments =
+        new ArrayList<>();
+    for (IrisGlStateSnapshot.ColorTarget target : snapshot.colorTargets()) {
+      if (!target.drawBuffer().isKnown()
+          || target.drawBuffer().value() == IrisGlStateTracker.GL_NONE
+          || !target.attachment().isKnown()
+          || target.attachment().value().isEmpty()) {
         continue;
       }
-      Resource resource = plan.graph().resources().get(use.resourceId());
+      attachments.add(target.attachment().value().orElseThrow());
+    }
+    if (snapshot.depthAttachment().isKnown()) {
+      snapshot.depthAttachment().value().ifPresent(attachments::add);
+    }
+    if (snapshot.stencilAttachment().isKnown()) {
+      snapshot.stencilAttachment().value().ifPresent(attachments::add);
+    }
+    for (IrisGlStateSnapshot.TextureAttachment attachment : attachments) {
+      Integer resourceId = idsByHandle.get(attachment.texture());
+      if (resourceId == null || !tokensById.containsKey(resourceId)) {
+        continue;
+      }
+      Resource resource = plan.graph().resources().get(resourceId);
+      if (attachment.mipLevel() >= resource.mipLevels()) {
+        throw unsupported("graph-frame-attachment-mip-unavailable");
+      }
+      int attachmentWidth = Math.max(1,
+          resource.width() >> attachment.mipLevel());
+      int attachmentHeight = Math.max(1,
+          resource.height() >> attachment.mipLevel());
       if (width == 0) {
-        width = resource.width();
-        height = resource.height();
+        width = attachmentWidth;
+        height = attachmentHeight;
         samples = resource.sampleCount();
-      } else if (width != resource.width() || height != resource.height()
+      } else if (width != attachmentWidth || height != attachmentHeight
           || samples != resource.sampleCount()) {
         throw unsupported("graph-frame-render-target-extent-mismatch");
       }
@@ -520,6 +661,34 @@ public final class IrisMetalGraphFramePlanner {
       throw unsupported("graph-frame-render-target-unavailable");
     }
     return new TargetExtent(width, height);
+  }
+
+  private static int attachmentMipLevel(
+      IrisGlStateSnapshot snapshot, ResourceHandle handle) {
+    for (IrisGlStateSnapshot.ColorTarget target : snapshot.colorTargets()) {
+      if (!target.attachment().isKnown()
+          || target.attachment().value().isEmpty()) {
+        continue;
+      }
+      IrisGlStateSnapshot.TextureAttachment attachment =
+          target.attachment().value().orElseThrow();
+      if (attachment.texture().equals(handle)) {
+        return attachment.mipLevel();
+      }
+    }
+    if (snapshot.depthAttachment().isKnown()
+        && snapshot.depthAttachment().value().isPresent()
+        && snapshot.depthAttachment().value().orElseThrow().texture()
+            .equals(handle)) {
+      return snapshot.depthAttachment().value().orElseThrow().mipLevel();
+    }
+    if (snapshot.stencilAttachment().isKnown()
+        && snapshot.stencilAttachment().value().isPresent()
+        && snapshot.stencilAttachment().value().orElseThrow().texture()
+            .equals(handle)) {
+      return snapshot.stencilAttachment().value().orElseThrow().mipLevel();
+    }
+    throw unsupported("graph-frame-attachment-mip-unavailable");
   }
 
   private static DrawTargets drawTargets(IrisRenderExecutionPlan plan,
@@ -540,25 +709,27 @@ public final class IrisMetalGraphFramePlanner {
       }
       IrisGlStateSnapshot.TextureAttachment attachment =
           target.attachment().value().orElseThrow();
-      if (attachment.mipLevel() != 0) {
-        throw unsupported("graph-frame-attachment-mip-unimplemented");
-      }
       Integer resourceId = idsByHandle.get(attachment.texture());
       if (resourceId == null || !tokensById.containsKey(resourceId)
           || !expected.format().cacheName().equals(
-              plan.graph().resources().get(resourceId).format())) {
+              plan.graph().resources().get(resourceId).format())
+          || attachment.mipLevel() >= plan.graph().resources()
+              .get(resourceId).mipLevels()) {
         throw unsupported("graph-frame-color-target-mismatch");
       }
       colors.add(new IrisMetalGraphFramePacketEncoder.ColorTarget(
-          expected.slot(), resourceId));
+          expected.slot(), resourceId, attachment.mipLevel()));
       allTargets.add(resourceId);
     }
     int depth = attachmentResource(snapshot.depthAttachment(),
         state.depthAttachmentFormat(), plan, tokensById, idsByHandle,
         "depth");
+    int depthMip = depth >= 0 ? attachmentMip(snapshot.depthAttachment()) : 0;
     int stencil = attachmentResource(snapshot.stencilAttachment(),
         state.stencilAttachmentFormat(), plan, tokensById, idsByHandle,
         "stencil");
+    int stencilMip =
+        stencil >= 0 ? attachmentMip(snapshot.stencilAttachment()) : 0;
     if (depth >= 0) {
       allTargets.add(depth);
     }
@@ -568,7 +739,8 @@ public final class IrisMetalGraphFramePlanner {
     if (colors.isEmpty() && depth < 0 && stencil < 0) {
       throw unsupported("graph-frame-draw-has-no-target");
     }
-    return new DrawTargets(colors, depth, stencil, allTargets);
+    return new DrawTargets(colors, depth, depthMip, stencil, stencilMip,
+        allTargets);
   }
 
   private static int attachmentResource(IrisGlStateSnapshot.StateValue<
@@ -587,16 +759,24 @@ public final class IrisMetalGraphFramePlanner {
     }
     IrisGlStateSnapshot.TextureAttachment attachment =
         captured.value().orElseThrow();
-    if (attachment.mipLevel() != 0) {
-      throw unsupported("graph-frame-attachment-mip-unimplemented");
-    }
     Integer resourceId = idsByHandle.get(attachment.texture());
     if (resourceId == null || !tokensById.containsKey(resourceId)
         || !expected.orElseThrow().cacheName().equals(
-            plan.graph().resources().get(resourceId).format())) {
+            plan.graph().resources().get(resourceId).format())
+        || attachment.mipLevel() >= plan.graph().resources()
+            .get(resourceId).mipLevels()) {
       throw unsupported("graph-frame-" + label + "-target-mismatch");
     }
     return resourceId;
+  }
+
+  private static int attachmentMip(
+      IrisGlStateSnapshot.StateValue<Optional<
+          IrisGlStateSnapshot.TextureAttachment>> captured) {
+    if (!captured.isKnown() || captured.value().isEmpty()) {
+      return 0;
+    }
+    return captured.value().orElseThrow().mipLevel();
   }
 
   private static Map<Integer, Integer> textureOverrides(
@@ -604,7 +784,8 @@ public final class IrisMetalGraphFramePlanner {
       IrisRenderExecutionPlan.PipelineStep pipeline,
       Map<Integer, Long> tokensById, Map<Integer, List<Integer>> idsByName,
       Set<Integer> initialized, Set<Integer> targets,
-      Set<Integer> sampledTextureNames) {
+      Set<Integer> sampledTextureNames,
+      Set<Integer> storageImageWriteTextures) {
     int diagnosticCutNode = Integer.getInteger(
         EXACT_JAR_DIAGNOSTIC_CUT_NODE_PROPERTY, -1);
     int diagnosticCutTexture = Integer.getInteger(
@@ -631,17 +812,18 @@ public final class IrisMetalGraphFramePlanner {
         }
         continue;
       }
+      boolean storageImageWrite =
+          storageImageWriteTextures.contains(glName);
       List<Integer> candidates = idsByName.getOrDefault(glName, List.of())
           .stream().filter(tokensById::containsKey)
-          .filter(initialized::contains).toList();
+          .filter(resourceId -> storageImageWrite
+              || initialized.contains(resourceId))
+          .toList();
       if (candidates.size() > 1) {
         throw unsupported("graph-frame-texture-override-ambiguous");
       }
       if (candidates.size() == 1) {
         int resourceId = candidates.getFirst();
-        if (targets.contains(resourceId)) {
-          throw unsupported("graph-frame-render-feedback-unimplemented");
-        }
         Resource resource = plan.graph().resources().get(resourceId);
         IrisGlTextureMirror.TextureSnapshot captured = pipeline.pending()
             .replayTextures().textures().get(glName);
@@ -704,7 +886,9 @@ public final class IrisMetalGraphFramePlanner {
       IrisRenderExecutionPlan.PipelineStep pipeline,
       Map<Integer, Long> tokensById, Set<Integer> initialized,
       Set<Integer> targets, Map<Integer, ResourceHandle> handlesById,
-      Set<Integer> sampledTextureNames) {
+      Set<Integer> sampledTextureNames,
+      Set<Integer> storageImageWriteTextures,
+      Set<Integer> storageImageTextures) {
     for (Integer target : targets) {
       if (!initialized.contains(target)) {
         throw unsupported("graph-frame-render-target-uninitialized");
@@ -716,7 +900,20 @@ public final class IrisMetalGraphFramePlanner {
         continue;
       }
       if (use.access().writes() && !targets.contains(use.resourceId())) {
-        throw unsupported("graph-frame-storage-image-write-unimplemented");
+        ResourceHandle writeHandle = handlesById.get(use.resourceId());
+        if (writeHandle == null
+            || writeHandle.kind() != ResourceKind.TEXTURE
+            || !storageImageWriteTextures.contains(writeHandle.name())) {
+          throw unsupported("graph-frame-storage-image-write-unimplemented");
+        }
+        // Storage-image writes are valid graph side effects when the texture
+        // is allocated with SHADER_WRITE usage. The replay argument table
+        // binds the same graph texture for read_write image access; the native
+        // MTL4 path already tracks the operation as a pending write and inserts
+        // the required queue barrier before subsequent consumers. Keep only
+        // true render-target feedback blocked here because Metal cannot bind a
+        // texture simultaneously as an attachment and a read/write image in
+        // the same render pass.
       }
       if (!use.access().reads() || initialized.contains(use.resourceId())) {
         continue;
@@ -725,7 +922,8 @@ public final class IrisMetalGraphFramePlanner {
       if (handle == null || handle.kind() != ResourceKind.TEXTURE) {
         throw unsupported("graph-frame-initial-resource-unavailable");
       }
-      if (!initialTextureSnapshotRequired(handle, sampledTextureNames)) {
+      if (!initialTextureSnapshotRequired(handle, sampledTextureNames,
+          storageImageTextures)) {
         continue;
       }
       IrisGlTextureMirror.TextureSnapshot snapshot = pipeline.pending()
@@ -749,8 +947,20 @@ public final class IrisMetalGraphFramePlanner {
 
   static boolean initialTextureSnapshotRequired(ResourceHandle handle,
       Set<Integer> sampledTextureNames) {
+    return initialTextureSnapshotRequired(handle, sampledTextureNames, Set.of());
+  }
+
+  /**
+   * A resource first consumed through either a sampler or an image unit must
+   * inherit its existing GL contents before Metal takes ownership. Image-only
+   * reads are not necessarily present in the sampler-name set.
+   */
+  static boolean initialTextureSnapshotRequired(ResourceHandle handle,
+      Set<Integer> sampledTextureNames,
+      Set<Integer> storageImageTextures) {
     return handle != null && handle.kind() == ResourceKind.TEXTURE
-        && sampledTextureNames.contains(handle.name());
+        && (sampledTextureNames.contains(handle.name())
+            || storageImageTextures.contains(handle.name()));
   }
 
   /**
@@ -765,10 +975,85 @@ public final class IrisMetalGraphFramePlanner {
         && (snapshot.format().equals(resource.format())
             || resource.format().equals("rg11b10-float")
                 && snapshot.format().equals("rgba16-float"));
-    return snapshot != null && snapshot.mipLevel() == 0
-        && snapshot.layer() == 0 && formatCompatible
-        && snapshot.width() == resource.width()
-        && snapshot.height() == resource.height();
+    if (snapshot == null || snapshot.layer() != 0
+        || !formatCompatible || snapshot.mipLevel() < 0
+        || snapshot.mipLevel() >= resource.mipLevels()
+        || snapshot.mipLevel() > 30) {
+      return false;
+    }
+    int expectedWidth = Math.max(1,
+        resource.width() >> snapshot.mipLevel());
+    int expectedHeight = Math.max(1,
+        resource.height() >> snapshot.mipLevel());
+    return snapshot.width() == expectedWidth
+        && snapshot.height() == expectedHeight;
+  }
+
+  private static Map<Integer, IrisGlTextureMirror.TextureSnapshot>
+      initialTextureBootstraps(
+      IrisRenderExecutionPlan plan,
+      IrisRenderExecutionPlan.PipelineStep pipeline,
+      Map<Integer, Long> tokensById, Set<Integer> initialized,
+      Set<Integer> sampledTextureNames, Set<Integer> storageImageTextures) {
+    LinkedHashMap<Integer, IrisGlTextureMirror.TextureSnapshot> result =
+        new LinkedHashMap<>();
+    IrisRenderGraph.Node node = plan.graph().nodes().get(pipeline.nodeId());
+    for (ResourceUse use : node.resources()) {
+      if (!use.access().reads() || initialized.contains(use.resourceId())
+          || !tokensById.containsKey(use.resourceId())) {
+        continue;
+      }
+      ResourceHandle handle = null;
+      for (IrisRenderExecutionPlan.ResourceBinding binding :
+          plan.resourceBindings()) {
+        if (binding.resourceId() == use.resourceId()) {
+          handle = binding.handle();
+          break;
+        }
+      }
+      if (handle == null || handle.kind() != ResourceKind.TEXTURE
+          || !initialTextureSnapshotRequired(handle, sampledTextureNames,
+              storageImageTextures)) {
+        continue;
+      }
+      IrisGlTextureMirror.TextureSnapshot snapshot = pipeline.pending()
+          .replayTextures().textures().get(handle.name());
+      Resource resource = plan.graph().resources().get(use.resourceId());
+      if (!initialTextureSnapshotCompatible(snapshot, resource)) {
+        throw unsupported("graph-frame-initial-texture-snapshot-unavailable");
+      }
+      if (result.putIfAbsent(use.resourceId(), snapshot) != null) {
+        throw unsupported("graph-frame-initial-texture-bootstrap-ambiguous");
+      }
+    }
+    return Map.copyOf(result);
+  }
+
+  private static Set<Integer> graphTextureInputExclusions(
+      Map<Integer, Integer> overrides,
+      Map<Integer, IrisGlTextureMirror.TextureSnapshot> bootstraps) {
+    HashSet<Integer> exclusions = new HashSet<>(overrides.keySet());
+    for (IrisGlTextureMirror.TextureSnapshot snapshot : bootstraps.values()) {
+      exclusions.remove(snapshot.texture());
+    }
+    return Set.copyOf(exclusions);
+  }
+
+  private static void appendInitialTextureBootstraps(
+      List<IrisMetalGraphFramePacketEncoder.Operation> operations,
+      Map<Integer, IrisGlTextureMirror.TextureSnapshot> bootstraps,
+      Map<Integer, Integer> inputTextureIds) {
+    for (Map.Entry<Integer, IrisGlTextureMirror.TextureSnapshot> entry
+        : bootstraps.entrySet()) {
+      IrisGlTextureMirror.TextureSnapshot snapshot = entry.getValue();
+      Integer inputTextureId = inputTextureIds.get(snapshot.texture());
+      if (inputTextureId == null) {
+        throw unsupported("graph-frame-initial-texture-input-unavailable");
+      }
+      operations.add(new IrisMetalGraphFramePacketEncoder.CopyInputTexture(
+          inputTextureId, entry.getKey(), snapshot.mipLevel(),
+          snapshot.width(), snapshot.height()));
+    }
   }
 
   private static boolean clearFormatMatches(String format, int buffer) {
@@ -1221,11 +1506,40 @@ public final class IrisMetalGraphFramePlanner {
 
   private record DrawTargets(
       List<IrisMetalGraphFramePacketEncoder.ColorTarget> colors,
-      int depthResourceId, int stencilResourceId,
+      int depthResourceId, int depthMipLevel,
+      int stencilResourceId, int stencilMipLevel,
       Set<Integer> allTargets) {
     private DrawTargets {
       colors = List.copyOf(colors);
       allTargets = Set.copyOf(allTargets);
+    }
+
+    private int targetMipLevel(int resourceId) {
+      int result = -1;
+      for (IrisMetalGraphFramePacketEncoder.ColorTarget target : colors) {
+        if (target.resourceId() == resourceId) {
+          if (result >= 0 && result != target.mipLevel()) {
+            throw unsupported("graph-frame-attachment-mip-ambiguous");
+          }
+          result = target.mipLevel();
+        }
+      }
+      if (depthResourceId == resourceId) {
+        if (result >= 0 && result != depthMipLevel) {
+          throw unsupported("graph-frame-attachment-mip-ambiguous");
+        }
+        result = depthMipLevel;
+      }
+      if (stencilResourceId == resourceId) {
+        if (result >= 0 && result != stencilMipLevel) {
+          throw unsupported("graph-frame-attachment-mip-ambiguous");
+        }
+        result = stencilMipLevel;
+      }
+      if (result < 0) {
+        throw unsupported("graph-frame-attachment-mip-unavailable");
+      }
+      return result;
     }
   }
 
