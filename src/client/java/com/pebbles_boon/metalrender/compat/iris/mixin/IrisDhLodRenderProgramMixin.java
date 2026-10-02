@@ -19,8 +19,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  *
  * <p>Iris links this program directly with LWJGL, bypassing both
  * {@code ShaderCreator.link} and {@code ProgramBuilder}. The vertex layout
- * below is the exact interleaved DH 3.2.0 terrain ABI: u16x4 position at byte
- * 0, normalized u8x4 color at byte 8, and u8x4 Iris metadata at byte 12.</p>
+ * below matches the interleaved LOD attributes that Iris binds for its
+ * 1.21.1 Distant Horizons terrain program: u16x4 position at byte 0,
+ * normalized u8x4 color at byte 8, and u8x4 Iris metadata at byte 12.</p>
  */
 @Pseudo
 @Mixin(targets = "net.irisshaders.iris.compat.dh.IrisLodRenderProgram",
