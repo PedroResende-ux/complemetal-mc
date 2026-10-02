@@ -39,7 +39,11 @@ public abstract class IrisSodiumGlRenderDeviceMixin {
   @Inject(method = "unbindVertexArray", at = @At("RETURN"), require = 0,
       remap = false)
   private void metalrender$unbindVertexArray(CallbackInfo ci) {
-    IrisSodiumGlStateBridge.bindVertexArray(0);
+    try {
+      IrisSodiumGlStateBridge.bindVertexArray(0);
+    } catch (RuntimeException ignored) {
+      // Observational path is fail-open.
+    }
   }
 
   @Inject(method = "bindBuffer", at = @At("RETURN"), require = 0,
@@ -83,7 +87,11 @@ public abstract class IrisSodiumGlRenderDeviceMixin {
       remap = false)
   private void metalrender$allocateStorage(GlMutableBuffer buffer, long size,
       GlBufferUsage usage, CallbackInfo ci) {
-    IrisSodiumGlStateBridge.allocate(buffer.handle(), size);
+    try {
+      IrisSodiumGlStateBridge.allocate(buffer.handle(), size);
+    } catch (RuntimeException ignored) {
+      // Preserve Sodium behavior; incomplete mirrors block replay later.
+    }
   }
 
   @Inject(method = "copyBufferSubData", at = @At("RETURN"), require = 0,
@@ -104,27 +112,43 @@ public abstract class IrisSodiumGlRenderDeviceMixin {
   private void metalrender$mapBuffer(GlBuffer buffer, long offset,
       long length, EnumBitField<GlBufferMapFlags> flags,
       CallbackInfoReturnable<GlBufferMapping> callback) {
-    IrisSodiumGlStateBridge.mapped(callback.getReturnValue(), offset, length);
+    try {
+      IrisSodiumGlStateBridge.mapped(callback.getReturnValue(), offset, length);
+    } catch (RuntimeException ignored) {
+      // Preserve Sodium behavior; incomplete mirrors block replay later.
+    }
   }
 
   @Inject(method = "flushMappedRange", at = @At("HEAD"), require = 0,
       remap = false)
   private void metalrender$flushMappedRange(GlBufferMapping mapping,
       int offset, int length, CallbackInfo ci) {
-    IrisSodiumGlStateBridge.refreshMapping(mapping);
+    try {
+      IrisSodiumGlStateBridge.refreshMapping(mapping);
+    } catch (RuntimeException ignored) {
+      // Preserve Sodium behavior; incomplete mirrors block replay later.
+    }
   }
 
   @Inject(method = "unmap", at = @At("HEAD"), require = 0,
       remap = false)
   private void metalrender$unmap(GlBufferMapping mapping, CallbackInfo ci) {
-    IrisSodiumGlStateBridge.refreshMapping(mapping);
+    try {
+      IrisSodiumGlStateBridge.refreshMapping(mapping);
+    } catch (RuntimeException ignored) {
+      // Preserve Sodium behavior; incomplete mirrors block replay later.
+    }
   }
 
   @Inject(method = "unmap", at = @At("RETURN"), require = 0,
       remap = false)
   private void metalrender$unmapComplete(GlBufferMapping mapping,
       CallbackInfo ci) {
-    IrisSodiumGlStateBridge.unmap(mapping);
+    try {
+      IrisSodiumGlStateBridge.unmap(mapping);
+    } catch (RuntimeException ignored) {
+      // Observational path is fail-open.
+    }
   }
 
   @Inject(method = "deleteBuffer", at = @At("HEAD"), require = 0,
