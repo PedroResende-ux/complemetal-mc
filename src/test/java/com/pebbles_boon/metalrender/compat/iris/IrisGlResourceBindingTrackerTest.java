@@ -39,7 +39,9 @@ final class IrisGlResourceBindingTrackerTest {
     tracker.registerProgram(17);
     tracker.useProgram(17);
 
-    assertEquals(null, tracker.snapshot());
+    var snapshot = tracker.snapshot();
+    assertNotNull(snapshot);
+    assertEquals(Map.of(), snapshot.uniformLocations());
   }
 
   @Test
@@ -136,6 +138,9 @@ final class IrisGlResourceBindingTrackerTest {
     tracker.initializeOpenGlDefaults();
     tracker.registerProgram(12);
     tracker.useProgram(12);
+    tracker.bindTextureToUnit(IrisGlResourceBindingTracker.GL_TEXTURE_2D, 0, 101);
+    tracker.bindTextureToUnit(IrisGlResourceBindingTracker.GL_TEXTURE_2D, 1, 102);
+    tracker.bindTextureToUnit(IrisGlResourceBindingTracker.GL_TEXTURE_2D, 2, 103);
     tracker.bindSamplerToUnit(0, 91);
     tracker.bindSamplerToUnit(1, 91);
     tracker.bindSamplerToUnit(2, 92);
