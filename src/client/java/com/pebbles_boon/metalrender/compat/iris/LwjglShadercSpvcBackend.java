@@ -83,7 +83,7 @@ public final class LwjglShadercSpvcBackend
 
   @Override
   public IrisTranslationProfile profile() {
-    return IrisTranslationProfile.LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS;
+    return IrisTranslationProfile.LWJGL_3_3_3_METAL_3_ARGUMENT_BUFFERS;
   }
 
   @Override
