@@ -5332,6 +5332,16 @@ struct IrisShadowRuntimeResources {
   }
 };
 
+struct IrisMetal4GraphFramePacket {
+  uint64_t contextGeneration = 0;
+  int32_t readbackResourceId = -1;
+  int32_t presentationResourceId = -1;
+  std::vector<IrisMetal4GraphFrameResource> resources;
+  std::vector<IrisMetal4GraphFrameInputBuffer> inputBuffers;
+  std::vector<IrisShadowTexture> inputTextures;
+  std::vector<IrisMetal4GraphFrameOperation> operations;
+};
+
 // Keep these graph packet/draw types complete before the executor declarations.
 // The encoder performs load/attachment analysis and accesses prepared-draw state
 // directly, so forward declarations alone are insufficient in C++.
@@ -5432,16 +5442,6 @@ static int iris_graph_encode_prepared_draw_run(
     jlong &reason) API_AVAILABLE(macos(26.0));
 static void iris_graph_destroy_prepared_draw(
     IrisMetal4GraphPreparedDraw *draw) API_AVAILABLE(macos(26.0));
-
-struct IrisMetal4GraphFramePacket {
-  uint64_t contextGeneration = 0;
-  int32_t readbackResourceId = -1;
-  int32_t presentationResourceId = -1;
-  std::vector<IrisMetal4GraphFrameResource> resources;
-  std::vector<IrisMetal4GraphFrameInputBuffer> inputBuffers;
-  std::vector<IrisShadowTexture> inputTextures;
-  std::vector<IrisMetal4GraphFrameOperation> operations;
-};
 
 static bool iris_graph_read_i32(IrisPipelineByteReader &reader,
                                 int32_t &value) {
@@ -9054,8 +9054,6 @@ static id<MTLSamplerState> iris_shadow_sampler(
   supported = sampler != nil;
   return sampler;
 }
-
-struct IrisMetal4RetiredSubmission;
 
 
 
