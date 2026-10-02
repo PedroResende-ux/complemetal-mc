@@ -19,6 +19,8 @@ public final class IrisGlVertexArrayTracker {
   private final LinkedHashMap<Integer, VertexArray> arrays =
       new LinkedHashMap<>(16, 0.75F, true);
   private final Map<Integer, Integer> targetBindings = new HashMap<>();
+  private final Map<Integer, MojangVertexBuffer> mojangVertexBuffers =
+      new HashMap<>();
   private int currentVertexArray;
 
   public static IrisGlVertexArrayTracker global() {
@@ -28,6 +30,7 @@ public final class IrisGlVertexArrayTracker {
   public synchronized void reset() {
     arrays.clear();
     targetBindings.clear();
+    mojangVertexBuffers.clear();
     currentVertexArray = 0;
     arrays.put(0, new VertexArray());
   }
@@ -69,6 +72,28 @@ public final class IrisGlVertexArrayTracker {
     return targetBindings.getOrDefault(target, 0);
   }
 
+  /**
+   * Mirrors the modern Minecraft vertex-buffer layout path used by 1.21.1.
+   * The binding is generation-qualified so deferred replay cannot accidentally
+   * consume a recycled GL name.
+   */
+  public synchronized void bindMojangVertexBuffers(
+      List<MojangVertexBuffer> buffers) {
+    mojangVertexBuffers.clear();
+    if (buffers == null) {
+      return;
+    }
+    for (MojangVertexBuffer buffer : buffers) {
+      if (buffer == null || buffer.slot < 0 || buffer.slot >= MAX_ATTRIBUTES
+          || buffer.glBuffer <= 0 || buffer.offsetBytes < 0
+          || buffer.lengthBytes <= 0 || buffer.mirrorGeneration < 0
+          || buffer.strideBytes < 0) {
+        continue;
+      }
+      mojangVertexBuffers.put(buffer.slot, buffer);
+    }
+  }
+
   public synchronized void vertexAttribute(int location, int size, int type,
       boolean normalized, int strideBytes, long offsetBytes,
       boolean integer) {
@@ -102,6 +127,8 @@ public final class IrisGlVertexArrayTracker {
       return;
     }
     targetBindings.replaceAll((target, bound) -> bound == buffer ? 0 : bound);
+    mojangVertexBuffers.entrySet().removeIf(
+        entry -> entry.getValue().glBuffer() == buffer);
     for (VertexArray vertexArray : arrays.values()) {
       if (vertexArray.elementBuffer == buffer) {
         vertexArray.elementBuffer = 0;
@@ -122,7 +149,35 @@ public final class IrisGlVertexArrayTracker {
         .toList();
     java.util.ArrayList<IrisVertexInputBindings.BufferSlice> buffers =
         new java.util.ArrayList<>(physicalLayouts.size());
-    for (VertexBufferLayout layout : physicalLayouts) {
+    if (!mojangVertexBuffers.isEmpty()) {
+      for (VertexBufferLayout layout : physicalLayouts) {
+        MojangVertexBuffer binding =
+            mojangVertexBuffers.get(layout.bufferIndex());
+        if (binding == null
+            || binding.strideBytes != layout.strideBytes()) {
+          return IrisVertexInputBindings.unavailable(
+              "mojang-buffer-layout-mismatch");
+        }
+        long mirrorGeneration =
+            IrisGlBufferMirror.global().generation(binding.glBuffer);
+        long expectedGeneration = binding.mirrorGeneration;
+        if (mirrorGeneration <= 0 || expectedGeneration <= 0
+            || mirrorGeneration != expectedGeneration) {
+          return IrisVertexInputBindings.unavailable(
+              "mojang-buffer-generation-mismatch");
+        }
+        long size = IrisGlBufferMirror.global().size(binding.glBuffer);
+        if (size <= 0 || binding.offsetBytes >= size
+            || binding.lengthBytes > size - binding.offsetBytes) {
+          return IrisVertexInputBindings.unavailable(
+              "mojang-buffer-range-invalid");
+        }
+        buffers.add(new IrisVertexInputBindings.BufferSlice(
+            layout.bufferIndex(), binding.glBuffer, binding.offsetBytes,
+            binding.lengthBytes, expectedGeneration));
+      }
+    } else {
+      for (VertexBufferLayout layout : physicalLayouts) {
       List<VertexAttribute> required = descriptor.vertexAttributes().stream()
           .filter(attribute -> attribute.bufferIndex()
               == layout.bufferIndex())
@@ -158,6 +213,8 @@ public final class IrisGlVertexArrayTracker {
       }
       buffers.add(new IrisVertexInputBindings.BufferSlice(
           layout.bufferIndex(), glBuffer, 0, size, generation));
+    }
+
     }
 
     IrisVertexInputBindings.BufferSlice index = null;
@@ -196,6 +253,11 @@ public final class IrisGlVertexArrayTracker {
       }
       arrays.remove(victim);
     }
+  }
+
+  public record MojangVertexBuffer(int slot, int glBuffer,
+                                   long offsetBytes, long lengthBytes,
+                                   long mirrorGeneration, int strideBytes) {
   }
 
   private static final class VertexArray {
