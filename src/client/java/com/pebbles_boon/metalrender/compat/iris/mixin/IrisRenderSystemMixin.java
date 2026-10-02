@@ -274,9 +274,7 @@ public abstract class IrisRenderSystemMixin {
       int internalFormat, long offset, long size, int format, int type,
       int[] values, CallbackInfo ci) {
     int buffer = metalrender$vertices().boundBuffer(target);
-    if (buffer <= 0) {
-      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
-          "graph-frame-buffer-clear-binding-unavailable");
+    if (buffer <= 0 || size <= 0) {
       return;
     }
     if (!com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global()
