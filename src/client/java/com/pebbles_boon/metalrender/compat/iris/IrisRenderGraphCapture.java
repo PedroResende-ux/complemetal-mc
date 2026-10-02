@@ -53,6 +53,8 @@ public final class IrisRenderGraphCapture {
   private float legacyClearGreen;
   private float legacyClearBlue;
   private float legacyClearAlpha;
+  private double legacyClearDepth = 1.0D;
+  private int legacyClearStencil;
   private long fullReplayFramesCompleted;
 
   IrisRenderGraphCapture(IrisGlStateTracker state) {
@@ -519,6 +521,17 @@ public final class IrisRenderGraphCapture {
     legacyClearAlpha = alpha;
   }
 
+  public synchronized void legacyClearDepth(double depth) {
+    if (!Double.isFinite(depth)) {
+      return;
+    }
+    legacyClearDepth = depth;
+  }
+
+  public synchronized void legacyClearStencil(int stencil) {
+    legacyClearStencil = stencil;
+  }
+
   /**
    * Captures Iris' direct {@code GlStateManager._clear} against the currently
    * bound framebuffer. Color attachments are resolved through the effective
@@ -594,8 +607,8 @@ public final class IrisRenderGraphCapture {
       return false;
     }
     IrisClearCommand command = depth
-        ? IrisClearCommand.depth(handle, 1.0, Optional.empty())
-        : IrisClearCommand.stencil(handle, 0);
+        ? IrisClearCommand.depth(handle, legacyClearDepth, Optional.empty())
+        : IrisClearCommand.stencil(handle, legacyClearStencil);
     return add(new RawClear(phase, command, List.of(resource)));
   }
 
