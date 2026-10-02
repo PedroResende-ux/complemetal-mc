@@ -1859,28 +1859,32 @@ public class CustomChunkMesher {
     private void emitBakedQuad(BakedQuad quad, int lx, int ly, int lz,
         BlockState state, boolean water) {
       ByteBuffer target = water ? waterBuffer : solidBuffer;
-      Direction face = quad.direction();
+      Direction face = quad.getDirection();
       byte normalIndex = (byte) (face != null ? face.get3DDataValue() : 6);
-      float shade = quad.materialInfo().shade() ? getFaceShade(normalIndex) : 1.0f;
+      float shade = quad.isShade() ? getFaceShade(normalIndex) : 1.0f;
 
       boolean isLeaves = state.getBlock() instanceof LeavesBlock;
       MetalRenderConfig cfg = MetalRenderClient.getConfig();
       boolean fastLeaves = isLeaves && cfg != null && cfg.leafCullingMode == 0;
 
-      boolean tinted = quad.materialInfo().isTinted() || quad.materialInfo().tintIndex() >= 0;
+      boolean tinted = quad.getTintIndex() >= 0;
       int blockColor = tinted ? getBiomeTint(lx, ly, lz) : 0xFFFFFF;
       byte tintR = (byte) ((blockColor >> 16) & 0xFF);
       byte tintG = (byte) ((blockColor >> 8) & 0xFF);
       byte tintB = (byte) (blockColor & 0xFF);
 
+      int[] vertices = quad.getVertices();
+      int vertexStride = vertices.length / 4;
+      if (vertexStride < 6) {
+        return;
+      }
       for (int i = 0; i < 4; i++) {
-        org.joml.Vector3fc pos = quad.position(i);
-        long packedUV = quad.packedUV(i);
-        float x = pos.getX() + lx;
-        float y = pos.getY() + ly;
-        float z = pos.getZ() + lz;
-        float u = Float.intBitsToFloat((int) (packedUV >> 32));
-        float v = Float.intBitsToFloat((int) packedUV);
+        int base = i * vertexStride;
+        float x = Float.intBitsToFloat(vertices[base]) + lx;
+        float y = Float.intBitsToFloat(vertices[base + 1]) + ly;
+        float z = Float.intBitsToFloat(vertices[base + 2]) + lz;
+        float u = Float.intBitsToFloat(vertices[base + 4]);
+        float v = Float.intBitsToFloat(vertices[base + 5]);
 
         short px = (short) (x * 256.0f);
         short py = (short) (y * 256.0f);
@@ -1888,7 +1892,7 @@ public class CustomChunkMesher {
         short su = (short) (u * 65535f);
         short sv = (short) (v * 65535f);
 
-        byte light = computeVertexLight(lx, ly, lz, face, x, y, z, quad.materialInfo().lightEmission());
+        byte light = computeVertexLight(lx, ly, lz, face, x, y, z, 0);
         float ao = (face != null) ? computeVertexAo(lx, ly, lz, face, x, y, z) : 1.0f;
 
         float fr, fg, fb;
