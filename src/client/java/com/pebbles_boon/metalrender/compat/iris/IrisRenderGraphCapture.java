@@ -515,21 +515,29 @@ public final class IrisRenderGraphCapture {
         || !Float.isFinite(blue) || !Float.isFinite(alpha)) {
       return;
     }
-    legacyClearRed = red;
-    legacyClearGreen = green;
-    legacyClearBlue = blue;
-    legacyClearAlpha = alpha;
+    legacyClearRed = clampClearColor(red);
+    legacyClearGreen = clampClearColor(green);
+    legacyClearBlue = clampClearColor(blue);
+    legacyClearAlpha = clampClearColor(alpha);
   }
 
   public synchronized void legacyClearDepth(double depth) {
     if (!Double.isFinite(depth)) {
       return;
     }
-    legacyClearDepth = depth;
+    legacyClearDepth = clampClearDepth(depth);
   }
 
   public synchronized void legacyClearStencil(int stencil) {
     legacyClearStencil = stencil;
+  }
+
+  private static float clampClearColor(float value) {
+    return Math.clamp(value, 0.0F, 1.0F);
+  }
+
+  private static double clampClearDepth(double value) {
+    return Math.clamp(value, 0.0D, 1.0D);
   }
 
   /**
