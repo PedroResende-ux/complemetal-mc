@@ -70,7 +70,7 @@ final class IrisMetalGraphFramePlannerTest {
   @Test
   void acceptsInitialSnapshotAtValidNonzeroMip() {
     IrisGlTextureMirror mirror = new IrisGlTextureMirror(4, 1_024, 1_024);
-    assertTrue(mirror.define(32, "rgba8-unorm", 8, 8, 1, 1, 3));
+    assertTrue(mirror.define(32, "rgba8-unorm", 8, 8, 1, 3, 3));
     assertTrue(mirror.write(32, 2, 0, 0, 0, 2, 2, 2,
         ByteBuffer.allocate(16)));
     IrisGlTextureMirror.TextureSnapshot snapshot = mirror.snapshot(32,
