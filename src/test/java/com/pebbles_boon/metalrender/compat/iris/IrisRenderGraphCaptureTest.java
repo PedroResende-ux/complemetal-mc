@@ -34,6 +34,7 @@ final class IrisRenderGraphCaptureTest {
     IrisRenderGraphCapture capture = new IrisRenderGraphCapture(
         tracker);
     capture.beginFrame();
+    assertTrue(capture.memoryBarrier(1));
     capture.markUnsupportedFullReplayOperation(
         "graph-frame-buffer-clear-unimplemented");
     assertTrue(capture.hasActiveFrame());
@@ -90,8 +91,7 @@ final class IrisRenderGraphCaptureTest {
     assertFalse(capture.clearDepthTexture(71, 1.0, Optional.empty()));
 
     capture.endFrame();
-    assertEquals(IrisRenderGraphCapture.MAX_EVENTS_PER_FRAME,
-        capture.poll().orElseThrow().events().size());
+    assertTrue(capture.poll().isEmpty());
   }
 
   @Test
@@ -252,6 +252,8 @@ final class IrisRenderGraphCaptureTest {
     tracker.defineTexture(80, "rgba16-float", 1, 1280, 720, 1, 1);
     assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
         IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 70, 0));
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
+        IrisGlStateTracker.GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 71, 0));
     assertTrue(tracker.framebufferTexture2DForFramebuffer(8,
         IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 80, 0));
 
