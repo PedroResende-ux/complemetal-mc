@@ -125,18 +125,19 @@ public class MetalParticleRenderer {
       Frustum frustum, Camera camera, float delta) {
     if (!active || particles == null)
       return false;
-    double camX = camera.position().x;
-    double camY = camera.position().y;
-    double camZ = camera.position().z;
+    var cameraPosition = camera.getPosition();
+    double camX = cameraPosition.x;
+    double camY = cameraPosition.y;
+    double camZ = cameraPosition.z;
 
     ClientLevel world = null;
     int camLight = 0x00F000F0;
     Minecraft mc = Minecraft.getInstance();
     if (mc != null && mc.level != null) {
       world = mc.level;
-      scratchPos.set((int) Math.floor(camera.position().x),
-          (int) Math.floor(camera.position().y),
-          (int) Math.floor(camera.position().z));
+      scratchPos.set((int) Math.floor(cameraPosition.x),
+          (int) Math.floor(cameraPosition.y),
+          (int) Math.floor(cameraPosition.z));
       var lights = world.getChunkSource().getLightEngine();
       int blockLev = lights.getLayerListener(LightLayer.BLOCK).getLightValue(scratchPos);
       int skyLev = lights.getLayerListener(LightLayer.SKY).getLightValue(scratchPos);
