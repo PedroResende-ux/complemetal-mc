@@ -369,10 +369,11 @@ public final class IrisVertexLayoutCapture {
    */
   public static Layout capture(VertexFormat format, boolean fallback) {
     Objects.requireNonNull(format, "format");
-    int stepRate = format.getStepRate();
-    IrisPipelineState.StepFunction stepFunction = stepRate == 0
-        ? IrisPipelineState.StepFunction.PER_VERTEX
-        : IrisPipelineState.StepFunction.PER_INSTANCE;
+    // Mojang's 1.21.1 VertexFormat does not encode an instance step rate;
+    // instanced layouts are supplied by Iris/Sodium-specific bridges.
+    int stepRate = 0;
+    IrisPipelineState.StepFunction stepFunction =
+        IrisPipelineState.StepFunction.PER_VERTEX;
     List<IrisPipelineState.VertexBufferLayout> buffers = List.of(
         new IrisPipelineState.VertexBufferLayout(0, format.getVertexSize(),
             stepFunction, stepRate));
@@ -385,10 +386,11 @@ public final class IrisVertexLayoutCapture {
       VertexFormatElement element = elements.get(location);
       IrisPipelineState.DataFormat dataFormat =
           new IrisPipelineState.DataFormat(
-              formatCacheName(element.format().name()));
+              formatCacheName(element.usage().name()));
       attributes.add(new IrisPipelineState.VertexAttribute(location, 0,
-          element.offset(), dataFormat));
-      String linkedName = linkedAttributeName(element.name(), fallback);
+          format.getOffset(element), dataFormat));
+      String linkedName = linkedAttributeName(
+          format.getElementName(element), fallback);
       if (!linkedNames.add(linkedName)) {
         throw new IllegalArgumentException(
             "duplicate linked vertex attribute name");
