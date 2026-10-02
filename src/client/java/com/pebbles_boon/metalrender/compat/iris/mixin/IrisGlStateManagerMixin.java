@@ -36,9 +36,15 @@ public abstract class IrisGlStateManagerMixin {
       new ThreadLocal<>();
   private static final ThreadLocal<Integer> METALRENDER_MOJANG_BUFFER_DATA_SCOPE =
       ThreadLocal.withInitial(() -> 0);
+  private static final ThreadLocal<Integer> METALRENDER_MOJANG_BUFFER_SUBDATA_SCOPE =
+      ThreadLocal.withInitial(() -> 0);
 
   public static boolean metalrender$isMojangBufferDataActive() {
     return METALRENDER_MOJANG_BUFFER_DATA_SCOPE.get() > 0;
+  }
+
+  public static boolean metalrender$isMojangBufferSubDataActive() {
+    return METALRENDER_MOJANG_BUFFER_SUBDATA_SCOPE.get() > 0;
   }
 
   private static void metalrender$enterBufferDataScope() {
@@ -140,6 +146,26 @@ public abstract class IrisGlStateManagerMixin {
   private static void metalrender$bufferDataSizeEnter(int target, long size,
       int usage, CallbackInfo ci) {
     metalrender$enterBufferDataScope();
+  }
+
+  @Inject(method = "_glBufferSubData", at = @At("HEAD"),
+      require = 0)
+  private static void metalrender$bufferSubDataEnter(int target, int offset,
+      ByteBuffer bytes, CallbackInfo ci) {
+    METALRENDER_MOJANG_BUFFER_SUBDATA_SCOPE.set(
+        METALRENDER_MOJANG_BUFFER_SUBDATA_SCOPE.get() + 1);
+  }
+
+  @Inject(method = "_glBufferSubData", at = @At("RETURN"),
+      require = 0)
+  private static void metalrender$bufferSubDataExit(int target, int offset,
+      ByteBuffer bytes, CallbackInfo ci) {
+    int depth = METALRENDER_MOJANG_BUFFER_SUBDATA_SCOPE.get() - 1;
+    if (depth <= 0) {
+      METALRENDER_MOJANG_BUFFER_SUBDATA_SCOPE.remove();
+    } else {
+      METALRENDER_MOJANG_BUFFER_SUBDATA_SCOPE.set(depth);
+    }
   }
 
   @Inject(method = "_glBufferSubData", at = @At("RETURN"),
