@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
+import com.mojang.blaze3d.systems.RenderSystem;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -1066,9 +1067,6 @@ public class MetalWorldRenderer {
 
   private void buildPendingChunkMeshes(Minecraft mc) {
     if (mc.player == null || mc.level == null) {
-      return;
-    }
-    if (mc.gui.overlay() != null) {
       return;
     }
     if (mc.player != null) {
