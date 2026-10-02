@@ -110,18 +110,26 @@ public abstract class IrisGlStateManagerMixin {
   private static void metalrender$bufferData(int target, ByteBuffer bytes,
       int usage, CallbackInfo ci) {
     try {
-      if (!IrisGlBufferMirror.isEnabled() || bytes == null) {
+      if (!IrisGlBufferMirror.isEnabled()) {
         return;
       }
       int buffer = metalrender$vertices().boundBuffer(target);
+      if (buffer <= 0) {
+        return;
+      }
+      IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
+      if (bytes == null || !bytes.hasRemaining()) {
+        // glBufferData replaces the previous storage even when the supplied
+        // ByteBuffer is null/empty. Drop the old shadow rather than allowing
+        // stale geometry to satisfy a later replay lookup.
+        mirror.delete(buffer);
+        return;
+      }
       int length = bytes.remaining();
-      if (buffer > 0 && length > 0) {
-        IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
-        if (!mirror.allocate(buffer, length)
-            || !mirror.write(buffer, length, 0, length, bytes)) {
-          IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
-              "graph-frame-buffer-upload-mirror-rejected");
-        }
+      if (!mirror.allocate(buffer, length)
+          || !mirror.write(buffer, length, 0, length, bytes)) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-buffer-upload-mirror-rejected");
       }
     } finally {
       metalrender$exitBufferDataScope();
