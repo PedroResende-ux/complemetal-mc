@@ -9692,6 +9692,15 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
     }
 
     IrisShadowReplayPacket &packet = prepared->packet;
+    auto packetTextureRequiresShaderWrite = [&](uint32_t glName) {
+      for (const auto &stage : packet.stages) {
+        for (const auto &argument : stage.arguments) {
+          if (argument.kind == 8 && argument.reference == glName)
+            return true;
+        }
+      }
+      return false;
+    };
     bool computePacket = operation.kind == 6;
     if (computePacket != (packet.draw.kind == 4)) {
       outcome = 0;
@@ -10107,7 +10116,9 @@ static IrisMetal4GraphPreparedDraw *iris_graph_prepare_draw(
           texture2DDescriptorWithPixelFormat:format width:captured.width
                                         height:captured.height mipmapped:NO];
       descriptor.storageMode = MTLStorageModeShared;
-      descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      descriptor.usage = MTLTextureUsageShaderRead
+          | (packetTextureRequiresShaderWrite(captured.glName)
+              ? MTLTextureUsageShaderWrite : 0);
       id<MTLTexture> texture = [g_device newTextureWithDescriptor:descriptor];
       if (!texture)
         return nullptr;
@@ -10728,6 +10739,15 @@ static jlongArray run_iris_metal4_replay(
       IrisShadowReplayPacket packet;
       if (!parse_iris_shadow_replay_packet(packetBytes, packet))
         return iris_shadow_result(env, -1, 0, 0, 0);
+      auto packetTextureRequiresShaderWrite = [&](uint32_t glName) {
+        for (const auto &stage : packet.stages) {
+          for (const auto &argument : stage.arguments) {
+            if (argument.kind == 8 && argument.reference == glName)
+              return true;
+          }
+        }
+        return false;
+      };
 
       IrisMetal4PipelineEntry entry;
       {
@@ -10879,7 +10899,9 @@ static jlongArray run_iris_metal4_replay(
                                           height:captured.height
                                        mipmapped:NO];
           descriptor.storageMode = MTLStorageModeShared;
-          descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+          descriptor.usage = MTLTextureUsageShaderRead
+              | (packetTextureRequiresShaderWrite(captured.glName)
+                  ? MTLTextureUsageShaderWrite : 0);
           id<MTLTexture> texture = [g_device newTextureWithDescriptor:descriptor];
           if (!texture)
             @throw [NSException exceptionWithName:@"MetalRenderShadowSetup"
