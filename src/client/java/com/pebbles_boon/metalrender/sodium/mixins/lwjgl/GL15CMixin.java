@@ -117,6 +117,8 @@ public class GL15CMixin {
     for (int index = buffers.position(); index < buffers.limit(); index++) {
       int buffer = buffers.get(index);
       IrisGlVertexArrayTracker.global().deleteBuffer(buffer);
+      com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingTracker
+          .global().deleteBuffer(buffer);
       IrisGlBufferMirror.global().delete(buffer);
       if (com.pebbles_boon.metalrender.config.MetalRenderConfig
           .mirrorUploads()) {
