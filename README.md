@@ -167,8 +167,10 @@ For a reproducible local graph-validation run, use:
 ./gradlew --no-daemon -PirisGraph runClient
 ```
 
-For the Complementary Reimagined target workload, the same validated experimental
-path is available through a dedicated shortcut:
+For the Complementary Reimagined target workload, the acceptance baseline is
+**Complementary Reimagined r5.2.2**, the release explicitly listed for Minecraft
+1.21–1.21.1. The same validated experimental path is available through a
+dedicated shortcut:
 
 ```bash
 ./gradlew --no-daemon -Pcomplementary runClient
