@@ -307,8 +307,7 @@ public abstract class IrisRenderSystemMixin {
           .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
       metalrender$state().defineTexture(texture, cacheFormat, 1,
           width, height, 1, Math.max(1, level + 1));
-      if (com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
-          .isEnabled()) {
+      if (IrisGlTextureMirror.isEnabled()) {
         int bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat)
             .orElse(0);
         if (bytesPerPixel > 0 && IrisGlTextureMirror.global().define(texture,
@@ -329,7 +328,8 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$texImage1D(int texture, int target,
       int level, int internalFormat, int width, int border, int format,
       int type, ByteBuffer pixels, CallbackInfo ci) {
-    if (texture <= 0 || level < 0 || width <= 0) {
+    if (!IrisGlTextureMirror.isEnabled()
+        || texture <= 0 || level < 0 || width <= 0) {
       return;
     }
     int bytesPerPixel = IrisGlFormat.exactUploadBytesPerPixel(
@@ -361,7 +361,7 @@ public abstract class IrisRenderSystemMixin {
       CallbackInfo ci) {
     // The mirror models layered textures. Keep genuine GL_TEXTURE_3D storage
     // fail-closed; GL_TEXTURE_2D_ARRAY and cube-map arrays remain layer-safe.
-    if (target == 0x806F) { // GL_TEXTURE_3D
+    if (!IrisGlTextureMirror.isEnabled() || target == 0x806F) {
       return;
     }
     if (texture <= 0 || level < 0 || width <= 0 || height <= 0
