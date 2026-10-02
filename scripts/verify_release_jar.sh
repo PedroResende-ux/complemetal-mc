@@ -85,7 +85,7 @@ fi
 if ! grep -Eq '^modId="complemetal"$' "$tmp_dir/META-INF/neoforge.mods.toml" ||
    ! grep -Eq '^displayName="Complemetal"$' "$tmp_dir/META-INF/neoforge.mods.toml" ||
    ! grep -Eq '^version="[^"]*"$' "$tmp_dir/META-INF/neoforge.mods.toml" ||
-   ! grep -Fq 'version="[1.21.1]"' "$tmp_dir/META-INF/neoforge.mods.toml" ||
+   ! grep -Fq 'versionRange="[1.21.1]"' "$tmp_dir/META-INF/neoforge.mods.toml" ||
    ! grep -Fq 'modId="neoforge"' "$tmp_dir/META-INF/neoforge.mods.toml"; then
   echo "NeoForge metadata does not contain the expected Complemetal 1.21.1 identity" >&2
   exit 1
