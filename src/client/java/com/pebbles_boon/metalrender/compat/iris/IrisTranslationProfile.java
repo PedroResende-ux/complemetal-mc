@@ -11,7 +11,7 @@ import java.util.Objects;
  */
 public record IrisTranslationProfile(String canonicalValue) {
   public static final IrisTranslationProfile
-      LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS =
+      LWJGL_3_3_3_METAL_3_ARGUMENT_BUFFERS =
       new IrisTranslationProfile(
           "metalrender-translator=8;lwjgl=3.3.3;shaderc-source=glsl;"
               + "shaderc-env=opengl4.5;spirv=1.0;"
