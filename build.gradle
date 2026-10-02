@@ -53,30 +53,30 @@ neoForge {
         client {
             client()
             systemProperty 'neoforge.enabledGameTestNamespaces', 'complemetal'
-            vmArg "-Djava.library.path=" + projectDir + "/src/main/resources"
-            vmArg "--enable-native-access=ALL-UNNAMED"
+            jvmArgument "-Djava.library.path=" + projectDir + "/src/main/resources"
+            jvmArgument "--enable-native-access=ALL-UNNAMED"
             if (project.hasProperty('irisCapture')) {
-                vmArg "-Dmetalrender.experimental.irisMetalPipeline=true"
-                vmArg "-Dmetalrender.experimental.irisMetalTranslation=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalPipeline=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalTranslation=true"
             }
             if (project.hasProperty('irisGraph') || project.hasProperty('irisGraphOwnership')) {
-                vmArg "-Dmetalrender.experimental.irisMetalPipeline=true"
-                vmArg "-Dmetalrender.experimental.irisMetalTranslation=true"
-                vmArg "-Dmetalrender.experimental.irisMetalLibraryValidation=true"
-                vmArg "-Dmetalrender.experimental.irisMetalPipelineCompilation=true"
-                vmArg "-Dmetalrender.experimental.irisMetalShadowReplay=true"
-                vmArg "-Dmetalrender.experimental.irisMetalVisualParity=true"
-                vmArg "-Dmetalrender.experimental.irisMetalFinalCutover=false"
-                vmArg "-Dmetalrender.experimental.irisMetalGraphResources=true"
-                vmArg "-Dmetalrender.experimental.irisMetalGraphExecution=true"
-                vmArg "-Dmetalrender.experimental.irisMetalGraphOwnership=false"
+                jvmArgument "-Dmetalrender.experimental.irisMetalPipeline=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalTranslation=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalLibraryValidation=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalPipelineCompilation=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalShadowReplay=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalVisualParity=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalFinalCutover=false"
+                jvmArgument "-Dmetalrender.experimental.irisMetalGraphResources=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalGraphExecution=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalGraphOwnership=false"
             }
             if (project.hasProperty('irisGraphOwnership')) {
-                vmArg "-Dmetalrender.experimental.irisMetalGraphOwnership=true"
+                jvmArgument "-Dmetalrender.experimental.irisMetalGraphOwnership=true"
             }
-            vmArg "-Xmx8g"
-            vmArg "-Xms2g"
-            vmArg "-XX:+AlwaysPreTouch"
+            jvmArgument "-Xmx8g"
+            jvmArgument "-Xms2g"
+            jvmArgument "-XX:+AlwaysPreTouch"
         }
     }
 
