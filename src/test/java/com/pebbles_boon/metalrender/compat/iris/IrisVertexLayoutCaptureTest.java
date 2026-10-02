@@ -2,12 +2,19 @@ package com.pebbles_boon.metalrender.compat.iris;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-import com.mojang.blaze3d.GpuFormat;
+import com.mojang.blaze3d.vertex.VertexFormatElement;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
 final class IrisVertexLayoutCaptureTest {
+  private static VertexFormatElement element(
+      VertexFormatElement.Type type, VertexFormatElement.Usage usage,
+      int count) {
+    return VertexFormatElement.register(
+        VertexFormatElement.findNextId(), 0, type, usage, count);
+  }
+
   @Test
   void gpuFormatNamesHaveStableCacheSpelling() {
     assertEquals("rgba16-float",
@@ -18,10 +25,13 @@ final class IrisVertexLayoutCaptureTest {
 
   @Test
   void linkedNamesAndLocationsMatchIrisVertexFormatBinding() {
-    VertexFormat format = VertexFormat.builder(0)
-        .addAttribute("Position", GpuFormat.RGB32_FLOAT)
-        .addAttribute("iris_Entity", GpuFormat.RGBA16_UINT)
-        .addAttribute("mc_midTexCoord", GpuFormat.RG32_FLOAT)
+    VertexFormat format = VertexFormat.builder()
+        .add("Position", element(VertexFormatElement.Type.FLOAT,
+            VertexFormatElement.Usage.POSITION, 3))
+        .add("iris_Entity", element(VertexFormatElement.Type.USHORT,
+            VertexFormatElement.Usage.GENERIC, 4))
+        .add("mc_midTexCoord", element(VertexFormatElement.Type.FLOAT,
+            VertexFormatElement.Usage.GENERIC, 2))
         .build();
 
     assertEquals(List.of(
@@ -39,10 +49,13 @@ final class IrisVertexLayoutCaptureTest {
 
   @Test
   void integerShaderInputUsesRawMetalFormatForNormalizedStorage() {
-    VertexFormat format = VertexFormat.builder(0)
-        .addAttribute("Position", GpuFormat.RGB32_FLOAT)
-        .addAttribute("a_LightAndData", GpuFormat.RGBA8_UNORM)
-        .addAttribute("Color", GpuFormat.RGBA8_UNORM)
+    VertexFormat format = VertexFormat.builder()
+        .add("Position", element(VertexFormatElement.Type.FLOAT,
+            VertexFormatElement.Usage.POSITION, 3))
+        .add("a_LightAndData", element(VertexFormatElement.Type.UBYTE,
+            VertexFormatElement.Usage.COLOR, 4))
+        .add("Color", element(VertexFormatElement.Type.UBYTE,
+            VertexFormatElement.Usage.COLOR, 4))
         .build();
     IrisVertexLayoutCapture.Layout captured =
         IrisVertexLayoutCapture.capture(format, false);
@@ -69,10 +82,13 @@ final class IrisVertexLayoutCaptureTest {
 
   @Test
   void linkedOpenGlAttributesOverrideGuessedNamesAndDropInactiveElements() {
-    VertexFormat format = VertexFormat.builder(0)
-        .addAttribute("Position", GpuFormat.RGB32_FLOAT)
-        .addAttribute("Color", GpuFormat.RGBA8_UNORM)
-        .addAttribute("UV0", GpuFormat.RG32_FLOAT)
+    VertexFormat format = VertexFormat.builder()
+        .add("Position", element(VertexFormatElement.Type.FLOAT,
+            VertexFormatElement.Usage.POSITION, 3))
+        .add("Color", element(VertexFormatElement.Type.UBYTE,
+            VertexFormatElement.Usage.COLOR, 4))
+        .add("UV0", element(VertexFormatElement.Type.FLOAT,
+            VertexFormatElement.Usage.UV, 2))
         .build();
     IrisVertexLayoutCapture.Layout linked =
         IrisVertexLayoutCapture.withLinkedAttributes(
@@ -107,9 +123,11 @@ final class IrisVertexLayoutCaptureTest {
 
   @Test
   void linkedNameMapsSparseOpenGlLocationToPhysicalFormatElement() {
-    VertexFormat format = VertexFormat.builder(0)
-        .addAttribute("Position", GpuFormat.RGB32_FLOAT)
-        .addAttribute("Color", GpuFormat.RGBA8_UNORM)
+    VertexFormat format = VertexFormat.builder()
+        .add("Position", element(VertexFormatElement.Type.FLOAT,
+            VertexFormatElement.Usage.POSITION, 3))
+        .add("Color", element(VertexFormatElement.Type.UBYTE,
+            VertexFormatElement.Usage.COLOR, 4))
         .build();
     IrisVertexLayoutCapture.Layout linked =
         IrisVertexLayoutCapture.withLinkedAttributes(
@@ -124,8 +142,9 @@ final class IrisVertexLayoutCaptureTest {
 
   @Test
   void linkedIntegerGenericAttributeRetainsShaderAbiWithoutPhysicalElement() {
-    VertexFormat format = VertexFormat.builder(0)
-        .addAttribute("Position", GpuFormat.RGB32_FLOAT)
+    VertexFormat format = VertexFormat.builder()
+        .add("Position", element(VertexFormatElement.Type.FLOAT,
+            VertexFormatElement.Usage.POSITION, 3))
         .build();
     IrisVertexLayoutCapture.Layout linked =
         IrisVertexLayoutCapture.withLinkedAttributes(
