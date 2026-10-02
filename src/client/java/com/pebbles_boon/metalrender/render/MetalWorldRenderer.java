@@ -907,9 +907,9 @@ public class MetalWorldRenderer {
       BlockHitResult hit = (BlockHitResult) mc.hitResult;
       BlockPos pos = hit.getBlockPos();
       Camera cam = mc.gameRenderer.getMainCamera();
-      float bx = (float) (pos.getX() - cam.position().x);
-      float by = (float) (pos.getY() - cam.position().y);
-      float bz = (float) (pos.getZ() - cam.position().z);
+      float bx = (float) (pos.getX() - cam.getPosition().x);
+      float by = (float) (pos.getY() - cam.getPosition().y);
+      float bz = (float) (pos.getZ() - cam.getPosition().z);
       float e = 0.002f;
       float x0 = bx - e, y0 = by - e, z0 = bz - e;
       float x1 = bx + 1 + e, y1 = by + 1 + e, z1 = bz + 1 + e;
