@@ -131,6 +131,60 @@ final class IrisMetalShadowReplayPacketEncoderTest {
   }
 
   @Test
+  void storageImageUsesDistinctWritableTextureArgumentKind() {
+    IrisShadowReplayBufferSnapshot buffers =
+        new IrisShadowReplayBufferSnapshot(true, List.of(
+            new IrisShadowReplayBufferSnapshot.BufferImage(
+                0, 7, 1, 0, new byte[48])),
+            List.of(new IrisShadowReplayBufferSnapshot.VertexBufferRef(0,
+                new IrisShadowReplayBufferSnapshot.BufferRef(0))),
+            Optional.empty(), Optional.empty(), Map.of(), Map.of(), List.of());
+    IrisMslArgumentLayout msl = new IrisMslArgumentLayout(List.of(
+        new IrisMslArgumentLayout.StageLayout(IrisShaderStage.FRAGMENT,
+            List.of(new IrisMslArgumentLayout.ArgumentBinding(
+                new IrisSpirvResourceLayout.DescriptorAddress(0, 7),
+                IrisSpirvResourceLayout.ResourceKind.STORAGE_IMAGE,
+                0, 3, -1)))));
+    IrisMetalVertexBindingLayout layout =
+        IrisMetalVertexBindingLayout.resolve(
+            IrisPipelineKeyTest.state(), msl);
+    IrisDynamicDrawState dynamic = new IrisDynamicDrawState(
+        StateValue.known(new IrisDynamicDrawState.Rect(0, 0, 4, 4)),
+        StateValue.known(false),
+        StateValue.known(new IrisDynamicDrawState.Rect(0, 0, 0, 0)));
+    IrisShadowReplayTextureSnapshot textures =
+        new IrisShadowReplayTextureSnapshot(true, Map.of(19,
+            IrisGlTextureMirror.TextureSnapshot.fromGraphReference(
+                19, 3, "rgba16-float", 4, 4, 8, 0, 0)), List.of());
+
+    IrisShadowReplayArgumentTable sampled =
+        new IrisShadowReplayArgumentTable(List.of(
+            new IrisShadowReplayArgumentTable.StageTable(
+                IrisShaderStage.FRAGMENT, List.of(
+                    new IrisShadowReplayArgumentTable.BoundArgument(0, 3,
+                        new IrisShadowReplayArgumentTable.TextureImage(19))))),
+            List.of());
+    IrisShadowReplayArgumentTable storage =
+        new IrisShadowReplayArgumentTable(List.of(
+            new IrisShadowReplayArgumentTable.StageTable(
+                IrisShaderStage.FRAGMENT, List.of(
+                    new IrisShadowReplayArgumentTable.BoundArgument(0, 3,
+                        new IrisShadowReplayArgumentTable.StorageTextureImage(
+                            19))))), List.of());
+
+    IrisExecutionCommand command = new IrisExecutionCommand.DrawArrays(
+        4, 0, 3, 1, 0, IrisExecutionCommand.Source.DIRECT_GL);
+    byte[] sampledPacket = IrisMetalShadowReplayPacketEncoder.encode(command,
+        dynamic, buffers, textures, layout, sampled, 4, 4, java.util.Set.of(19));
+    byte[] storagePacket = IrisMetalShadowReplayPacketEncoder.encode(command,
+        dynamic, buffers, textures, layout, storage, 4, 4, java.util.Set.of(19));
+
+    assertTrue(sampledPacket.length > 0);
+    assertTrue(storagePacket.length > 0);
+    assertTrue(!java.util.Arrays.equals(sampledPacket, storagePacket));
+  }
+
+  @Test
   void requiresGraphOverrideForMetadataOnlyTextureReference() {
     IrisShadowReplayBufferSnapshot buffers = new IrisShadowReplayBufferSnapshot(
         true, List.of(new IrisShadowReplayBufferSnapshot.BufferImage(
