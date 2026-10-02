@@ -228,6 +228,18 @@ public final class IrisGlResourceBindingTracker {
         .sampler = sampler;
   }
 
+  /** Mirrors glDeleteSamplers unbinding them from every texture unit. */
+  public synchronized void deleteSampler(int sampler) {
+    if (sampler <= 0) {
+      return;
+    }
+    for (MutableTextureUnit unit : textureUnits.values()) {
+      if (unit.sampler == sampler) {
+        unit.sampler = 0;
+      }
+    }
+  }
+
   /** Mirrors glDeleteTextures unbinding and prevents reused names leaking. */
   public synchronized void deleteTexture(int texture) {
     if (texture <= 0) {
