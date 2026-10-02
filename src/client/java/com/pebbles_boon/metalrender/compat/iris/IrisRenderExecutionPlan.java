@@ -96,6 +96,7 @@ public record IrisRenderExecutionPlan(IrisRenderGraph graph,
       } else if (command instanceof IrisExecutionCommand.MultiDrawIndexed draw
           && draw.indexElementBytes() == 1) {
         addDistinct(blockers, "uint8-indices-require-expansion");
+      }
       if (pipeline.pending().resourceBindings() == null) {
         addDistinct(blockers, "resource-bindings-unavailable");
       }
