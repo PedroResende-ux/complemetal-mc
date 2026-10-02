@@ -172,7 +172,8 @@ public abstract class IrisGlStateManagerMixin {
       require = 0)
   private static void metalrender$bufferSubData(int target, int offset,
       ByteBuffer bytes, CallbackInfo ci) {
-    if (!IrisGlBufferMirror.isEnabled() || bytes == null) {
+    if (!IrisGlBufferMirror.isEnabled() || bytes == null
+        || !bytes.hasRemaining()) {
       return;
     }
     int buffer = metalrender$vertices().boundBuffer(target);
