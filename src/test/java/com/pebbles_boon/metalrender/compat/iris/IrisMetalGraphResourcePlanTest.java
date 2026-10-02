@@ -95,8 +95,7 @@ final class IrisMetalGraphResourcePlanTest {
     assertEquals(IrisMetalGraphResourcePlan.USAGE_SHADER_READ
         | IrisMetalGraphResourcePlan.USAGE_RENDER_TARGET,
         complete.plan().allocations().get(0).usage());
-    assertEquals(IrisMetalGraphResourcePlan.USAGE_SHADER_READ
-        | IrisMetalGraphResourcePlan.USAGE_RENDER_TARGET
+    assertEquals(IrisMetalGraphResourcePlan.USAGE_RENDER_TARGET
         | IrisMetalGraphResourcePlan.USAGE_TRANSFER_DESTINATION,
         complete.plan().allocations().get(1).usage());
   }
