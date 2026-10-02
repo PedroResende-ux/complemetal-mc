@@ -107,14 +107,14 @@ final class IrisMetalGraphFramePacketEncoderTest {
                 IrisGlTextureMirror.TextureSnapshot.fromReadback(
                     42, 7, new IrisGlTextureMirror.TextureMetadata(
                         "rgba8-unorm", 4, 4, 1, 4, 7), 0, 1,
-                    new byte[16]))),
+                    new byte[64]))),
             List.of(new IrisMetalGraphFramePacketEncoder.CopyInputTexture(
                 0, 2, 1, 2, 2)), -1,
             IrisMetalGraphFramePacketEncoder.NO_PRESENTATION);
 
     ByteBuffer buffer = ByteBuffer.wrap(
         IrisMetalGraphFramePacketEncoder.encode(frame));
-    buffer.position(115);
+    buffer.position(163);
     assertEquals(7, buffer.getInt());
     assertEquals(0, buffer.getInt());
     assertEquals(2, buffer.getInt());
@@ -143,9 +143,6 @@ final class IrisMetalGraphFramePacketEncoderTest {
     assertEquals(-1, buffer.getInt());
     assertEquals(-1, buffer.getInt());
     assertEquals(2, buffer.getInt());
-    assertEquals(0, buffer.getInt());
-    assertEquals(0, buffer.getInt());
-    assertEquals(1, buffer.getInt());
     assertEquals(6, buffer.getInt());
   }
 
