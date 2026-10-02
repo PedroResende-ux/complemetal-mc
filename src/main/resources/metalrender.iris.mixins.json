@@ -10,6 +10,7 @@
     "IrisProgramBuilderMixin",
     "IrisProgramBuilderAccessor",
     "Iris1211SodiumProgramsMixin",
+    "IrisDhLodRenderProgramMixin",
     "IrisSodiumGlProgramMixin",
     "IrisSodiumGlRenderDeviceMixin",
     "IrisSodiumGlTessellationMixin",
