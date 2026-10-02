@@ -1,6 +1,5 @@
 package com.pebbles_boon.metalrender.render;
 
-import com.mojang.blaze3d.systems.RenderSystem;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.compat.IrisCompatibility;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
@@ -61,19 +60,9 @@ public final class MetalRenderHookState {
       return false;
     }
 
-    String backendDescription;
-    try {
-      var device = RenderSystem.tryGetDevice();
-      backendDescription = device == null || device.getDeviceInfo() == null
-          ? null
-          : device.getDeviceInfo().backendName();
-    } catch (Throwable error) {
-      return false;
-    }
-    if (backendDescription == null || backendDescription.isBlank()) {
-      return false;
-    }
-
+    // Minecraft 1.21.1 is OpenGL-only. The GpuDevice/backend abstraction
+    // used for this check was introduced by later Minecraft versions.
+    String backendDescription = "OpenGL";
     String normalized = backendDescription.toLowerCase(Locale.ROOT);
     graphicsBackendName = backendDescription;
     if (normalized.contains("vulkan") || normalized.contains(".vk.")) {
