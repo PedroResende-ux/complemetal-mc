@@ -12,7 +12,6 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.Optional;
-import net.neoforged.fml.ModList;
 import java.util.Set;
 
 public final class NativeBridge {
@@ -294,13 +293,25 @@ public final class NativeBridge {
   /**
    * NeoForge does not always expose JAR package manifest attributes through
    * {@link Package}. Resolve the same version from loader metadata without
-   * adding any native-runtime dependency to the packaged-payload smoke test.
+   * making the JNI/source-parity task compile against the NeoForge classes.
    */
   private static String neoforgeMetadataVersion() {
     try {
-      return ModList.get().getModContainerById("complemetal")
-          .map(container -> container.getModInfo().getVersion().toString())
-          .orElse(null);
+      Class<?> modListClass = Class.forName("net.neoforged.fml.ModList");
+      Object modList = modListClass.getMethod("get").invoke(null);
+      Object optionalContainer = modListClass
+          .getMethod("getModContainerById", String.class)
+          .invoke(modList, "complemetal");
+      if (!(optionalContainer instanceof Optional<?> optional)
+          || optional.isEmpty()) {
+        return null;
+      }
+      Object container = optional.get();
+      Object modInfo = container.getClass().getMethod("getModInfo")
+          .invoke(container);
+      Object version = modInfo.getClass().getMethod("getVersion")
+          .invoke(modInfo);
+      return version == null ? null : version.toString();
     } catch (Throwable ignored) {
       return null;
     }
