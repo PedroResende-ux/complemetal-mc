@@ -5,8 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import com.mojang.blaze3d.vertex.VertexFormatElement;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Set;
@@ -167,8 +167,11 @@ final class IrisInProcessTranslationSmokeTest {
         """;
     IrisVertexLayoutCapture.Layout layout =
         IrisVertexLayoutCapture.resolveShaderInputFormats(vertex,
-            IrisVertexLayoutCapture.capture(VertexFormat.builder(0)
-                .addAttribute("a_LightAndData", GpuFormat.RGBA8_UNORM)
+            IrisVertexLayoutCapture.capture(VertexFormat.builder()
+                .add("a_LightAndData", VertexFormatElement.register(
+                    VertexFormatElement.findNextId(), 0,
+                    VertexFormatElement.Type.UBYTE,
+                    VertexFormatElement.Usage.COLOR, 4))
                 .build(), true));
     IrisFinalShaderProgram program =
         IrisFinalShaderProgram.fromGraphicsLink("normalized-integer-smoke",
