@@ -241,6 +241,17 @@ public final class IrisGlResourceBindingTracker {
         entry -> entry.getValue().texture() == texture);
   }
 
+  /** Mirrors deletion of a GL buffer from every indexed binding table. */
+  public synchronized void deleteBuffer(int buffer) {
+    if (buffer <= 0) {
+      return;
+    }
+    indexedBuffers.entrySet().removeIf(
+        entry -> entry.getValue().buffer() == buffer);
+    textureBuffers.entrySet().removeIf(
+        entry -> entry.getValue().buffer() == buffer);
+  }
+
   public synchronized TextureUnitBinding activeTextureBinding() {
     MutableTextureUnit binding = textureUnits.get(activeTextureUnit);
     return binding == null ? null : binding.snapshot();
