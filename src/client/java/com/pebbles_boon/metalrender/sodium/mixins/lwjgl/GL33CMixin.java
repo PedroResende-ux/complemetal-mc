@@ -1,6 +1,7 @@
 package com.pebbles_boon.metalrender.sodium.mixins.lwjgl;
 
 import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingTracker;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlSamplerMirror;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.injection.At;
