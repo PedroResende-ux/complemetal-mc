@@ -1,3 +1,4 @@
+// 1.21.1 port: native Metal/Iris compile gates run on macOS arm64 CI.
 plugins {
     id 'java-library'
     id 'maven-publish'
