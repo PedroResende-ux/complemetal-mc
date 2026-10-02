@@ -855,7 +855,7 @@ public class MetalWorldRenderer {
 
   /**
    * Minecraft 1.21.1 does not expose the newer camera attribute-probe API used
-   * by the 26.2 implementation. Keep a neutral sky factor until a native 1.21.1
+   * by the newer implementation. Keep a neutral sky factor until a native 1.21.1
    * light/sky capture path is added.
    */
   private static float resolveSkyLightFactor(Camera camera, float tickDelta) {
@@ -1771,7 +1771,7 @@ public class MetalWorldRenderer {
     if (handle == 0) {
       return false;
     }
-    // 1.21.1 does not expose the 26.2 RenderPass/CommandEncoder API used by
+    // 1.21.1 does not expose the newer RenderPass/CommandEncoder API used by
     // the upstream branch. The IOSurface blitter already contains the native
     // texture-to-window path and is loader/version independent.
     return ioSurfaceBlitter.blit(handle);
