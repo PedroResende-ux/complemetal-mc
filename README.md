@@ -167,6 +167,28 @@ For a reproducible local graph-validation run, use:
 ./gradlew --no-daemon -PirisGraph runClient
 ```
 
+For the Complementary Reimagined target workload, the same validated experimental
+path is available through a dedicated shortcut:
+
+```bash
+./gradlew --no-daemon -Pcomplementary runClient
+```
+
+This profile enables capture, GLSL -> SPIR-V -> MSL translation, Metal pipeline
+compilation, resource mirroring, parity capture, and graph execution. It does
+**not** enable automatic Metal ownership; Iris/OpenGL remains the visible
+fallback until the parity/ownership gates are satisfied.
+
+The translator acceptance smoke includes a Complementary-style workload covering
+legacy GLSL compatibility syntax, interpolated varyings, framebuffer MRT output,
+texture fetch/LOD and derivative operations, and shader image access. Run it on
+an Apple Silicon macOS environment with the LWJGL shaderc/SPIRV-Cross natives
+available:
+
+```bash
+METALRENDER_IRIS_TRANSLATION_SMOKE=1   ./gradlew --no-daemon test   --tests '*.IrisInProcessTranslationSmokeTest'
+```
+
 This enables shader capture/translation, Metal pipeline compilation, resource
 mirroring, visual-parity capture, and Metal graph execution while keeping
 full-frame OpenGL ownership disabled. To test the subsequent ownership gate:
