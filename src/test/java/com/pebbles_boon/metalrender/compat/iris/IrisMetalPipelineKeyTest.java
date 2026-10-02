@@ -16,7 +16,7 @@ final class IrisMetalPipelineKeyTest {
   private static final String C = "c".repeat(64);
   private static final String D = "d".repeat(64);
   private static final IrisTranslationProfile PROFILE =
-      IrisTranslationProfile.LWJGL_3_4_1_METAL_3_ARGUMENT_BUFFERS;
+      IrisTranslationProfile.LWJGL_3_3_3_METAL_3_ARGUMENT_BUFFERS;
 
   @Test
   void keyIsDeterministicAndIncludesEveryCompatibilityBoundary() {
