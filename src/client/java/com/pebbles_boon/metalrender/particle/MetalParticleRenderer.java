@@ -25,6 +25,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.phys.AABB;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 import org.lwjgl.opengl.GL11;
@@ -146,8 +147,10 @@ public class MetalParticleRenderer {
       if (p == null)
         continue;
       ParticleAccessor pa = (ParticleAccessor) p;
-      if (!frustum.pointInFrustum(pa.metalrender$getX(),
-          pa.metalrender$getY(), pa.metalrender$getZ())) {
+      if (frustum != null && !frustum.isVisible(new AABB(
+          pa.metalrender$getX() - 0.25D, pa.metalrender$getY() - 0.25D,
+          pa.metalrender$getZ() - 0.25D, pa.metalrender$getX() + 0.25D,
+          pa.metalrender$getY() + 0.25D, pa.metalrender$getZ() + 0.25D))) {
         continue;
       }
       if (!(p instanceof SingleQuadParticle bp))
@@ -321,7 +324,7 @@ public class MetalParticleRenderer {
     Minecraft mc = Minecraft.getInstance();
     if (mc == null)
       return;
-    Camera camera = mc.gameRenderer.mainCamera();
+    Camera camera = mc.gameRenderer.getMainCamera();
     if (camera == null)
       return;
     Quaternionf camRot = camera.rotation();
@@ -538,10 +541,7 @@ public class MetalParticleRenderer {
       AbstractTexture tex = mc.getTextureManager().getTexture(atlasId);
       if (tex == null)
         return 0;
-      var gpuTex = tex.getTexture();
-      if (gpuTex instanceof GlTexture glTex) {
-        return glTex.glId();
-      }
+      return tex.getId();
     } catch (Exception e) {
     }
     return 0;
