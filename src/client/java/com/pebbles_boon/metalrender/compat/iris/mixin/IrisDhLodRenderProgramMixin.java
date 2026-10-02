@@ -1,7 +1,7 @@
 package com.pebbles_boon.metalrender.compat.iris.mixin;
 
-import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import com.mojang.blaze3d.vertex.VertexFormatElement;
 import com.pebbles_boon.metalrender.compat.iris.IrisPipelineStateCapture;
 import com.pebbles_boon.metalrender.compat.iris.IrisShaderCapture;
 import org.spongepowered.asm.mixin.Final;
@@ -28,11 +28,25 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class IrisDhLodRenderProgramMixin {
   @Unique
   private static final VertexFormat METALRENDER_DH_LOD_VERTEX_FORMAT =
-      VertexFormat.builder(0)
-          .addAttribute("vPosition", GpuFormat.RGBA16_UINT)
-          .addAttribute("iris_color", GpuFormat.RGBA8_UNORM)
-          .addAttribute("irisExtra", GpuFormat.RGBA8_UINT)
+      VertexFormat.builder()
+          .add("vPosition", metalrender$element(
+              VertexFormatElement.Type.USHORT,
+              VertexFormatElement.Usage.POSITION, 4))
+          .add("iris_color", metalrender$element(
+              VertexFormatElement.Type.UBYTE,
+              VertexFormatElement.Usage.COLOR, 4))
+          .add("irisExtra", metalrender$element(
+              VertexFormatElement.Type.UBYTE,
+              VertexFormatElement.Usage.GENERIC, 4))
           .build();
+
+  @Unique
+  private static VertexFormatElement metalrender$element(
+      VertexFormatElement.Type type, VertexFormatElement.Usage usage,
+      int count) {
+    return VertexFormatElement.register(
+        VertexFormatElement.findNextId(), 0, type, usage, count);
+  }
 
   @Shadow
   @Final
