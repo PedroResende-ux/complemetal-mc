@@ -835,8 +835,8 @@ public class CustomChunkMesher {
     } else {
       Minecraft mc = Minecraft.getInstance();
       if (priority == 1 && mc != null && mc.player != null) {
-        int pcx = mc.player.chunkPosition().x();
-        int pcz = mc.player.chunkPosition().z();
+        int pcx = mc.player.chunkPosition().x;
+        int pcz = mc.player.chunkPosition().z;
         int dx = Math.abs(chunkX - pcx);
         int dz = Math.abs(chunkZ - pcz);
         int chunkDist = Math.max(dx, dz);
@@ -1009,8 +1009,8 @@ public class CustomChunkMesher {
     if (mc != null) {
       blockRenderer = mc.getBlockRenderer();
       if (mc.player != null) {
-        buildPCX = mc.player.chunkPosition().x();
-        buildPCZ = mc.player.chunkPosition().z();
+        buildPCX = mc.player.chunkPosition().x;
+        buildPCZ = mc.player.chunkPosition().z;
         buildPCY = (int) Math.floor(mc.player.getY()) >> 4;
       }
       waterStill = getFluidSprite(mc, net.minecraft.world.level.material.Fluids.WATER, false);
@@ -1408,7 +1408,7 @@ public class CustomChunkMesher {
   private static final class MeshBuilder {
     private final ByteBuffer solidBuffer;
     private final ByteBuffer waterBuffer;
-    private final BlockStateModelSet blockModels;
+    private final net.minecraft.client.renderer.block.BlockRenderDispatcher blockRenderer;
     private final SectionSnapshot snapshot;
     private final MeshBuildContext context;
     private final int chunkX, chunkY, chunkZ;
@@ -1416,11 +1416,12 @@ public class CustomChunkMesher {
     int opaqueQuadCount = 0;
     int waterQuadCount = 0;
 
-    MeshBuilder(ByteBuffer solidBuffer, ByteBuffer waterBuffer, BlockStateModelSet blockModels,
+    MeshBuilder(ByteBuffer solidBuffer, ByteBuffer waterBuffer,
+        net.minecraft.client.renderer.block.BlockRenderDispatcher blockRenderer,
         SectionSnapshot snapshot, MeshBuildContext context, int chunkX, int chunkY, int chunkZ) {
       this.solidBuffer = solidBuffer;
       this.waterBuffer = waterBuffer;
-      this.blockModels = blockModels;
+      this.blockRenderer = blockRenderer;
       this.snapshot = snapshot;
       this.context = context;
       this.chunkX = chunkX;
@@ -1606,7 +1607,7 @@ public class CustomChunkMesher {
 
       if (downVisible) {
         BlockState downState = getPaddedBlockState(lx, ly - 1, lz);
-        if (downState == null || !downState.isSolidRender()) {
+        if (downState == null || !downState.canOcclude()) {
           renderFluidBottom(lx, ly, lz, r, g, b, a, light, isLava,
               translucent);
         }
@@ -1875,9 +1876,9 @@ public class CustomChunkMesher {
       for (int i = 0; i < 4; i++) {
         org.joml.Vector3fc pos = quad.position(i);
         long packedUV = quad.packedUV(i);
-        float x = pos.x() + lx;
-        float y = pos.y() + ly;
-        float z = pos.z() + lz;
+        float x = pos.getX() + lx;
+        float y = pos.getY() + ly;
+        float z = pos.getZ() + lz;
         float u = Float.intBitsToFloat((int) (packedUV >> 32));
         float v = Float.intBitsToFloat((int) packedUV);
 
