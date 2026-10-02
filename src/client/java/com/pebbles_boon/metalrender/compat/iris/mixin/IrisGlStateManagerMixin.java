@@ -48,6 +48,10 @@ public abstract class IrisGlStateManagerMixin {
     return METALRENDER_MOJANG_BUFFER_SUBDATA_SCOPE.get() > 0;
   }
 
+  public static boolean metalrender$isMojangDrawActive() {
+    return Boolean.TRUE.equals(METALRENDER_MOJANG_DRAW_SCOPE.get());
+  }
+
   private static void metalrender$enterBufferDataScope() {
     METALRENDER_MOJANG_BUFFER_DATA_SCOPE.set(
         METALRENDER_MOJANG_BUFFER_DATA_SCOPE.get() + 1);
