@@ -208,6 +208,7 @@ public final class IrisShaderCapture {
     DEFERRED_SODIUM_PROGRAMS.remove(glProgram);
     IrisPipelineStateCapture.global().deleteProgram(glProgram);
     IrisProgramIdentityRegistry.global().delete(glProgram);
+    IrisGlResourceBindingTracker.global().deleteProgram(glProgram);
   }
 
   private static void enqueueRegistered(IrisFinalShaderProgram program,
