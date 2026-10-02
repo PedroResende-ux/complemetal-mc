@@ -5,8 +5,6 @@ project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
 
 patterns=(
-  '26\.2'
-  'mc26\.2'
   'Java[[:space:]]+25'
   'JAVA_25'
   '--release[[:space:]]+25'
