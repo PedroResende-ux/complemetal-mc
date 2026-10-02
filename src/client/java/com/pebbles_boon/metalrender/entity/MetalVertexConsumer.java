@@ -81,7 +81,6 @@ public class MetalVertexConsumer implements VertexConsumer {
     return this;
   }
 
-  @Override
   public VertexConsumer setLineWidth(float width) {
     return this;
   }
