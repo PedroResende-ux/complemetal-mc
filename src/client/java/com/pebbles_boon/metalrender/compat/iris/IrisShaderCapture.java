@@ -224,6 +224,7 @@ public final class IrisShaderCapture {
         != IrisShaderCaptureQueue.Disposition.ACCEPTED) {
       registry.delete(glProgram);
       IrisPipelineStateCapture.global().deleteProgram(glProgram);
+      IrisGlResourceBindingTracker.global().deleteProgram(glProgram);
     }
   }
 
