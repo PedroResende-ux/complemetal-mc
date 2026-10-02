@@ -6860,8 +6860,8 @@ static jlongArray run_iris_metal4_graph_frame(
                                reason:@"graph texture copy multisample unsupported"
                              userInfo:nil];
               }
-              MTLRenderPassDescriptor *pass =
-                  [[MTLRenderPassDescriptor alloc] init];
+              MTL4RenderPassDescriptor *pass =
+                  [[MTL4RenderPassDescriptor alloc] init];
               MTLRenderPassColorAttachmentDescriptor *attachment =
                   pass.colorAttachments[0];
               attachment.texture = source;
