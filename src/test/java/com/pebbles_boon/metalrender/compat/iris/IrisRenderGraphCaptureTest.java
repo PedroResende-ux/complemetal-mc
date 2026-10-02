@@ -252,8 +252,6 @@ final class IrisRenderGraphCaptureTest {
     tracker.defineTexture(80, "rgba16-float", 1, 1280, 720, 1, 1);
     assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
         IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 70, 0));
-    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
-        IrisGlStateTracker.GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 71, 0));
     assertTrue(tracker.framebufferTexture2DForFramebuffer(8,
         IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 80, 0));
 
@@ -333,9 +331,12 @@ final class IrisRenderGraphCaptureTest {
     tracker.initializeOpenGlDefaults();
     tracker.registerFramebuffer(7);
     tracker.defineTexture(70, "rgba8-unorm", 1, 32, 16, 1, 1);
+    tracker.defineTexture(71, "d32-float", 1, 32, 16, 1, 1);
     tracker.bindFramebuffer(IrisGlStateTracker.GL_DRAW_FRAMEBUFFER, 7);
     assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
         IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 70, 0));
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
+        IrisGlStateTracker.GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 71, 0));
 
     IrisRenderGraphCapture capture = new IrisRenderGraphCapture(tracker);
     capture.beginFrame();
