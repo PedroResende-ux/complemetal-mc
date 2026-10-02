@@ -32,6 +32,7 @@ public final class IrisSodiumGlStateBridge {
 
   public static void deleteBuffer(int buffer) {
     IrisGlVertexArrayTracker.global().deleteBuffer(buffer);
+    IrisGlResourceBindingTracker.global().deleteBuffer(buffer);
     MAPPINGS.remove(buffer);
     IrisGlBufferMirror.global().delete(buffer);
   }
