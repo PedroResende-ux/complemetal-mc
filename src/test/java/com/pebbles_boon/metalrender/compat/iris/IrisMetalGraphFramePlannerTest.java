@@ -39,9 +39,7 @@ final class IrisMetalGraphFramePlannerTest {
         IrisRenderGraph.ResourceKind.TEXTURE, "rgba16-float", 1,
         16, 16, 1, 1);
 
-    IrisRenderExecutionPlan plan = plan(
-        new IrisExecutionCommand.DrawArrays(4, 0, 3, 1, 0,
-            IrisExecutionCommand.Source.DIRECT_GL),
+    IrisRenderExecutionPlan plan = graphOnlyPlan(
         List.of(first, second, distinct));
 
     assertTrue(IrisMetalGraphFramePlanner.hasRepeatedFormat(plan,
@@ -272,4 +270,23 @@ final class IrisMetalGraphFramePlannerTest {
     assertEquals("graph-frame-transfer-source-uninitialized",
         unsupported.reason());
   }
+  private static IrisRenderExecutionPlan graphOnlyPlan(
+      List<IrisRenderGraph.Resource> resources) {
+    ResourceHandle handle = new ResourceHandle(ResourceKind.TEXTURE,
+        9001, 1, 1);
+    IrisRenderGraph.ResourceUse write = new IrisRenderGraph.ResourceUse(0,
+        IrisRenderGraph.Access.WRITE);
+    IrisRenderGraph.Node node = new IrisRenderGraph.Node(0,
+        IrisRenderGraph.NodeKind.CLEAR, IrisRenderGraph.Phase.FINAL,
+        "0".repeat(64), "0".repeat(64), 0, List.of(write));
+    IrisRenderGraph graph = new IrisRenderGraph(resources,
+        List.of(node), List.of());
+    return new IrisRenderExecutionPlan(graph,
+        List.of(new IrisRenderExecutionPlan.ClearStep(0, 0,
+            IrisRenderGraph.Phase.FINAL,
+            IrisClearCommand.colorFloat(handle, 0,
+                0.0F, 0.0F, 0.0F, 1.0F, Optional.empty()),
+            List.of(write))));
+  }
+
 }
