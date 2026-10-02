@@ -336,6 +336,8 @@ final class IrisRenderGraphCaptureTest {
     tracker.registerFramebuffer(7);
     tracker.defineTexture(70, "rgba8-unorm", 1, 32, 16, 1, 1);
     tracker.defineTexture(71, "d32-float", 1, 32, 16, 1, 1);
+    tracker.drawBuffersForFramebuffer(7,
+        IrisGlStateTracker.GL_COLOR_ATTACHMENT0);
     tracker.bindFramebuffer(IrisGlStateTracker.GL_DRAW_FRAMEBUFFER, 7);
     assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
         IrisGlStateTracker.GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 70, 0));
