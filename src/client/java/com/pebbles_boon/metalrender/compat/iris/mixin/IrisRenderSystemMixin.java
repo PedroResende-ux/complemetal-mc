@@ -70,17 +70,29 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$bufferData(int target, float[] values,
       int usage, CallbackInfo ci) {
     if (!com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
-        .isEnabled() || values == null || values.length == 0
-        || values.length > Integer.MAX_VALUE / Float.BYTES) {
+        .isEnabled()) {
       return;
     }
     int buffer = metalrender$vertices().boundBuffer(target);
+    if (buffer <= 0) {
+      return;
+    }
+    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
+        com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
+    if (values == null || values.length == 0) {
+      mirror.delete(buffer);
+      return;
+    }
+    if (values.length > Integer.MAX_VALUE / Float.BYTES) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-upload-size-invalid");
+      mirror.delete(buffer);
+      return;
+    }
     int bytes = values.length * Float.BYTES;
     ByteBuffer encoded = ByteBuffer.allocate(bytes)
         .order(ByteOrder.nativeOrder());
     encoded.asFloatBuffer().put(values);
-    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
-        com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
     if (!mirror.allocate(buffer, bytes)
         || !mirror.write(buffer, bytes, 0, bytes, encoded)) {
       IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
@@ -93,17 +105,29 @@ public abstract class IrisRenderSystemMixin {
   private static void metalrender$bufferStorage(int target, float[] values,
       int flags, CallbackInfoReturnable<Integer> callback) {
     if (!com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
-        .isEnabled() || values == null || values.length == 0
-        || values.length > Integer.MAX_VALUE / Float.BYTES) {
+        .isEnabled()) {
       return;
     }
     int buffer = callback.getReturnValue();
+    if (buffer <= 0) {
+      return;
+    }
+    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
+        com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
+    if (values == null || values.length == 0) {
+      mirror.delete(buffer);
+      return;
+    }
+    if (values.length > Integer.MAX_VALUE / Float.BYTES) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-storage-size-invalid");
+      mirror.delete(buffer);
+      return;
+    }
     int bytes = values.length * Float.BYTES;
     ByteBuffer encoded = ByteBuffer.allocate(bytes)
         .order(ByteOrder.nativeOrder());
     encoded.asFloatBuffer().put(values);
-    com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
-        com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
     if (!mirror.allocate(buffer, bytes)
         || !mirror.write(buffer, bytes, 0, bytes, encoded)) {
       IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
