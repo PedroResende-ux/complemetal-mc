@@ -513,6 +513,7 @@ public abstract class IrisRenderSystemMixin {
       remap = false)
   private static void metalrender$destroySampler(int sampler,
       CallbackInfo ci) {
+    metalrender$resources().deleteSampler(sampler);
     IrisGlSamplerMirror.global().deleteSampler(sampler);
   }
 
