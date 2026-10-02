@@ -12,4 +12,7 @@ public interface WindowAccessor {
 
   @Accessor("height")
   void metalrender$setWindowHeight(int height);
+
+  @Accessor("handle")
+  long metalrender$getWindowHandle();
 }
