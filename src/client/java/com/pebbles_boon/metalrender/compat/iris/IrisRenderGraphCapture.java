@@ -345,8 +345,7 @@ public final class IrisRenderGraphCapture {
           : new IrisTransferCommand.CopyTexImage2D(sourceFramebuffer,
               sourceTexture, destination.handle(), target, level,
               internalFormat, sourceX, sourceY, width, height, border);
-      add(new RawTransfer(phase, reads, List.of(destination), command));
-      return true;
+      return add(new RawTransfer(phase, reads, List.of(destination), command));
     }
     return false;
   }
@@ -504,8 +503,7 @@ public final class IrisRenderGraphCapture {
     }
     IrisClearCommand command = IrisClearCommand.depth(resource.handle(),
         depth, region);
-    add(new RawClear(phase, command, List.of(resource)));
-    return true;
+    return add(new RawClear(phase, command, List.of(resource)));
   }
 
   /** Tracks the value consumed by the next legacy {@code glClear}. */
