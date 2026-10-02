@@ -69,6 +69,34 @@ final class IrisRenderGraphCaptureTest {
   }
 
   @Test
+  void overflowedFrameDoesNotReportResourceOperationsAsCaptured() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerFramebuffer(7);
+    tracker.defineTexture(70, "rgba8-unorm", 1, 32, 16, 1, 1);
+    tracker.defineTexture(71, "d32-float", 1, 32, 16, 1, 1);
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_READ_FRAMEBUFFER, 7);
+    tracker.bindTextureToUnit(GL_TEXTURE_2D, 0, 70);
+
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(tracker);
+    capture.beginFrame();
+    for (int index = 0;
+        index < IrisRenderGraphCapture.MAX_EVENTS_PER_FRAME; index++) {
+      assertTrue(capture.memoryBarrier(index));
+    }
+    assertFalse(capture.memoryBarrier(IrisRenderGraphCapture.MAX_EVENTS_PER_FRAME));
+    assertFalse(capture.hasActiveFrame());
+
+    assertFalse(capture.copyBoundTexture(GL_TEXTURE_2D, 0, 0,
+        0, 0, 1, 1, 0, 0, IrisGlStateTracker.GL_COLOR_ATTACHMENT0));
+    assertFalse(capture.clearDepthTexture(71, 1.0, Optional.empty()));
+
+    capture.endFrame();
+    assertEquals(IrisRenderGraphCapture.MAX_EVENTS_PER_FRAME,
+        capture.poll().orElseThrow().events().size());
+  }
+
+  @Test
   void fullReplayReservationBypassesRegularFrameSamplingInterval() {
     AtomicLong now = new AtomicLong(1_000_000_000L);
     AtomicBoolean fullReplay = new AtomicBoolean();
