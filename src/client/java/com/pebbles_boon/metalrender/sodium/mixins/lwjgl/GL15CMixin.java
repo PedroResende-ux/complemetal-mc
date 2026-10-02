@@ -90,7 +90,8 @@ public class GL15CMixin {
       require = 0)
   private static void metalrender$onBufferSubData(int target, long offset,
       ByteBuffer data, CallbackInfo ci) {
-    if (!IrisGlBufferMirror.isEnabled() || data == null) {
+    if (IrisGlStateManagerMixin.metalrender$isMojangBufferSubDataActive()
+        || !IrisGlBufferMirror.isEnabled() || data == null) {
       return;
     }
     int buffer = IrisGlVertexArrayTracker.global().boundBuffer(target);
