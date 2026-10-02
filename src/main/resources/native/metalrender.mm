@@ -5222,6 +5222,116 @@ class IrisMetal4FrameBufferArena {
   std::vector<IrisMetal4FrameArenaChunk> chunks_;
 };
 
+static constexpr size_t kIrisMetal4TransientBufferPoolLimit = 8192;
+static constexpr uint64_t kIrisMetal4TransientBufferPoolByteLimit =
+    256ULL * 1024ULL * 1024ULL;
+
+/**
+ * Per-calling-thread pool for the shared buffers used by Iris argument
+ * encoders and captured CPU buffer images.
+ *
+ * Metal 4's macOS 26 shared-buffer implementation internally suballocates
+ * small MTLBuffers.  Releasing hundreds of them after one command buffer and
+ * immediately allocating the same shapes on another Iris path exposed a
+ * driver assertion in IOGPUMetalSuballocatorAllocate.  Retaining and reusing
+ * a bounded set also removes that allocation churn from the eventual frame
+ * path.  Buffers are returned only after synchronous command completion.
+ */
+struct IrisMetal4TransientBufferPool {
+  std::unordered_map<NSUInteger, std::vector<id<MTLBuffer>>> available;
+  size_t allocatedCount = 0;
+  uint64_t allocatedBytes = 0;
+
+  id<MTLBuffer> acquire(NSUInteger length) {
+    if (!g_device || length == 0)
+      return nil;
+    auto found = available.find(length);
+    if (found != available.end() && !found->second.empty()) {
+      id<MTLBuffer> buffer = found->second.back();
+      found->second.pop_back();
+      return buffer;
+    }
+    if (allocatedCount >= kIrisMetal4TransientBufferPoolLimit ||
+        (uint64_t)length > kIrisMetal4TransientBufferPoolByteLimit ||
+        allocatedBytes >
+            kIrisMetal4TransientBufferPoolByteLimit - (uint64_t)length) {
+      return nil;
+    }
+    id<MTLBuffer> buffer = [g_device
+        newBufferWithLength:length
+                    options:MTLResourceStorageModeShared |
+                            MTLResourceCPUCacheModeWriteCombined];
+    if (!buffer)
+      return nil;
+    allocatedCount++;
+    allocatedBytes += (uint64_t)length;
+    return buffer;
+  }
+
+  void recycle(id<MTLBuffer> buffer) {
+    if (!buffer)
+      return;
+    available[buffer.length].push_back(buffer);
+  }
+
+  ~IrisMetal4TransientBufferPool() {
+    for (auto &bucket : available) {
+      for (id<MTLBuffer> buffer : bucket.second)
+        [buffer release];
+    }
+  }
+};
+
+static thread_local IrisMetal4TransientBufferPool
+    g_irisMetal4TransientBufferPool;
+
+
+struct IrisMetal4RetiredSubmission;
+
+struct IrisShadowRuntimeResources {
+  std::vector<id<MTLBuffer>> buffers;
+  std::vector<uint8_t> pooledBufferOwnership;
+  std::vector<id<MTLBuffer>> inlineBuffers;
+  std::vector<id<MTLBuffer>> argumentBuffers;
+  std::vector<id<MTLTexture>> sampledTextures;
+  std::unordered_map<uint32_t, id<MTLTexture>> sampledByName;
+  std::vector<id<MTLSamplerState>> samplers;
+  std::vector<id<MTLTexture>> colorTargets;
+  id<MTLTexture> depthTarget = nil;
+  id<MTLTexture> stencilTarget = nil;
+  id vertexTable = nil;
+  id fragmentTable = nil;
+  id computeTable = nil;
+
+  void transferTo(IrisMetal4RetiredSubmission &submission);
+
+  ~IrisShadowRuntimeResources() {
+    if (vertexTable) [vertexTable release];
+    if (fragmentTable) [fragmentTable release];
+    if (computeTable) [computeTable release];
+    for (id<MTLSamplerState> value : samplers) [value release];
+    for (id<MTLBuffer> value : argumentBuffers)
+      g_irisMetal4TransientBufferPool.recycle(value);
+    for (id<MTLBuffer> value : inlineBuffers)
+      g_irisMetal4TransientBufferPool.recycle(value);
+    for (id<MTLTexture> value : sampledTextures) [value release];
+    for (size_t index = 0; index < buffers.size(); index++) {
+      if (index < pooledBufferOwnership.size() &&
+          pooledBufferOwnership[index] != 0) {
+        g_irisMetal4TransientBufferPool.recycle(buffers[index]);
+      } else {
+        [buffers[index] release];
+      }
+    }
+    for (id<MTLTexture> value : colorTargets) {
+      if (value) [value release];
+    }
+    if (depthTarget) [depthTarget release];
+    if (stencilTarget && stencilTarget != depthTarget)
+      [stencilTarget release];
+  }
+};
+
 // Keep these graph packet/draw types complete before the executor declarations.
 // The encoder performs load/attachment analysis and accesses prepared-draw state
 // directly, so forward declarations alone are insufficient in C++.
@@ -8945,114 +9055,9 @@ static id<MTLSamplerState> iris_shadow_sampler(
   return sampler;
 }
 
-static constexpr size_t kIrisMetal4TransientBufferPoolLimit = 8192;
-static constexpr uint64_t kIrisMetal4TransientBufferPoolByteLimit =
-    256ULL * 1024ULL * 1024ULL;
-
-/**
- * Per-calling-thread pool for the shared buffers used by Iris argument
- * encoders and captured CPU buffer images.
- *
- * Metal 4's macOS 26 shared-buffer implementation internally suballocates
- * small MTLBuffers.  Releasing hundreds of them after one command buffer and
- * immediately allocating the same shapes on another Iris path exposed a
- * driver assertion in IOGPUMetalSuballocatorAllocate.  Retaining and reusing
- * a bounded set also removes that allocation churn from the eventual frame
- * path.  Buffers are returned only after synchronous command completion.
- */
-struct IrisMetal4TransientBufferPool {
-  std::unordered_map<NSUInteger, std::vector<id<MTLBuffer>>> available;
-  size_t allocatedCount = 0;
-  uint64_t allocatedBytes = 0;
-
-  id<MTLBuffer> acquire(NSUInteger length) {
-    if (!g_device || length == 0)
-      return nil;
-    auto found = available.find(length);
-    if (found != available.end() && !found->second.empty()) {
-      id<MTLBuffer> buffer = found->second.back();
-      found->second.pop_back();
-      return buffer;
-    }
-    if (allocatedCount >= kIrisMetal4TransientBufferPoolLimit ||
-        (uint64_t)length > kIrisMetal4TransientBufferPoolByteLimit ||
-        allocatedBytes >
-            kIrisMetal4TransientBufferPoolByteLimit - (uint64_t)length) {
-      return nil;
-    }
-    id<MTLBuffer> buffer = [g_device
-        newBufferWithLength:length
-                    options:MTLResourceStorageModeShared |
-                            MTLResourceCPUCacheModeWriteCombined];
-    if (!buffer)
-      return nil;
-    allocatedCount++;
-    allocatedBytes += (uint64_t)length;
-    return buffer;
-  }
-
-  void recycle(id<MTLBuffer> buffer) {
-    if (!buffer)
-      return;
-    available[buffer.length].push_back(buffer);
-  }
-
-  ~IrisMetal4TransientBufferPool() {
-    for (auto &bucket : available) {
-      for (id<MTLBuffer> buffer : bucket.second)
-        [buffer release];
-    }
-  }
-};
-
-static thread_local IrisMetal4TransientBufferPool
-    g_irisMetal4TransientBufferPool;
-
 struct IrisMetal4RetiredSubmission;
 
-struct IrisShadowRuntimeResources {
-  std::vector<id<MTLBuffer>> buffers;
-  std::vector<uint8_t> pooledBufferOwnership;
-  std::vector<id<MTLBuffer>> inlineBuffers;
-  std::vector<id<MTLBuffer>> argumentBuffers;
-  std::vector<id<MTLTexture>> sampledTextures;
-  std::unordered_map<uint32_t, id<MTLTexture>> sampledByName;
-  std::vector<id<MTLSamplerState>> samplers;
-  std::vector<id<MTLTexture>> colorTargets;
-  id<MTLTexture> depthTarget = nil;
-  id<MTLTexture> stencilTarget = nil;
-  id vertexTable = nil;
-  id fragmentTable = nil;
-  id computeTable = nil;
 
-  void transferTo(IrisMetal4RetiredSubmission &submission);
-
-  ~IrisShadowRuntimeResources() {
-    if (vertexTable) [vertexTable release];
-    if (fragmentTable) [fragmentTable release];
-    if (computeTable) [computeTable release];
-    for (id<MTLSamplerState> value : samplers) [value release];
-    for (id<MTLBuffer> value : argumentBuffers)
-      g_irisMetal4TransientBufferPool.recycle(value);
-    for (id<MTLBuffer> value : inlineBuffers)
-      g_irisMetal4TransientBufferPool.recycle(value);
-    for (id<MTLTexture> value : sampledTextures) [value release];
-    for (size_t index = 0; index < buffers.size(); index++) {
-      if (index < pooledBufferOwnership.size() &&
-          pooledBufferOwnership[index] != 0) {
-        g_irisMetal4TransientBufferPool.recycle(buffers[index]);
-      } else {
-        [buffers[index] release];
-      }
-    }
-    for (id<MTLTexture> value : colorTargets) {
-      if (value) [value release];
-    }
-    if (depthTarget) [depthTarget release];
-    if (stencilTarget && stencilTarget != depthTarget)
-      [stencilTarget release];
-  }
-};
 
 /**
  * Metal 4 command buffers don't retain the resources they reference.  A
@@ -9553,10 +9558,7 @@ static int iris_shadow_prepare_arguments(
 
 namespace {
 
-struct IrisMetal4GraphFeedbackCopy {
-  id<MTLTexture> source = nil;
-  id<MTLTexture> snapshot = nil;
-};
+
 
 
 
