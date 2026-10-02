@@ -3,6 +3,7 @@ package com.pebbles_boon.metalrender.sodium.mixins.lwjgl;
 import com.pebbles_boon.metalrender.backend.GLIntercept;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlVertexArrayTracker;
+import com.pebbles_boon.metalrender.compat.iris.IrisRenderGraphCapture;
 import com.pebbles_boon.metalrender.compat.iris.mixin.IrisGlStateManagerMixin;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
@@ -27,25 +28,10 @@ public class GL15CMixin {
   }
 
   @Inject(method = "glBufferData", at = @At("HEAD"), remap = false)
-  private static void metalrender$onBufferDataBB(int target, ByteBuffer data,
-      int usage, CallbackInfo ci) {
+  private static void metalrender$onBufferDataIntercept(int target,
+      ByteBuffer data, int usage, CallbackInfo ci) {
     if (IrisGlStateManagerMixin.metalrender$isMojangBufferDataActive()) {
       return;
-    }
-    if (data == null || !IrisGlBufferMirror.isEnabled()) {
-      if (com.pebbles_boon.metalrender.config.MetalRenderConfig
-          .mirrorUploads()) {
-        GLIntercept.onBufferData(target, data, usage, 32);
-      }
-      return;
-    }
-    int buffer = IrisGlVertexArrayTracker.global().boundBuffer(target);
-    int length = data.remaining();
-    if (buffer > 0 && length > 0) {
-      IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
-      if (mirror.allocate(buffer, length)) {
-        mirror.write(buffer, length, 0, length, data);
-      }
     }
     if (com.pebbles_boon.metalrender.config.MetalRenderConfig
         .mirrorUploads()) {
@@ -53,34 +39,77 @@ public class GL15CMixin {
     }
   }
 
-  @Inject(method = "glBufferData", at = @At("HEAD"), remap = false,
+  @Inject(method = "glBufferData", at = @At("RETURN"), remap = false,
+      require = 0)
+  private static void metalrender$onBufferDataBB(int target, ByteBuffer data,
+      int usage, CallbackInfo ci) {
+    if (IrisGlStateManagerMixin.metalrender$isMojangBufferDataActive()
+        || !IrisGlBufferMirror.isEnabled()) {
+      return;
+    }
+    int buffer = IrisGlVertexArrayTracker.global().boundBuffer(target);
+    if (buffer <= 0) {
+      return;
+    }
+    IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
+    if (data == null || !data.hasRemaining()) {
+      mirror.delete(buffer);
+      return;
+    }
+    int length = data.remaining();
+    if (!mirror.allocate(buffer, length)
+        || !mirror.write(buffer, length, 0, length, data)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-lwjgl-buffer-upload-mirror-rejected");
+    }
+  }
+
+  @Inject(method = "glBufferData", at = @At("RETURN"), remap = false,
       require = 0)
   private static void metalrender$onBufferDataSize(int target, long size,
       int usage, CallbackInfo ci) {
-    if (IrisGlStateManagerMixin.metalrender$isMojangBufferDataActive()) {
+    if (IrisGlStateManagerMixin.metalrender$isMojangBufferDataActive()
+        || !IrisGlBufferMirror.isEnabled()) {
       return;
     }
-    if (IrisGlBufferMirror.isEnabled()) {
-      int buffer = IrisGlVertexArrayTracker.global().boundBuffer(target);
-      if (buffer > 0 && size > 0) {
-        IrisGlBufferMirror.global().allocate(buffer, size);
-      }
+    int buffer = IrisGlVertexArrayTracker.global().boundBuffer(target);
+    if (buffer <= 0) {
+      return;
+    }
+    if (size <= 0) {
+      IrisGlBufferMirror.global().delete(buffer);
+      return;
+    }
+    if (!IrisGlBufferMirror.global().allocate(buffer, size)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-lwjgl-buffer-allocation-mirror-rejected");
     }
   }
 
-  @Inject(method = "glBufferSubData", at = @At("HEAD"), remap = false)
+  @Inject(method = "glBufferSubData", at = @At("RETURN"), remap = false,
+      require = 0)
   private static void metalrender$onBufferSubData(int target, long offset,
       ByteBuffer data, CallbackInfo ci) {
-    if (!IrisGlBufferMirror.isEnabled() || data == null) return;
+    if (!IrisGlBufferMirror.isEnabled() || data == null) {
+      return;
+    }
     int buffer = IrisGlVertexArrayTracker.global().boundBuffer(target);
-    if (buffer > 0 && offset >= 0) {
-      IrisGlBufferMirror.global().write(buffer,
-          IrisGlBufferMirror.global().size(buffer), offset, data.remaining(),
-          data);
+    if (buffer <= 0 || offset < 0) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-lwjgl-buffer-subdata-binding-unavailable");
+      return;
+    }
+    IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
+    long size = mirror.size(buffer);
+    if (size <= 0
+        || !mirror.write(buffer, size, offset, data.remaining(), data)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-lwjgl-buffer-subdata-mirror-rejected");
     }
   }
 
-  @Inject(method = "glDeleteBuffers", at = @At("HEAD"), remap = false)
+  @Inject(method = "glDeleteBuffers", at = @At("RETURN"), remap = false,
+      require = 0)
   private static void metalrender$onDeleteBuffers(IntBuffer buffers,
       CallbackInfo ci) {
     if (buffers == null) return;
