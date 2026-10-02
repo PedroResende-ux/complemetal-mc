@@ -4286,7 +4286,7 @@ static bool parse_iris_metal4_pipeline_descriptor(
 }
 
 constexpr uint32_t kIrisShadowReplayMagic = 0x4d525837;
-constexpr uint32_t kIrisShadowReplaySchema = 8;
+constexpr uint32_t kIrisShadowReplaySchema = 9;
 constexpr jsize kIrisShadowReplayMaximumPacketBytes = 384 * 1024 * 1024;
 constexpr uint32_t kIrisShadowReplayMaximumExtent = 4096;
 constexpr uint32_t kIrisShadowReplayMaximumBuffers = 2048;
@@ -4661,7 +4661,7 @@ static bool parse_iris_shadow_replay_packet_data(
               ((uint64_t)argument.argumentBufferIndex << 32) | argument.id,
               true).second ||
           !reader.u32(argument.kind) || argument.kind < 1 ||
-          argument.kind > 7)
+          argument.kind > 8)
         return false;
       if (argument.kind == 1) {
         uint32_t length = 0;
@@ -4670,11 +4670,12 @@ static bool parse_iris_shadow_replay_packet_data(
                                      kIrisShadowReplayMaximumInlineBytes) ||
             !reader.bytes(length, argument.inlineBytes))
           return false;
-      } else if (argument.kind == 2 || argument.kind == 3) {
+      } else if (argument.kind == 2 || argument.kind == 3 ||
+                 argument.kind == 8) {
         if (!reader.u32(argument.reference) ||
             (argument.kind == 2 &&
              argument.reference >= result.buffers.size()) ||
-            (argument.kind == 3 &&
+            ((argument.kind == 3 || argument.kind == 8) &&
              textureNames.find(argument.reference) == textureNames.end()))
           return false;
       } else if (argument.kind == 7) {
@@ -9484,11 +9485,16 @@ static int iris_shadow_prepare_arguments(
       } else if (argument.kind == 2) {
         [argumentEncoder setBuffer:resources.buffers[argument.reference]
                             offset:0 atIndex:argument.id];
-      } else if (argument.kind == 3) {
+      } else if (argument.kind == 3 || argument.kind == 8) {
         auto texture = resources.sampledByName.find(argument.reference);
         if (texture == resources.sampledByName.end()) {
           [argumentEncoder release];
           return -1;
+        }
+        if (argument.kind == 8 &&
+            (texture->second.usage & MTLTextureUsageShaderWrite) == 0) {
+          [argumentEncoder release];
+          return 0;
         }
         [argumentEncoder setTexture:texture->second atIndex:argument.id];
       } else if (argument.kind == 7) {
