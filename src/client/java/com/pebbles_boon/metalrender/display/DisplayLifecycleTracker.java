@@ -193,8 +193,11 @@ public final class DisplayLifecycleTracker {
         monitorHandle, monitorName, window.getX(), window.getY(),
         window.getScreenWidth(), window.getScreenHeight(), window.getWidth(),
         window.getHeight(), scaleX, scaleY, Math.max(0, refreshRate),
-        window.isFullscreen(), visible, window.isIconified(),
-        window.isFocused());
+        window.isFullscreen(), visible,
+        handle != 0 && GLFW.glfwGetWindowAttrib(handle, GLFW.GLFW_ICONIFIED)
+            == GLFW.GLFW_TRUE,
+        handle != 0 && GLFW.glfwGetWindowAttrib(handle, GLFW.GLFW_FOCUSED)
+            == GLFW.GLFW_TRUE);
   }
 
   /** Repairs missed GLFW window/backing callbacks before lifecycle analysis. */
