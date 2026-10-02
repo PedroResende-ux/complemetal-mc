@@ -167,6 +167,41 @@ final class IrisShadowReplayArgumentTableTest {
   }
 
   @Test
+  void mapsStorageImageToWritableStorageTextureArgument() {
+    DescriptorAddress address = new DescriptorAddress(0, 12);
+    IrisProgramResourceLayout semantic = semantic(address,
+        ResourceKind.STORAGE_IMAGE, "image");
+    IrisMslArgumentLayout msl = new IrisMslArgumentLayout(List.of(
+        new StageLayout(IrisShaderStage.FRAGMENT, List.of(
+            new ArgumentBinding(address, ResourceKind.STORAGE_IMAGE,
+                0, 7, -1)))));
+    IrisGlResourceBindingSnapshot live =
+        new IrisGlResourceBindingSnapshot(2,
+            Map.of("image", 4),
+            Map.of(4, new UniformValue(
+                UniformValueKind.SIGNED_INT, 1, 1,
+                new long[] {1})),
+            Map.of(), Map.of(), Map.of(), Map.of(), Map.of(),
+            Map.of(1, new com.pebbles_boon.metalrender.compat.iris
+                .IrisGlResourceBindingSnapshot.ImageUnitBinding(
+                    51, 0, false, 0, 0x88BA, 0x8058)));
+    IrisShadowReplayTextureSnapshot textures =
+        new IrisShadowReplayTextureSnapshot(true, Map.of(51,
+            IrisGlTextureMirror.TextureSnapshot.fromGraphReference(
+                51, 4, "rgba16-float", 4, 4, 8, 0, 0)), List.of());
+
+    IrisShadowReplayArgumentTable table =
+        IrisShadowReplayArgumentTable.resolve(semantic, msl, live,
+            emptyBuffers(), textures,
+            IrisShadowReplaySamplerSnapshot.emptyEnabled());
+
+    assertTrue(table.complete(), table.blockers().toString());
+    assertEquals(1, table.argumentCount());
+    assertTrue(table.stages().getFirst().arguments().getFirst().value()
+        instanceof IrisShadowReplayArgumentTable.StorageTextureImage);
+  }
+
+  @Test
   void textureOnlySampledImageDoesNotInventASamplerBinding() {
     DescriptorAddress address = new DescriptorAddress(0, 6);
     IrisProgramResourceLayout semantic = semantic(address,
