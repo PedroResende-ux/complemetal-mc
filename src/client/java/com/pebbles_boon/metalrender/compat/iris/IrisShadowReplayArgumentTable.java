@@ -351,7 +351,8 @@ public record IrisShadowReplayArgumentTable(List<StageTable> stages,
         return;
       }
       output.add(new BoundArgument(argument.argumentBufferIndex(),
-          argument.primaryId(), new TextureImage(binding.texture())));
+          argument.primaryId(),
+          new StorageTextureImage(binding.texture())));
     }
 
     private void storageBuffer(ResourceBinding resource,
