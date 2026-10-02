@@ -328,6 +328,40 @@ final class IrisRenderGraphCaptureTest {
   }
 
   @Test
+  void capturesLegacyDepthAndStencilClearValues() {
+    IrisGlStateTracker tracker = new IrisGlStateTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerFramebuffer(7);
+    tracker.defineTexture(71, "d32-float", 1, 64, 32, 1, 1);
+    tracker.defineTexture(72, "s8-uint", 1, 64, 32, 1, 1);
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
+        IrisGlStateTracker.GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 71, 0));
+    assertTrue(tracker.framebufferTexture2DForFramebuffer(7,
+        IrisGlStateTracker.GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 72, 0));
+    tracker.bindFramebuffer(IrisGlStateTracker.GL_DRAW_FRAMEBUFFER, 7);
+
+    IrisRenderGraphCapture capture = new IrisRenderGraphCapture(tracker);
+    capture.beginFrame();
+    capture.legacyClearDepth(0.375D);
+    capture.legacyClearStencil(173);
+    assertTrue(capture.legacyClearBoundFramebuffer(
+        GL_DEPTH_BUFFER_BIT | 0x00000400));
+    capture.endFrame();
+
+    List<IrisRenderGraphCapture.RawEvent> events = capture.poll()
+        .orElseThrow().events();
+    assertEquals(2, events.size());
+    IrisRenderGraphCapture.RawClear depth =
+        (IrisRenderGraphCapture.RawClear) events.get(0);
+    assertEquals(Double.doubleToRawLongBits(0.375D),
+        depth.command().rawValues().getFirst());
+    IrisRenderGraphCapture.RawClear stencil =
+        (IrisRenderGraphCapture.RawClear) events.get(1);
+    assertEquals(Integer.toUnsignedLong(173),
+        stencil.command().rawValues().getFirst());
+  }
+
+  @Test
   void capturesLegacyBoundFramebufferClearAsTextureOperations() {
     IrisGlStateTracker tracker = new IrisGlStateTracker();
     tracker.initializeOpenGlDefaults();
