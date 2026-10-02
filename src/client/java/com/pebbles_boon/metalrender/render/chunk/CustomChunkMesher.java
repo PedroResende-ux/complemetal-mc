@@ -21,20 +21,17 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
-import net.minecraft.client.renderer.block.BlockStateModelSet;
-import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
-import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
-import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+import net.minecraft.client.renderer.block.model.BakedQuad;
+import net.minecraft.client.resources.model.BakedModel;
+import net.neoforged.neoforge.client.model.data.ModelData;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
-import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.util.RandomSource;
-import net.minecraft.util.TriState;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
@@ -972,7 +969,7 @@ public class CustomChunkMesher {
   private static final ThreadLocal<SnapshotData> SNAPSHOT_POOL = ThreadLocal.withInitial(SnapshotData::new);
 
   private static final class MeshBuildContext {
-    final BlockStateModelSet blockModels;
+    final net.minecraft.client.renderer.block.BlockRenderDispatcher blockRenderer;
     final int buildPlayerCX, buildPlayerCY, buildPlayerCZ;
     final TextureAtlasSprite waterStillSprite;
     final TextureAtlasSprite waterFlowingSprite;
@@ -981,11 +978,12 @@ public class CustomChunkMesher {
     final boolean waterTranslucent;
     final boolean lavaTranslucent;
 
-    MeshBuildContext(BlockStateModelSet blockModels, int buildPlayerCX, int buildPlayerCY, int buildPlayerCZ,
+    MeshBuildContext(net.minecraft.client.renderer.block.BlockRenderDispatcher blockRenderer,
+        int buildPlayerCX, int buildPlayerCY, int buildPlayerCZ,
         TextureAtlasSprite waterStillSprite, TextureAtlasSprite waterFlowingSprite,
         TextureAtlasSprite lavaStillSprite, TextureAtlasSprite lavaFlowingSprite,
         boolean waterTranslucent, boolean lavaTranslucent) {
-      this.blockModels = blockModels;
+      this.blockRenderer = blockRenderer;
       this.buildPlayerCX = buildPlayerCX;
       this.buildPlayerCY = buildPlayerCY;
       this.buildPlayerCZ = buildPlayerCZ;
@@ -1000,7 +998,7 @@ public class CustomChunkMesher {
 
   private MeshBuildContext captureBuildContext(ClientLevel world, int chunkX, int chunkY, int chunkZ) {
     Minecraft mc = Minecraft.getInstance();
-    BlockStateModelSet blockModels = null;
+    net.minecraft.client.renderer.block.BlockRenderDispatcher blockRenderer = null;
     int buildPCX = 0, buildPCY = 0, buildPCZ = 0;
     TextureAtlasSprite waterStill = null;
     TextureAtlasSprite waterFlow = null;
@@ -1009,22 +1007,7 @@ public class CustomChunkMesher {
     boolean waterTranslucent = true;
     boolean lavaTranslucent = false;
     if (mc != null) {
-      if (mc.getModelManager() != null) {
-        blockModels = mc.getModelManager().getBlockStateModelSet();
-        var fluidModels = mc.getModelManager().getFluidStateModelSet();
-        if (fluidModels != null) {
-          var waterModel =
-              fluidModels.get(net.minecraft.world.level.material.Fluids.WATER
-                  .defaultFluidState());
-          var lavaModel =
-              fluidModels.get(net.minecraft.world.level.material.Fluids.LAVA
-                  .defaultFluidState());
-          waterTranslucent =
-              waterModel == null || waterModel.layer().translucent();
-          lavaTranslucent =
-              lavaModel != null && lavaModel.layer().translucent();
-        }
-      }
+      blockRenderer = mc.getBlockRenderer();
       if (mc.player != null) {
         buildPCX = mc.player.chunkPosition().x();
         buildPCZ = mc.player.chunkPosition().z();
@@ -1035,7 +1018,7 @@ public class CustomChunkMesher {
       lavaStill = getFluidSprite(mc, net.minecraft.world.level.material.Fluids.LAVA, false);
       lavaFlow = getFluidSprite(mc, net.minecraft.world.level.material.Fluids.LAVA, true);
     }
-    return new MeshBuildContext(blockModels, buildPCX, buildPCY, buildPCZ,
+    return new MeshBuildContext(blockRenderer, buildPCX, buildPCY, buildPCZ,
         waterStill, waterFlow, lavaStill, lavaFlow,
         waterTranslucent, lavaTranslucent);
   }
@@ -1181,10 +1164,7 @@ public class CustomChunkMesher {
                   // orange tint.
                   tint = 0xFFFFFF;
                 } else {
-                  net.minecraft.client.color.block.BlockTintSource source = blockColors.getTintSource(state, 0);
-                  if (source != null) {
-                    tint = source.colorInWorld(state, world, mutablePos);
-                  }
+                  tint = blockColors.getColor(state, world, mutablePos, 0);
                 }
               } catch (Exception ignored) {
               }
@@ -1465,12 +1445,12 @@ public class CustomChunkMesher {
 
             pos.set(chunkX * 16 + x, chunkY * 16 + y, chunkZ * 16 + z);
 
-            if (state.getRenderShape() == net.minecraft.world.level.block.RenderShape.MODEL) {
-              if (blockModels != null) {
-                BlockStateModel model = blockModels.get(state);
-                if (model != null) {
-                  renderBlockModel(model, state, pos, x, y, z, random);
-                }
+            if (state.getRenderShape()
+                == net.minecraft.world.level.block.RenderShape.MODEL
+                && blockRenderer != null) {
+              BakedModel model = blockRenderer.getBlockModel(state);
+              if (model != null) {
+                renderBlockModel(model, state, pos, x, y, z, random);
               }
             }
 
@@ -1508,33 +1488,34 @@ public class CustomChunkMesher {
       return snapshot.biomeTints[y * 256 + z * 16 + x];
     }
 
-    private void renderBlockModel(BlockStateModel model, BlockState state, BlockPos pos,
+    private void renderBlockModel(BakedModel model, BlockState state, BlockPos pos,
         int lx, int ly, int lz, RandomSource random) {
       random.setSeed(state.getSeed(pos));
-      List<BlockStateModelPart> parts = new java.util.ArrayList<>();
-      model.collectParts(random, parts);
-      for (BlockStateModelPart part : parts) {
-        for (Direction direction : ALL_DIRECTIONS) {
-          List<BakedQuad> quads = part.getQuads(direction);
-          if (quads == null || quads.isEmpty())
-            continue;
-          if (shouldCullFace(lx, ly, lz, direction, state))
-            continue;
-          for (BakedQuad quad : quads) {
-            if (quad.materialInfo().layer() !=
-                ChunkSectionLayer.TRANSLUCENT) {
-              emitBakedQuad(quad, lx, ly, lz, state, false);
-            }
-          }
+      var renderTypes = model.getRenderTypes(state, random, ModelData.EMPTY);
+      boolean hasOpaqueLayer = false;
+      for (var renderType : renderTypes) {
+        if (renderType != net.minecraft.client.renderer.RenderType.translucent()) {
+          hasOpaqueLayer = true;
+          break;
         }
-        List<BakedQuad> noCull = part.getQuads(null);
-        if (noCull != null) {
-          for (BakedQuad quad : noCull) {
-            if (quad.materialInfo().layer() !=
-                ChunkSectionLayer.TRANSLUCENT) {
-              emitBakedQuad(quad, lx, ly, lz, state, false);
-            }
-          }
+      }
+      if (!hasOpaqueLayer) {
+        return;
+      }
+      for (Direction direction : ALL_DIRECTIONS) {
+        List<BakedQuad> quads = model.getQuads(state, direction, random);
+        if (quads == null || quads.isEmpty()
+            || shouldCullFace(lx, ly, lz, direction, state)) {
+          continue;
+        }
+        for (BakedQuad quad : quads) {
+          emitBakedQuad(quad, lx, ly, lz, state, false);
+        }
+      }
+      List<BakedQuad> noCull = model.getQuads(state, null, random);
+      if (noCull != null) {
+        for (BakedQuad quad : noCull) {
+          emitBakedQuad(quad, lx, ly, lz, state, false);
         }
       }
     }
@@ -1561,7 +1542,7 @@ public class CustomChunkMesher {
     }
 
     private boolean isOpaqueForCulling(BlockState state) {
-      if (state.isSolidRender()) {
+      if (state.canOcclude()) {
         return true;
       }
       if (state.getBlock() instanceof LeavesBlock) {
@@ -1617,7 +1598,7 @@ public class CustomChunkMesher {
         BlockState neighbor = getPaddedBlockState(lx + dir.getStepX(), ly, lz + dir.getStepZ());
         if (neighbor == null || !neighbor.getFluidState().isEmpty())
           continue;
-        if (neighbor.isSolidRender())
+        if (neighbor.canOcclude())
           continue;
         renderFluidSide(lx, ly, lz, dir, cornerHeights, r, g, b, a, light,
             isLava, translucent);
@@ -2043,7 +2024,7 @@ public class CustomChunkMesher {
       y = Math.max(-1, Math.min(16, y));
       z = Math.max(-1, Math.min(16, z));
       BlockState state = getPaddedBlockState(x, y, z);
-      return state != null && state.isSolidRender();
+      return state != null && state.canOcclude();
     }
   }
 
@@ -2180,6 +2161,6 @@ public class CustomChunkMesher {
 
   private static boolean isOpaqueState(int stateId) {
     BlockState state = Block.stateById(stateId);
-    return state.isSolidRender();
+    return state.canOcclude();
   }
 }
