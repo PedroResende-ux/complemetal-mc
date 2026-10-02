@@ -38,6 +38,9 @@ jobs:
           xcrun --sdk macosx metal --version
           xcrun --sdk macosx --find metallib
 
+      - name: Check NeoForge 1.21.1 port hygiene
+        run: bash ./scripts/check_neoforge_port_hygiene.sh
+
       - name: Compile, test, package, and verify
         env:
           MACOSX_DEPLOYMENT_TARGET: "14.0"
