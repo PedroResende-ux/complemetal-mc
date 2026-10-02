@@ -74,6 +74,30 @@ final class IrisGlResourceBindingTrackerTest {
   }
 
   @Test
+  void deletingBufferClearsIndexedAndTextureBufferBindings() {
+    IrisGlResourceBindingTracker tracker =
+        new IrisGlResourceBindingTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerProgram(11);
+    tracker.useProgram(11);
+
+    tracker.bindBufferBase(
+        IrisGlResourceBindingTracker.GL_SHADER_STORAGE_BUFFER, 3, 73);
+    tracker.bindBufferBase(
+        IrisGlResourceBindingTracker.GL_UNIFORM_BUFFER, 4, 73);
+    tracker.bindTextureToUnit(GL_TEXTURE_BUFFER, 0, 81);
+    tracker.texBuffer(GL_TEXTURE_BUFFER, 0x822E, 73);
+
+    tracker.deleteBuffer(73);
+
+    IrisGlResourceBindingSnapshot snapshot = tracker.snapshot();
+    assertNotNull(snapshot);
+    assertEquals(0,
+        snapshot.indexedBuffers().size());
+    assertEquals(0, snapshot.textureBuffers().size());
+  }
+
+  @Test
   void capturesDirectFourByFourMatrixFromCurrentBufferPosition() {
     IrisGlResourceBindingTracker tracker =
         new IrisGlResourceBindingTracker();
