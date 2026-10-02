@@ -81,8 +81,10 @@ public abstract class IrisRenderSystemMixin {
     encoded.asFloatBuffer().put(values);
     com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
         com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
-    if (mirror.allocate(buffer, bytes)) {
-      mirror.write(buffer, bytes, 0, bytes, encoded);
+    if (!mirror.allocate(buffer, bytes)
+        || !mirror.write(buffer, bytes, 0, bytes, encoded)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-upload-mirror-rejected");
     }
   }
 
@@ -102,8 +104,10 @@ public abstract class IrisRenderSystemMixin {
     encoded.asFloatBuffer().put(values);
     com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror mirror =
         com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global();
-    if (mirror.allocate(buffer, bytes)) {
-      mirror.write(buffer, bytes, 0, bytes, encoded);
+    if (!mirror.allocate(buffer, bytes)
+        || !mirror.write(buffer, bytes, 0, bytes, encoded)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-storage-mirror-rejected");
     }
   }
 
@@ -113,8 +117,13 @@ public abstract class IrisRenderSystemMixin {
       int flags, CallbackInfo ci) {
     if (com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
         .isEnabled()) {
-      com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror.global()
-          .allocate(metalrender$vertices().boundBuffer(target), size);
+      int buffer = metalrender$vertices().boundBuffer(target);
+      if (buffer > 0
+          && !com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror
+              .global().allocate(buffer, size)) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-buffer-storage-allocation-rejected");
+      }
     }
   }
 
