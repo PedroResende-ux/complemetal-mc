@@ -18,7 +18,7 @@ import java.util.TreeSet;
 /** Strict, bounded JNI packet for one offscreen Metal shadow draw. */
 public final class IrisMetalShadowReplayPacketEncoder {
   public static final int MAGIC = 0x4d525837; // MRX8 (stable magic)
-  public static final int SCHEMA = 8;
+  public static final int SCHEMA = 9;
   public static final int MAX_PACKET_BYTES = 384 * 1024 * 1024;
   public static final int MAX_TARGET_EXTENT = 4_096;
 
