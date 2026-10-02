@@ -185,7 +185,7 @@ public record IrisShadowReplayBufferSnapshot(
     Builder builder = new Builder(mirror, retainedCapture);
 
     boolean computePipeline = descriptor != null
-        && descriptor.pass().kind() == IrisPipelineState.PassKind.COMPUTE;
+        && descriptor.kind() == IrisPipelineState.PassKind.COMPUTE;
     if (computePipeline) {
       // Compute dispatches do not have vertex/index bindings.
     } else if (vertexInputBindings.complete()) {
