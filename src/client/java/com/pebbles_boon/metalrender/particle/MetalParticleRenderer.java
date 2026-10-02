@@ -1,6 +1,5 @@
 package com.pebbles_boon.metalrender.particle;
 
-import com.mojang.blaze3d.opengl.GlTexture;
 import com.pebbles_boon.metalrender.MetalRenderClient;
 import com.pebbles_boon.metalrender.backend.MetalRenderer;
 import com.pebbles_boon.metalrender.nativebridge.NativeBridge;
