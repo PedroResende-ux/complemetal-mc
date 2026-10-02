@@ -44,7 +44,15 @@ jobs:
         run: ./gradlew --no-daemon clean test check build releaseCheck
 
       - name: Smoke-test packaged native payload
-        run: ./scripts/smoke_release_payload.sh
+        run: |
+          java -version
+          javac -version
+          javac_version="$(javac -version 2>&1 | awk '{print $2}' | cut -d. -f1)"
+          if [[ "$javac_version" != "21" ]]; then
+            echo "Smoke test requires javac 21, found $javac_version" >&2
+            exit 1
+          fi
+          ./scripts/smoke_release_payload.sh
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
