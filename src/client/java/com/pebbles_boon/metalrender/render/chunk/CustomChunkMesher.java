@@ -1216,7 +1216,7 @@ public class CustomChunkMesher {
       vertexBuffer.clear();
       waterBuffer.clear();
 
-      MeshBuilder builder = new MeshBuilder(vertexBuffer, waterBuffer, context.blockModels,
+      MeshBuilder builder = new MeshBuilder(vertexBuffer, waterBuffer, context.blockRenderer,
           snapshot, context, chunkX, chunkY, chunkZ);
 
       builder.build();
