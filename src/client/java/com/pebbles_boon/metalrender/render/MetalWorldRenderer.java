@@ -456,8 +456,8 @@ public class MetalWorldRenderer {
     if (minecraft == null || minecraft.player == null) {
       return true;
     }
-    int playerChunkX = minecraft.player.chunkPosition().x();
-    int playerChunkZ = minecraft.player.chunkPosition().z();
+    int playerChunkX = minecraft.player.chunkPosition().x;
+    int playerChunkZ = minecraft.player.chunkPosition().z;
     it.unimi.dsi.fastutil.longs.LongIterator iterator =
         pendingBuildSet.iterator();
     while (iterator.hasNext()) {
@@ -547,9 +547,9 @@ public class MetalWorldRenderer {
               " fb=" + textureManager.isUsingFallbackBlockAtlas() +
               " m=" + chunkMesher.getMeshCount());
     }
-    Camera camera = mc.gameRenderer.mainCamera();
-    Vector3f camPos = new Vector3f((float) camera.position().x, (float) camera.position().y,
-        (float) camera.position().z);
+    Camera camera = mc.gameRenderer.getMainCamera();
+    Vector3f camPos = new Vector3f((float) camera.getPosition().x, (float) camera.getPosition().y,
+        (float) camera.getPosition().z);
     if (MetalRenderClient.getConfig().enableMetalRendering) {
       long t0 = System.nanoTime();
       int pruneInterval = chunkMesher.getMeshCount() > 3000 ? 120
@@ -708,8 +708,8 @@ public class MetalWorldRenderer {
     }
     projectionMatrix.set(projection);
     modelViewMatrix.set(modelView);
-    Vector3f camPos = new Vector3f((float) camera.position().x, (float) camera.position().y,
-        (float) camera.position().z);
+    Vector3f camPos = new Vector3f((float) camera.getPosition().x, (float) camera.getPosition().y,
+        (float) camera.getPosition().z);
 
     long cullStart = System.nanoTime();
     FrustumCuller latest = AsyncCullTask.getCurrentCull();
@@ -745,8 +745,8 @@ public class MetalWorldRenderer {
     metalProj.m32(0.5f * metalProj.m32() + 0.5f * metalProj.m33());
     renderer.setProjectionMatrix(metalProj);
     renderer.setModelViewMatrix(modelViewMatrix);
-    renderer.setCameraPosition(camera.position().x, camera.position().y,
-        camera.position().z);
+    renderer.setCameraPosition(camera.getPosition().x, camera.getPosition().y,
+        camera.getPosition().z);
     if (NativeBridge.isLibLoaded()) {
       NativeBridge.nSetRenderDistance(
           Minecraft.getInstance().options.renderDistance().get() * 16);
@@ -906,7 +906,7 @@ public class MetalWorldRenderer {
         return;
       BlockHitResult hit = (BlockHitResult) mc.hitResult;
       BlockPos pos = hit.getBlockPos();
-      Camera cam = mc.gameRenderer.mainCamera();
+      Camera cam = mc.gameRenderer.getMainCamera();
       float bx = (float) (pos.getX() - cam.position().x);
       float by = (float) (pos.getY() - cam.position().y);
       float bz = (float) (pos.getZ() - cam.position().z);
@@ -1092,8 +1092,8 @@ public class MetalWorldRenderer {
       scanForPendingChunks(mc);
     }
     if (mc.player != null && chunkMesher.getMeshCount() < maxMeshes) {
-      int playerChunkX = mc.player.chunkPosition().x();
-      int playerChunkZ = mc.player.chunkPosition().z();
+      int playerChunkX = mc.player.chunkPosition().x;
+      int playerChunkZ = mc.player.chunkPosition().z;
       int playerSectionY = mc.player.getBlockY() >> 4;
       boolean shouldSortTranslucent = translucencyTrigger.shouldReSort(
           new Vector3f((float) mc.player.getX(), (float) mc.player.getY(), (float) mc.player.getZ()),
@@ -1167,8 +1167,8 @@ public class MetalWorldRenderer {
     } else if (scanPressured) {
       closeRange = Math.min(closeRange, PRESSURED_CLOSE_SCAN_RANGE);
     }
-    int playerChunkX = mc.player.chunkPosition().x();
-    int playerChunkZ = mc.player.chunkPosition().z();
+    int playerChunkX = mc.player.chunkPosition().x;
+    int playerChunkZ = mc.player.chunkPosition().z;
     int playerSectionY = mc.player.getBlockY() >> 4;
     if (scanPressured && !coverageFillActive) {
       if (visibleBacklog < CHUNK_SCAN_SATURATED_THRESHOLD ||
@@ -1868,8 +1868,8 @@ public class MetalWorldRenderer {
     resetBulkUpdateRecoveryState();
     Minecraft mc = Minecraft.getInstance();
     if (mc != null && mc.player != null && mc.level != null) {
-      int playerChunkX = mc.player.chunkPosition().x();
-      int playerChunkZ = mc.player.chunkPosition().z();
+      int playerChunkX = mc.player.chunkPosition().x;
+      int playerChunkZ = mc.player.chunkPosition().z;
       int playerSectionY = mc.player.getBlockY() >> 4;
       int renderDist = mc.options.renderDistance().get();
       scanRingsInRange(mc.level, playerChunkX, playerChunkZ, playerSectionY, 0,
@@ -1922,10 +1922,10 @@ public class MetalWorldRenderer {
     boolean highPriorityChunk = shouldPrioritizeLoadedChunk(chunkX, chunkZ);
     Minecraft mc = Minecraft.getInstance();
     int playerChunkX = mc != null && mc.player != null
-        ? mc.player.chunkPosition().x()
+        ? mc.player.chunkPosition().x
         : Integer.MIN_VALUE;
     int playerChunkZ = mc != null && mc.player != null
-        ? mc.player.chunkPosition().z()
+        ? mc.player.chunkPosition().z
         : Integer.MIN_VALUE;
     int loadedChunkDistance = mc != null && mc.player != null
         ? Math.max(Math.abs(chunkX - playerChunkX),
@@ -2009,8 +2009,8 @@ public class MetalWorldRenderer {
     Minecraft mc = Minecraft.getInstance();
     if (mc == null || mc.player == null)
       return false;
-    int playerChunkX = mc.player.chunkPosition().x();
-    int playerChunkZ = mc.player.chunkPosition().z();
+    int playerChunkX = mc.player.chunkPosition().x;
+    int playerChunkZ = mc.player.chunkPosition().z;
     int dx = chunkX - playerChunkX;
     int dz = chunkZ - playerChunkZ;
     int chunkDistance = Math.max(Math.abs(dx), Math.abs(dz));
