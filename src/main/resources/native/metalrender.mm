@@ -2708,7 +2708,6 @@ fragment float4 fragment_terrain_icb(
 }
 
 
-
 struct DepthOnlyOut {
 	float4 position [[position]];
 };
@@ -2768,7 +2767,6 @@ vertex EntityVertexOut vertex_entity(
 	out.position = projection * viewPos;
 	out.texCoord = float2(v.texCoord) / 32768.0;
 	out.color    = float4(v.color) / 255.0;
-
 
 
 	float3 rawN = float3(v.normal.xyz);
@@ -5286,7 +5284,38 @@ static thread_local IrisMetal4TransientBufferPool
     g_irisMetal4TransientBufferPool;
 
 
-struct IrisMetal4RetiredSubmission;
+struct IrisMetal4RetiredSubmission {
+  std::vector<id> submissionObjects;
+  std::vector<id> resourceObjects;
+  std::vector<id<MTLBuffer>> pooledBuffers;
+  std::vector<IrisMetal4FrameArenaChunk> frameArenaChunks;
+  // Store the retained Objective-C object without its macOS 15 protocol
+  // spelling. Every assignment/use is guarded by the Metal 4 macOS 26 path,
+  // while keeping the dylib's supported deployment target at macOS 14.
+  id residency = nil;
+  std::shared_ptr<Metal4ProbeState> feedbackState;
+
+  ~IrisMetal4RetiredSubmission() {
+    for (auto object = submissionObjects.rbegin();
+         object != submissionObjects.rend(); ++object) {
+      if (*object)
+        [*object release];
+    }
+    if (residency) {
+      [residency endResidency];
+      [residency release];
+    }
+    for (auto object = resourceObjects.rbegin();
+         object != resourceObjects.rend(); ++object) {
+      if (*object)
+        [*object release];
+    }
+    for (id<MTLBuffer> buffer : pooledBuffers)
+      g_irisMetal4TransientBufferPool.recycle(buffer);
+    for (IrisMetal4FrameArenaChunk &chunk : frameArenaChunks)
+      g_irisMetal4FrameArenaBufferPool.recycle(chunk.buffer);
+  }
+};
 
 struct IrisShadowRuntimeResources {
   std::vector<id<MTLBuffer>> buffers;
@@ -9056,7 +9085,6 @@ static id<MTLSamplerState> iris_shadow_sampler(
 }
 
 
-
 /**
  * Metal 4 command buffers don't retain the resources they reference.  A
  * submission whose shared-event completion has not been observed therefore
@@ -9064,38 +9092,7 @@ static id<MTLSamplerState> iris_shadow_sampler(
  * synchronous submissions are released immediately after the event boundary;
  * only genuinely unresolved GPU work consumes a slot.
  */
-struct IrisMetal4RetiredSubmission {
-  std::vector<id> submissionObjects;
-  std::vector<id> resourceObjects;
-  std::vector<id<MTLBuffer>> pooledBuffers;
-  std::vector<IrisMetal4FrameArenaChunk> frameArenaChunks;
-  // Store the retained Objective-C object without its macOS 15 protocol
-  // spelling. Every assignment/use is guarded by the Metal 4 macOS 26 path,
-  // while keeping the dylib's supported deployment target at macOS 14.
-  id residency = nil;
-  std::shared_ptr<Metal4ProbeState> feedbackState;
 
-  ~IrisMetal4RetiredSubmission() {
-    for (auto object = submissionObjects.rbegin();
-         object != submissionObjects.rend(); ++object) {
-      if (*object)
-        [*object release];
-    }
-    if (residency) {
-      [residency endResidency];
-      [residency release];
-    }
-    for (auto object = resourceObjects.rbegin();
-         object != resourceObjects.rend(); ++object) {
-      if (*object)
-        [*object release];
-    }
-    for (id<MTLBuffer> buffer : pooledBuffers)
-      g_irisMetal4TransientBufferPool.recycle(buffer);
-    for (IrisMetal4FrameArenaChunk &chunk : frameArenaChunks)
-      g_irisMetal4FrameArenaBufferPool.recycle(chunk.buffer);
-  }
-};
 
 static constexpr size_t kIrisMetal4RetiredSubmissionLimit = 16;
 static thread_local std::vector<std::unique_ptr<IrisMetal4RetiredSubmission>>
@@ -9555,9 +9552,6 @@ static int iris_shadow_prepare_arguments(
 }
 
 namespace {
-
-
-
 
 
 static bool iris_graph_texture_override_format_compatible(
