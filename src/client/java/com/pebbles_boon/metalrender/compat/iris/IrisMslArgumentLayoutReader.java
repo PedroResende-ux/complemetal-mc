@@ -10,7 +10,6 @@ import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_MSL_VERSION;
 import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_FIXUP_DEPTH_CONVENTION;
 import static org.lwjgl.util.spvc.Spvc.SPVC_COMPILER_OPTION_FLIP_VERTEX_Y;
 import static org.lwjgl.util.spvc.Spvc.SPVC_MSL_PLATFORM_MACOS;
-import static org.lwjgl.util.spvc.Spvc.SPVC_RESOURCE_TYPE_GL_PLAIN_UNIFORM;
 import static org.lwjgl.util.spvc.Spvc.SPVC_RESOURCE_TYPE_SAMPLED_IMAGE;
 import static org.lwjgl.util.spvc.Spvc.SPVC_RESOURCE_TYPE_SEPARATE_IMAGE;
 import static org.lwjgl.util.spvc.Spvc.SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS;
@@ -55,9 +54,7 @@ public final class IrisMslArgumentLayoutReader {
       new ResourceType(SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
           ResourceKind.TEXTURE),
       new ResourceType(SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
-          ResourceKind.SAMPLER),
-      new ResourceType(SPVC_RESOURCE_TYPE_GL_PLAIN_UNIFORM,
-          ResourceKind.UNIFORM));
+          ResourceKind.SAMPLER));
 
   private final IrisPipelineCache cache;
   private final IrisTranslationProfile profile;
