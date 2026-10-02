@@ -385,8 +385,7 @@ public final class IrisVertexLayoutCapture {
     for (int location = 0; location < elements.size(); location++) {
       VertexFormatElement element = elements.get(location);
       IrisPipelineState.DataFormat dataFormat =
-          new IrisPipelineState.DataFormat(
-              vertexElementDataFormat(element));
+          vertexElementDataFormat(element);
       attributes.add(new IrisPipelineState.VertexAttribute(location, 0,
           format.getOffset(element), dataFormat));
       String linkedName = linkedAttributeName(
