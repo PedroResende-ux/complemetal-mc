@@ -98,6 +98,26 @@ final class IrisGlResourceBindingTrackerTest {
   }
 
   @Test
+  void deletingSamplerClearsEveryTextureUnitSamplerBinding() {
+    IrisGlResourceBindingTracker tracker =
+        new IrisGlResourceBindingTracker();
+    tracker.initializeOpenGlDefaults();
+    tracker.registerProgram(12);
+    tracker.useProgram(12);
+    tracker.bindSamplerToUnit(0, 91);
+    tracker.bindSamplerToUnit(1, 91);
+    tracker.bindSamplerToUnit(2, 92);
+
+    tracker.deleteSampler(91);
+
+    IrisGlResourceBindingSnapshot snapshot = tracker.snapshot();
+    assertNotNull(snapshot);
+    assertEquals(0, snapshot.textureUnits().get(0).sampler());
+    assertEquals(0, snapshot.textureUnits().get(1).sampler());
+    assertEquals(92, snapshot.textureUnits().get(2).sampler());
+  }
+
+  @Test
   void capturesDirectFourByFourMatrixFromCurrentBufferPosition() {
     IrisGlResourceBindingTracker tracker =
         new IrisGlResourceBindingTracker();
