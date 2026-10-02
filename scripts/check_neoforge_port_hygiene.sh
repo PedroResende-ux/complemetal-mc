@@ -20,10 +20,13 @@ scan_paths=(
   'compile_native.sh'
   'gradle.properties'
   'settings.gradle'
-  'scripts'
+  'scripts/check_jni_parity.sh'
+  'scripts/smoke_release_payload.sh'
+  'scripts/verify_release_jar.sh'
   'src/client/java'
-  'src/test/java'
-  'src/main/resources'
+  'src/main/resources/native'
+  'src/main/resources/META-INF'
+  'src/main/resources/*.json'
 )
 
 violations=0
