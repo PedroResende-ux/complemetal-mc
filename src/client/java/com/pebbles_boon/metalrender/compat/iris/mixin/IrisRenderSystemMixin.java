@@ -310,14 +310,25 @@ public abstract class IrisRenderSystemMixin {
       if (IrisGlTextureMirror.isEnabled()) {
         int bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat)
             .orElse(0);
-        if (bytesPerPixel > 0 && IrisGlTextureMirror.global().define(texture,
-            cacheFormat, width, height, 1, Math.max(1, level + 1),
-            bytesPerPixel) && pixels != null
+        boolean defined = bytesPerPixel > 0
+            && IrisGlTextureMirror.global().define(texture, cacheFormat,
+                width, height, 1, Math.max(1, level + 1),
+                bytesPerPixel);
+        if (!defined) {
+          IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+              "graph-frame-dsa-texture-define-rejected");
+        } else if (pixels != null
             && IrisGlFormat.exactUploadBytesPerPixel(internalFormat, format,
                 type).orElse(0) == bytesPerPixel
             && ((long) width * bytesPerPixel) % 4 == 0) {
-          IrisGlTextureMirror.global().write(texture, level, 0, 0, 0,
-              width, height, width, pixels);
+          if (!IrisGlTextureMirror.global().write(texture, level, 0, 0, 0,
+              width, height, width, pixels)) {
+            IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+                "graph-frame-dsa-texture-upload-rejected");
+          }
+        } else if (pixels != null) {
+          IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+              "graph-frame-dsa-texture-upload-format-unsupported");
         }
       }
     }
@@ -338,18 +349,25 @@ public abstract class IrisRenderSystemMixin {
       bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat).orElse(0);
     }
     if (bytesPerPixel <= 0) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-dsa-texture1d-format-unsupported");
       return;
     }
     String cacheFormat = IrisGlFormat.cacheName(internalFormat)
         .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
     if (!IrisGlTextureMirror.global().define(texture, cacheFormat, width, 1,
         1, Math.max(1, level + 1), bytesPerPixel)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-dsa-texture1d-define-rejected");
       return;
     }
     if (pixels != null && level == 0
         && pixels.remaining() >= width * bytesPerPixel) {
-      IrisGlTextureMirror.global().write(texture, level, 0, 0, 0, width, 1,
-          width, pixels);
+      if (!IrisGlTextureMirror.global().write(texture, level, 0, 0, 0,
+          width, 1, width, pixels)) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-dsa-texture1d-upload-rejected");
+      }
     }
   }
 
@@ -374,12 +392,16 @@ public abstract class IrisRenderSystemMixin {
       bytesPerPixel = IrisGlFormat.bytesPerPixel(internalFormat).orElse(0);
     }
     if (bytesPerPixel <= 0) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-dsa-texture1d-format-unsupported");
       return;
     }
     String cacheFormat = IrisGlFormat.cacheName(internalFormat)
         .orElseGet(() -> "gl-0x" + Integer.toHexString(internalFormat));
     if (!IrisGlTextureMirror.global().define(texture, cacheFormat, width,
         height, depth, Math.max(1, level + 1), bytesPerPixel)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-dsa-texture3d-define-rejected");
       return;
     }
     if (pixels == null || level != 0) {
@@ -401,8 +423,12 @@ public abstract class IrisRenderSystemMixin {
       ByteBuffer slice = pixels.duplicate();
       slice.position(Math.toIntExact(start));
       slice.limit(Math.toIntExact(start + layerBytes));
-      IrisGlTextureMirror.global().write(texture, level, layer, 0, 0, width,
-          height, width, slice.slice());
+      if (!IrisGlTextureMirror.global().write(texture, level, layer,
+          0, 0, width, height, width, slice.slice())) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-dsa-texture3d-upload-rejected");
+        return;
+      }
     }
   }
 
