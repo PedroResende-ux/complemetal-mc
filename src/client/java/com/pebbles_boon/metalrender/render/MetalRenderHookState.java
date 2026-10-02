@@ -5,6 +5,7 @@ import com.pebbles_boon.metalrender.compat.IrisCompatibility;
 import com.pebbles_boon.metalrender.config.MetalRenderConfig;
 import com.pebbles_boon.metalrender.util.MetalLogger;
 import java.util.Locale;
+import org.lwjgl.opengl.GL;
 import net.minecraft.client.Minecraft;
 
 /**
@@ -60,8 +61,14 @@ public final class MetalRenderHookState {
       return false;
     }
 
-    // Minecraft 1.21.1 is OpenGL-only. The GpuDevice/backend abstraction
-    // used for this check was introduced by later Minecraft versions.
+    // Minecraft 1.21.1 is OpenGL by default, but VulkanMod can replace the
+    // renderer. Test the active LWJGL context instead of relying on the later
+    // GpuDevice/backend abstraction.
+    try {
+      GL.getCapabilities();
+    } catch (Throwable error) {
+      return false;
+    }
     String backendDescription = "OpenGL";
     String normalized = backendDescription.toLowerCase(Locale.ROOT);
     graphicsBackendName = backendDescription;
