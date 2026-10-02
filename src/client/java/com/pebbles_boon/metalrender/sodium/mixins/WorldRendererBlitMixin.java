@@ -65,8 +65,9 @@ public abstract class WorldRendererBlitMixin {
 
     try {
       float tickDelta = deltaTracker.getGameTimeDeltaPartialTick(true);
+      var cameraPosition = camera.getPosition();
       CapturedMatrices.capture(projectionMatrix, positionMatrix,
-          camera.position().x, camera.position().y, camera.position().z);
+          cameraPosition.x, cameraPosition.y, cameraPosition.z);
 
       worldRenderer.beginFrame(camera, tickDelta,
           projectionMatrix, positionMatrix);
