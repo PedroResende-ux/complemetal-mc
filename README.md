@@ -4,6 +4,12 @@
 
 # Complemetal
 
+> **Development branch note — `neoforge-1.21.1-port`**
+>
+> This branch is the active Minecraft 1.21.1 NeoForge port. It targets NeoForge 21.1.252, Sodium 0.6.13, Iris 1.8.12, and Java 21 on Apple Silicon. The stable-release documentation below describes the upstream 0.4.1 Fabric/Minecraft 26.2 release and is retained for project lineage; the branch-specific build and verification instructions later in this file apply to this port.
+>
+> The port keeps the native Metal runtime and experimental Iris translation/Metal 4 graph work behind validation and fail-open gates. A failed Metal or Iris integration must leave the vanilla/Iris OpenGL path usable.
+
 [GitHub release](https://github.com/daniiarkg/complemetal-mc/releases/tag/v0.4.1%2Bmc26.2)
 · [Modrinth](https://modrinth.com/mod/complemetal)
 · [Architecture graphs](docs/ARCHITECTURE_GRAPH.md)
