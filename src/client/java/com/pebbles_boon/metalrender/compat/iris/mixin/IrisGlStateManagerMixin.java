@@ -213,6 +213,7 @@ public abstract class IrisGlStateManagerMixin {
   @Inject(method = "_glDeleteBuffers", at = @At("TAIL"))
   private static void metalrender$deleteBuffer(int buffer, CallbackInfo ci) {
     metalrender$vertices().deleteBuffer(buffer);
+    metalrender$resources().deleteBuffer(buffer);
     IrisGlBufferMirror.global().delete(buffer);
   }
 
