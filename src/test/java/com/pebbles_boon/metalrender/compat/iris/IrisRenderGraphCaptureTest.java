@@ -289,7 +289,7 @@ final class IrisRenderGraphCaptureTest {
         (IrisRenderGraphCapture.RawClear) events.get(1);
     assertEquals(8, repeatedClear.command().target().name());
     IrisRenderGraphCapture.RawTransfer transfer =
-        (IrisRenderGraphCapture.RawTransfer) events.get(1);
+        (IrisRenderGraphCapture.RawTransfer) events.get(2);
     IrisTransferCommand.CopyTexSubImage2D copy =
         (IrisTransferCommand.CopyTexSubImage2D) transfer.command();
     assertEquals(7, copy.sourceFramebuffer().name());
