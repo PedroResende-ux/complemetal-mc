@@ -134,6 +134,28 @@ public abstract class IrisGlStateManagerMixin {
     metalrender$enterBufferDataScope();
   }
 
+  @Inject(method = "_glBufferSubData", at = @At("RETURN"),
+      require = 0)
+  private static void metalrender$bufferSubData(int target, int offset,
+      ByteBuffer bytes, CallbackInfo ci) {
+    if (!IrisGlBufferMirror.isEnabled() || bytes == null) {
+      return;
+    }
+    int buffer = metalrender$vertices().boundBuffer(target);
+    if (buffer <= 0) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-subdata-binding-unavailable");
+      return;
+    }
+    IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
+    long size = mirror.size(buffer);
+    if (size <= 0 || offset < 0
+        || !mirror.write(buffer, size, offset, bytes.remaining(), bytes)) {
+      IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+          "graph-frame-buffer-subdata-mirror-rejected");
+    }
+  }
+
   @Inject(method = "_glBufferData(IJI)V", at = @At("RETURN"))
   private static void metalrender$bufferDataSize(int target, long size,
       int usage, CallbackInfo ci) {
