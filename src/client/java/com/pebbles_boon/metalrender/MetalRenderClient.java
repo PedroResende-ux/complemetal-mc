@@ -24,7 +24,6 @@ import java.nio.file.Path;
 import net.neoforged.fml.ModList;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
-import net.neoforged.neoforge.client.event.lifecycle.ClientStoppingEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
@@ -60,13 +59,14 @@ public class MetalRenderClient {
   private static volatile InitState initState = InitState.NOT_TRIED;
   private static volatile String initFailure;
   private static boolean terminalShutdown;
+  private static boolean shutdownHookInstalled;
   private static int displayTargetPollTicks;
   private static int lastConfiguredTargetFrameRate = -1;
 
   public MetalRenderClient() {
     instance = this;
     NeoForge.EVENT_BUS.addListener(this::onClientTick);
-    NeoForge.EVENT_BUS.addListener(this::onClientStopping);
+    installShutdownHook();
     initializeClient();
   }
 
@@ -111,9 +111,6 @@ public class MetalRenderClient {
     }
   }
 
-  private void onClientStopping(ClientStoppingEvent event) {
-    shutdownForClientExit();
-  }
 
   public static void requestDeferredApply(boolean requestCfgSync,
       boolean refreshLevelRenderer,
@@ -619,7 +616,6 @@ public class MetalRenderClient {
       int cachedFramebufferHeight = minecraft.getWindow().getHeight();
       if (DisplayLifecycleTracker.synchronizeWindowGeometry(
           minecraft.getWindow())) {
-        minecraft.framebufferSizeChanged();
         MetalLogger.info(
             "synchronized missed GLFW geometry callbacks: window=%dx%d->%dx%d framebuffer=%dx%d->%dx%d",
             cachedWindowWidth, cachedWindowHeight,
@@ -703,6 +699,16 @@ public class MetalRenderClient {
     lastConfiguredTargetFrameRate = -1;
     DisplayLifecycleTracker.reset();
     DisplayPresentationTracker.reset();
+  }
+
+  private static synchronized void installShutdownHook() {
+    if (shutdownHookInstalled) {
+      return;
+    }
+    shutdownHookInstalled = true;
+    Runtime.getRuntime().addShutdownHook(
+        new Thread(MetalRenderClient::shutdownForClientExit,
+            "complemetal-shutdown"));
   }
 
   private static void shutdownForClientExit() {
