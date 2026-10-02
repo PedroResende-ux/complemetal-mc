@@ -76,7 +76,7 @@ public final class MetalRenderSettingsScreen extends Screen {
 
   @Override
   public void render(GuiGraphics gui, int mouseX, int mouseY, float partialTick) {
-    renderBackground(gui);
+    renderBackground(gui, mouseX, mouseY, partialTick);
     int cx = width / 2;
     gui.drawCenteredString(font, "Complemetal - Metal / Minecraft 1.21.1",
         cx, 30, 0xFFFFFFFF);
@@ -105,7 +105,8 @@ public final class MetalRenderSettingsScreen extends Screen {
     }
   }
 
-  private void rebuildWidgets() {
+  @Override
+  protected void rebuildWidgets() {
     clearWidgets();
     init();
   }
