@@ -374,9 +374,15 @@ public final class IrisMetalShadowReplayPacketEncoder {
     arguments.stages().stream()
         .flatMap(stage -> stage.arguments().stream())
         .map(IrisShadowReplayArgumentTable.BoundArgument::value)
-        .filter(IrisShadowReplayArgumentTable.TextureImage.class::isInstance)
-        .map(IrisShadowReplayArgumentTable.TextureImage.class::cast)
-        .map(IrisShadowReplayArgumentTable.TextureImage::glTexture)
+        .flatMap(value -> {
+          if (value instanceof IrisShadowReplayArgumentTable.TextureImage image) {
+            return java.util.stream.Stream.of(image.glTexture());
+          }
+          if (value instanceof IrisShadowReplayArgumentTable.StorageTextureImage image) {
+            return java.util.stream.Stream.of(image.glTexture());
+          }
+          return java.util.stream.Stream.empty();
+        })
         .forEach(requiredNames::add);
     if (!requiredNames.containsAll(externalTextureNames)
         || !requiredNames.containsAll(externalTextureIndices.keySet())) {
@@ -471,6 +477,9 @@ public final class IrisMetalShadowReplayPacketEncoder {
       out.writeInt(image.internalFormat());
     } else if (value instanceof IrisShadowReplayArgumentTable.TextureImage image) {
       out.writeInt(3);
+      out.writeInt(image.glTexture());
+    } else if (value instanceof IrisShadowReplayArgumentTable.StorageTextureImage image) {
+      out.writeInt(8);
       out.writeInt(image.glTexture());
     } else if (value instanceof IrisShadowReplayArgumentTable.CanonicalZeroTexture) {
       out.writeInt(4);
