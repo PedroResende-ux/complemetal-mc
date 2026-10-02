@@ -138,8 +138,11 @@ public abstract class IrisGlStateManagerMixin {
   private static void metalrender$bufferDataSize(int target, long size,
       int usage, CallbackInfo ci) {
     if (IrisGlBufferMirror.isEnabled()) {
-      IrisGlBufferMirror.global().allocate(
-          metalrender$vertices().boundBuffer(target), size);
+      int buffer = metalrender$vertices().boundBuffer(target);
+      if (buffer > 0 && !IrisGlBufferMirror.global().allocate(buffer, size)) {
+        IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+            "graph-frame-buffer-allocation-mirror-rejected");
+      }
     }
     metalrender$exitBufferDataScope();
   }
