@@ -5222,11 +5222,43 @@ class IrisMetal4FrameBufferArena {
   std::vector<IrisMetal4FrameArenaChunk> chunks_;
 };
 
-// Draw preparation is implemented next to the proven MRX7 replay helpers
-// below. Keep the graph executor above that implementation so the ABI parser
-// remains adjacent to its JNI entry point, while exposing only an opaque
-// prepared-draw lifetime here.
-struct IrisMetal4GraphPreparedDraw;
+// Keep these graph packet/draw types complete before the executor declarations.
+// The encoder performs load/attachment analysis and accesses prepared-draw state
+// directly, so forward declarations alone are insufficient in C++.
+struct IrisMetal4GraphFeedbackCopy {
+  id<MTLTexture> source = nil;
+  id<MTLTexture> snapshot = nil;
+};
+
+struct IrisMetal4GraphPreparedDraw {
+  IrisShadowReplayPacket packet;
+  IrisMetal4PipelineEntry pipeline;
+  IrisShadowRuntimeResources resources;
+  std::vector<IrisMetal4GraphFeedbackCopy> feedbackCopies;
+  std::vector<uint32_t> colorTargetMips;
+  uint32_t depthTargetMip = 0;
+  uint32_t stencilTargetMip = 0;
+  MTLPrimitiveType primitiveType = MTLPrimitiveTypeTriangle;
+  std::vector<id> additionalAllocations;
+  std::vector<id> encodedObjects;
+  bool pipelineRetained = false;
+
+  ~IrisMetal4GraphPreparedDraw() {
+    for (id object : encodedObjects) {
+      if (object)
+        [object release];
+    }
+    if (!pipelineRetained)
+      return;
+    if (pipeline.render) [pipeline.render release];
+    if (pipeline.compute) [pipeline.compute release];
+    if (pipeline.vertexFunction) [pipeline.vertexFunction release];
+    if (pipeline.fragmentFunction) [pipeline.fragmentFunction release];
+    if (pipeline.computeFunction) [pipeline.computeFunction release];
+    if (pipeline.depthStencil) [pipeline.depthStencil release];
+  }
+};
+
 static bool iris_graph_prepare_input_textures(
     const std::vector<IrisShadowTexture> &inputs,
     std::vector<IrisMetal4GraphFramePreparedInputTexture> &textures,
@@ -6191,6 +6223,7 @@ static jlongArray run_iris_metal4_graph_frame(
       uint64_t presentationToken = 0;
       uint32_t presentationWidth = 0;
       uint32_t presentationHeight = 0;
+      uint32_t presentationSourceMip = 0;
       std::shared_ptr<Metal4ProbeState> submissionState;
       @try {
         NSUInteger preparedAllocationCount = 0;
@@ -9525,34 +9558,7 @@ struct IrisMetal4GraphFeedbackCopy {
   id<MTLTexture> snapshot = nil;
 };
 
-struct IrisMetal4GraphPreparedDraw {
-  IrisShadowReplayPacket packet;
-  IrisMetal4PipelineEntry pipeline;
-  IrisShadowRuntimeResources resources;
-  std::vector<IrisMetal4GraphFeedbackCopy> feedbackCopies;
-  std::vector<uint32_t> colorTargetMips;
-  uint32_t depthTargetMip = 0;
-  uint32_t stencilTargetMip = 0;
-  MTLPrimitiveType primitiveType = MTLPrimitiveTypeTriangle;
-  std::vector<id> additionalAllocations;
-  std::vector<id> encodedObjects;
-  bool pipelineRetained = false;
 
-  ~IrisMetal4GraphPreparedDraw() {
-    for (id object : encodedObjects) {
-      if (object)
-        [object release];
-    }
-    if (!pipelineRetained)
-      return;
-    if (pipeline.render) [pipeline.render release];
-    if (pipeline.compute) [pipeline.compute release];
-    if (pipeline.vertexFunction) [pipeline.vertexFunction release];
-    if (pipeline.fragmentFunction) [pipeline.fragmentFunction release];
-    if (pipeline.computeFunction) [pipeline.computeFunction release];
-    if (pipeline.depthStencil) [pipeline.depthStencil release];
-  }
-};
 
 static bool iris_graph_texture_override_format_compatible(
     MTLPixelFormat graphFormat, MTLPixelFormat capturedFormat) {
