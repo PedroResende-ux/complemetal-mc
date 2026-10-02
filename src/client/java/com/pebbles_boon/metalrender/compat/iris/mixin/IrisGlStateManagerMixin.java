@@ -115,9 +115,13 @@ public abstract class IrisGlStateManagerMixin {
       }
       int buffer = metalrender$vertices().boundBuffer(target);
       int length = bytes.remaining();
-      if (buffer > 0 && length > 0
-          && IrisGlBufferMirror.global().allocate(buffer, length)) {
-        IrisGlBufferMirror.global().write(buffer, length, 0, length, bytes);
+      if (buffer > 0 && length > 0) {
+        IrisGlBufferMirror mirror = IrisGlBufferMirror.global();
+        if (!mirror.allocate(buffer, length)
+            || !mirror.write(buffer, length, 0, length, bytes)) {
+          IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
+              "graph-frame-buffer-upload-mirror-rejected");
+        }
       }
     } finally {
       metalrender$exitBufferDataScope();
