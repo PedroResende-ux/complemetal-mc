@@ -8,6 +8,7 @@ import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingTracker;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlBufferMirror;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlTextureMirror;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlResourceBindingSnapshot;
+import com.pebbles_boon.metalrender.compat.iris.IrisGlFormat;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlVertexArrayTracker;
 import com.pebbles_boon.metalrender.compat.iris.IrisGlSamplerMirror;
 import com.pebbles_boon.metalrender.compat.iris.IrisPipelineStateCapture;
@@ -503,7 +504,7 @@ public abstract class IrisGlStateManagerMixin {
     }
 
     try {
-      int pbo = GL15C.glGetInteger(GL15C.GL_PIXEL_UNPACK_BUFFER_BINDING);
+      int pbo = GL15C.glGetInteger(0x88EC);
       if (pbo == 0 && pixels == 0) {
         IrisRenderGraphCapture.global().markUnsupportedFullReplayOperation(
             "graph-frame-texture-upload-pixels-unavailable");
